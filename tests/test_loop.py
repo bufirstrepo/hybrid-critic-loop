@@ -150,6 +150,76 @@ class TestRunOne(LoopTestBase):
         self.assertNotIn("NotImplementedError", merged)
 
 
+class TestRepositoryPathWithWhitespace(unittest.TestCase):
+    """A repository path containing a space must survive every git call.
+
+    The owner's own workspace path has one; the first real run there died
+    in ``WorktreeManager.baseline_hash`` (fix pass, Wave 2.0).
+    """
+
+    def _init_repo(self, repo):
+        repo.mkdir(parents=True)
+        _git(["init", "-q", "."], repo)
+        (repo / "a.txt").write_text("baseline\n", encoding="utf-8")
+        _git(["add", "-A"], repo)
+        _git(
+            ["-c", "user.email=t@local", "-c", "user.name=t", "commit", "-q", "-m", "baseline"],
+            repo,
+        )
+
+    def test_worktree_manager_round_trips_in_a_spaced_path(self):
+        from hybrid_critic_loop.worktrees import WorktreeManager
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo with space"
+            self._init_repo(repo)
+            mgr = WorktreeManager(repo)
+            head = mgr.baseline_hash()
+            self.assertEqual(len(head), 40, head)
+            wt = Path(mgr.create("ctr_space", "a"))
+            self.assertTrue(wt.is_dir())
+            (wt / "b.txt").write_text("candidate\n", encoding="utf-8")
+            self.assertIn("b.txt", mgr.diff(wt))
+            mgr.commit_all(wt, "critic: spaced path")
+            merged = mgr.merge_into_main(wt)
+            self.assertEqual(len(merged), 40, merged)
+            self.assertTrue((repo / "b.txt").exists())
+            mgr.remove(wt)
+            self.assertFalse(wt.exists())
+
+    def test_full_loop_completes_in_a_spaced_path(self):
+        # The demo's own failure shape: a whole contract run against a
+        # repository (and a data dir) under a path with a space.
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "work space"
+            repo = base / "repo"
+            base.mkdir()
+            shutil.copytree(FIXTURE, repo)
+            _git(["init", "-q", "."], repo)
+            _git(["add", "-A"], repo)
+            _git(
+                ["-c", "user.email=t@local", "-c", "user.name=t", "commit", "-q", "-m", "baseline"],
+                repo,
+            )
+            store = Store(base / "data" / "data.db")
+            try:
+                store.upsert_route(
+                    "code", "solver-naive", "solver-ring", [], ["gemini", "beam"],
+                    "judge.family not in contest.families; panel recomputed on fallback",
+                )
+                contract = load_contract_file(ROOT / "contracts" / "demo1.json")
+                result = loop_mod.run_contract(
+                    store, contract, repo, _local_executors(),
+                    human_decider=lambda info: "approved",
+                )
+            finally:
+                store.close()
+            self.assertEqual(result["status"], "completed", json.dumps(result, indent=2))
+            self.assertNotIn(
+                "NotImplementedError", (repo / "src" / "speed_sampler.py").read_text()
+            )
+
+
 class TestBaselineRefusal(LoopTestBase):
     def test_vacuous_contract_refused(self):
         # Pre-implement the sampler so acceptance passes on the baseline.

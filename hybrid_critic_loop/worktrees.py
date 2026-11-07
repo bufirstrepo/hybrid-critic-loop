@@ -5,8 +5,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .shellrun import run_command
-
 
 def _git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -27,8 +25,10 @@ class WorktreeManager:
         return self.repo / "wt"
 
     def baseline_hash(self) -> str:
-        result = run_command(f"git -C {self.repo} rev-parse HEAD", cwd=self.repo)
-        if result.exit_code != 0:
+        # argv list, like every other git call here: a repository path
+        # containing whitespace must never be split into two arguments.
+        result = _git(["-C", str(self.repo), "rev-parse", "HEAD"])
+        if result.returncode != 0:
             raise RuntimeError(f"git rev-parse HEAD failed: {result.stderr.strip()}")
         return result.stdout.strip()
 
