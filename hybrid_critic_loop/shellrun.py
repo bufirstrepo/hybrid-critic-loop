@@ -1,0 +1,100 @@
+"""Shell runner utilities (stdlib only)."""
+from __future__ import annotations
+
+import hashlib
+import shlex
+import subprocess
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class RunResult:
+    cmd: str
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    duration_ms: int
+    timed_out: bool
+
+
+def run_command(cmd: str, cwd=None, timeout_s: int = 900) -> RunResult:
+    """Run a command string without a shell.
+
+    - shlex.split the cmd, subprocess.run with shell=False, stdin=DEVNULL,
+      capture text.
+    - Timeout -> timed_out=True, exit_code=None.
+    - Never raise on non-zero exit.
+    """
+    cmd_str = cmd if isinstance(cmd, str) else " ".join(shlex.quote(str(c)) for c in cmd)  # defensive
+    start = time.monotonic()
+    try:
+        parts = shlex.split(cmd) if isinstance(cmd, str) else list(cmd)  # type: ignore[arg-type]
+    except ValueError as exc:
+        duration_ms = int((time.monotonic() - start) * 1000)
+        return RunResult(cmd=cmd_str, exit_code=None, stdout="", stderr=str(exc), duration_ms=duration_ms, timed_out=False)
+
+    if not parts:
+        duration_ms = int((time.monotonic() - start) * 1000)
+        return RunResult(cmd=cmd_str, exit_code=None, stdout="", stderr="empty command", duration_ms=duration_ms, timed_out=False)
+
+    try:
+        proc = subprocess.run(
+            parts,
+            cwd=str(cwd) if cwd is not None else None,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        duration_ms = int((time.monotonic() - start) * 1000)
+        return RunResult(
+            cmd=cmd_str,
+            exit_code=proc.returncode,
+            stdout=proc.stdout or "",
+            stderr=proc.stderr or "",
+            duration_ms=duration_ms,
+            timed_out=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        duration_ms = int((time.monotonic() - start) * 1000)
+        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return RunResult(
+            cmd=cmd_str,
+            exit_code=None,
+            stdout=stdout,
+            stderr=stderr,
+            duration_ms=duration_ms,
+            timed_out=True,
+        )
+    except FileNotFoundError as exc:
+        duration_ms = int((time.monotonic() - start) * 1000)
+        return RunResult(
+            cmd=cmd_str,
+            exit_code=None,
+            stdout="",
+            stderr=str(exc),
+            duration_ms=duration_ms,
+            timed_out=False,
+        )
+    except OSError as exc:
+        duration_ms = int((time.monotonic() - start) * 1000)
+        return RunResult(
+            cmd=cmd_str,
+            exit_code=None,
+            stdout="",
+            stderr=str(exc),
+            duration_ms=duration_ms,
+            timed_out=False,
+        )
+
+
+def sha256_text(s: str) -> str:
+    return "sha256:" + hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def sha256_bytes(b: bytes) -> str:
+    return "sha256:" + hashlib.sha256(b).hexdigest()

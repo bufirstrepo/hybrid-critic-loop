@@ -1,0 +1,146 @@
+# The Millionaire Matrix
+
+Eight models walk in. The field steps down round by round. One answer walks out.
+
+The Millionaire Matrix — a Hermes plugin (Python package `hybrid_critic_loop`, formerly presented as the Hybrid Critic Loop) — makes one task compete across every model family the operator has a seat for. Each family generates one candidate in its own git worktree; hard and measured gates anchored in real tests eliminate what they eliminate; the survivors are blind-scored by their peers on a validity matrix; the field steps down by recorded score, round after round, until one candidate remains for the human gate. The deciding evidence is written back as a Lesson the agent loads at the start of its next session — with the losing approach's expert demoted in the route table, so the same failure is not bought twice.
+
+## Disclosures (read first)
+
+Catalog Rule 13 disclosure — this plugin, by design:
+
+- **Executes shell commands.** It runs the model CLIs (`codex exec`, `grok -p`, and the other family adapters below), the acceptance commands written into each contract (unit tests, build commands), the sensor commands that produce measured-gate metrics, and `git` (worktree, diff, merge, branch). Contract acceptance commands are operator-authored; the plugin runs them as written, in the candidate's worktree.
+- **Makes network calls through the operator's own credentials.** Model traffic goes through the operator's logged-in model CLIs, the operator's local ollama server (alibaba seat), or API adapters keyed by the operator's own environment variables (DeepSeek). The plugin holds no keys of its own and sends no telemetry anywhere.
+- **Runs candidate code.** Acceptance tests execute the candidates' implementations. Run contests in a disposable repository, never in a tree you cannot afford to have code executed in.
+- **Writes local state.** A SQLite database (WAL mode) and a human-readable `lessons.md` under the Hermes plugin-data directory (`<HERMES_HOME>/plugin-data/hybrid-critic-loop/`). Nothing is written inside the plugin's own directory.
+- **No hosted control plane.** The queue, the gates, and the matrix all run locally. The Beam seat (Reflection) is an optional adapter hosted via the Nous portal and requires the operator's own Nous login (`hermes auth add nous`); the entry never depends on it.
+
+## The panel — eight families
+
+The target panel is eight model families, expressed in the route table (`panel` + `scoring: "peer_matrix; no self-scoring; blind"`). Each seat is an adapter behind one interface; each reports available or unavailable honestly from the environment it runs in, and the panel composes from the seats that are actually live. Nothing is faked: an absent CLI reports unavailable, and a contest runs on what exists.
+
+| Family | Seat | How it runs |
+|---|---|---|
+| anthropic | `claude` | Claude Code CLI |
+| openai | `codex` | Codex CLI |
+| xai | `grok` | Grok CLI |
+| google | `agy` | agy CLI (headless mode unverified — reports so) |
+| reflection | `beam` | Nous portal; optional seat, requires the operator's Nous login |
+| alibaba | `qwen-local` | local ollama server (`qwen2.5-coder:14b`); `qwen-cli` is an alternate CLI seat |
+| moonshot | `kimi` | Kimi CLI |
+| deepseek | `deepseek` | DeepSeek API (`DEEPSEEK_API_KEY` from the environment) |
+
+Panel floor: a candidate scored by fewer than 2 distinct peer families has its verdict marked **degraded** (`judged.panel_status: full|degraded`), and a degraded matrix can never produce the Phase-1 lesson-loop exit on its own. Two-family contests keep working — the documented exception — but their verdicts say degraded.
+
+## The peer validity matrix
+
+The judged gate is a blind peer review, not a judge panel. Every panel family scores every *other* family's candidate; the queue strips self-cells **in code** before dispatch, so no family can score its own work even by construction. Candidates are renamed per peer and identity terms are scrubbed from the packet.
+
+Four rows (`validity_matrix_v1`):
+
+- **question_fidelity** — scored against the original contract task text, which the packet carries verbatim, never a candidate's restatement.
+- **completeness** — every acceptance item addressed.
+- **evidence** — every claim or API cited points at a file:line, a test, or a measurement.
+- **test_agreement** — the peer is shown the hard/measured results; it cannot pass what the tests failed.
+
+Every cell carries a score (0–10), a confidence (0–1), an evidence pointer, and a one-line rationale; a cell missing any of them is discarded whole — no rationale, no score. Aggregation is per-row weighted medians across peers, where a cell's effective weight is **judge calibration × confidence**. The pass rule is unchanged from the design: the median of per-judge means must reach the contract minimum, and no row may fall below minimum − 2.
+
+**Dissent.** Two numbers, named and separate (this closes the design document's open question, with defaults): `spread_threshold` (default 2.0) bounds the max−min spread of per-judge means and escalates; `dissent_threshold` (default 3.0 on the 0–10 scale) flags a *single cell* further than that from its row median. A flagged dissent is logged with its rationale and shown in the verdict (`verdict.judged.dissent`). If a dissent cites a test or measurement the majority may have missed, the queue **re-runs that gate before anything merges**. If the mean confidence across a candidate's cells falls below 0.4, the run escalates instead of passing.
+
+**Calibration.** Each family's `judge_calibration` is computed from the store's own history: how often its scores agreed with decidable outcomes (verdict winners vs gate/verdict eliminations), Laplace-smoothed toward the neutral prior 0.5. Families start at 0.5; calibration weighting activates only after a family has ≥ 5 scored cells (before that, weight = prior, effectively unweighted), and the count `n` is recorded alongside the value. One part of the design is a named gap, not a silent omission: the blind style-preference penalty is **not** applied, because in a peer matrix the proxy the design sketches reduces to raw leniency (self-scores are exactly the stripped cells), which agreement calibration already judges. The bias quantity is still measured and reported; the reasoning is in `matrix.py` and the build log (`GAP-STYLE-PREFERENCE-PENALTY`).
+
+## The step-down bracket
+
+The funnel is a scored step-down bracket. The whole panel generates once — up to 16 candidates at the wide end, or however many seats are live (eight is the working panel). Then, every round, every surviving candidate faces the full gate stack again and the field narrows by recorded validity score:
+
+- **Default ladder:** eliminate 2 per round — 16 → 14 → 12 → 10 → 8 → 6 → 4 → 2 → a final scored round → 1. `bracket.cut_mode: "half"` selects the halving ladder instead (top half advances, rounding up: 9 → 5 → 3 → 2 → 1). Either way the ladder always lands on a final two, and a cut never jumps past two. The cut size is configurable per contract (`bracket.cut_per_round`, default 2) because every extra round is a full matrix pass — **the step-down rate is a cost dial**, and the ledger's cost-per-validity-point is what makes that cost visible.
+- **The anchor never bends:** a hard or measured failure eliminates at *any* round, regardless of matrix score. The matrix never overrules the gates.
+- **Cuts are pure functions of recorded scores.** Nothing is regenerated between rounds; a candidate's artifact never changes (no revision round in this entry). An elimination is a verdict row with the candidate's full score record kept — not a deletion.
+- **Tie at the cut line:** fewer tokens wins, then earlier completion (the Phase-0 tie rule).
+- **Auditable:** every round records round number, field in, field out, and the cut-line score in the verdict's `judged.bracket` block and in the ledger.
+
+## Cost per validity point
+
+A **validity point** is one point of final validity score from the matrix (the candidate's `median_mean`, 0–10). Each expert's ledger line reports dispatches, tokens, cost, win rate, accumulated validity points, and **cost per validity point** (total reported cost ÷ total validity points). The undefined-cost rule is strict: CPVP is computed only when both cost and validity are measured numbers. Where an executor does not report cost, CPVP prints **"not reported"** and the route table falls back to win rate for that family — the plugin never divides by an unreported cost and never estimates one.
+
+## What it does, end to end
+
+1. **Contract.** A task is written as a contract with *structured* acceptance: hard gates (shell command + expected exit code), measured gates (a sensor command emitting JSON + metric/operator/threshold), and a judged gate naming the `validity_matrix_v1` rubric (+ minimum, judge count, the two thresholds, the bracket config). Prose acceptance criteria and judged-only contracts are refused.
+2. **Baseline rule.** The acceptance suite must execute and **fail on the unmodified baseline** before any candidate is dispatched. A contract whose tests already pass is refused as vacuous.
+3. **Panel generation.** One candidate per available panel family, each in its own git worktree (`wt/<contract>/<slot>`, branch `critic/<contract>/<slot>`), each carrying provenance (`generated`) and evidence (run-log hash, provider request ids where reported). A mock or human-supplied artifact can never pass a gate.
+4. **Gates, in rank order.** Hard, then measured, then the matrix. When the anchor leaves exactly one survivor there is no contest to score and the anchor's decision stands; fields of two or more go to the bracket. Hard/measured failure retries with the error log attached (attempt cap 3, then escalate); refusal/unavailability re-dispatches within the panel.
+5. **Events.** Exactly four event types ever reach the operator: spread over threshold, budget exhaustion, retry cap, and the human gate. They are surfaced in the verdict and the events log — a durable events table readable via `critic_ledger` — not via any phone or agent-room ping (no such plugin API exists).
+6. **Human gate.** The one surviving answer is presented for approval. Approval merges its worktree into the main tree and keeps the losers as branches for inspection. Rejection starts a new contract with the rejection recorded as a constraint. A human may waive a *measured* failure only — never a hard one.
+7. **Lesson writeback.** At the verdict, a Lesson is written from the deciding gate's own evidence — the failing measurement or score rows, never an invented cause — and its route change is applied (the losing expert is demoted for that task category). On the next session, lessons for the session's domain are injected into context under the real `pre_llm_call` cap (10,000 characters): ranked by domain match, tag overlap, then newest, filled to the cap, with the number dropped by the cap logged.
+
+## Install
+
+Requires Hermes **>= 0.21.0** and `git`. The model seats are the operator's: install and log into the CLIs for live contests (contests compose from whatever seats are available; they never fake a result).
+
+```sh
+hermes plugins install <owner>/hybrid-critic-loop
+hermes plugins enable the-millionaire-matrix
+# restart Hermes
+```
+
+Standalone, without Hermes (the same loop, driven from a shell):
+
+```sh
+pip install .
+hcl --data-dir ./hcl-data run --repo /path/to/repo --task "Implement X" --approve
+```
+
+## Usage
+
+In Hermes:
+
+- Slash command: `/critic run <task>`, `/critic lessons [domain]`, `/critic ledger`
+- CLI: `hermes critic run|lessons|ledger|session-start`
+- Tools (for the agent itself): `critic_run`, `critic_matrix` (the validity matrix for a contract: every peer's score per criterion, confidence, dissent flags), `critic_lessons`, `critic_ledger` (cost, win rate, cost per validity point, calibration, and the events log)
+
+A run prints the verdict, the matrix, the bracket rounds, and — when a winner is waiting — the human-gate prompt. Lessons are retrievable with `critic_lessons` and are injected automatically at session start for the session's domain.
+
+## The demo
+
+`demo/run_demo.py` runs the whole loop end-to-end in this repository against a small fixture (`fixture/python-sampler/`): rolling-average samplers of the kind a physics loop reads every tick. The measured gate is the interesting one — the natural implementation recomputes the average over the whole buffer every tick; the sensor counts the arithmetic and the contract caps it.
+
+The demo panel is three deterministic local solver families (`local-naive`, `local-ring`, `local-balanced`) plus three deterministic local demo judges — packet-text scorers, labelled as such everywhere, **not models**. The script first attempts the live contest with the real `codex`/`grok` CLIs and prints whatever genuinely happens — refusals and unavailability are recorded in the ledger like any other outcome.
+
+- **Run 1 (contract `ctr_demo_1`, SpeedSampler):** baseline tests fail (the fixture ships as stubs) → the panel generates → the naive candidate *and* the balanced candidate (whose deque average still rescans the window) die on the measured gate (ops_per_tick 120.0 vs threshold <= 8; the ring candidate scores 1.0) → a single survivor stands, so the anchor alone decides: verdict, human approval, winner merged → a Lesson is written from the measurement row and the naive expert is demoted in the route table.
+- **Fresh session:** the session-start path injects the Lesson into context before any new work happens.
+- **Run 2 (contract `ctr_demo_2`, SteeringSampler):** the route table already shows the demotion; the lesson-conditioned generators now all produce the O(1) implementation and pass the measured gate → the peer matrix fills in over the full field → the bracket steps it down 3 → 2 → 1 with the cut line printed per round → one answer walks out.
+
+A Godot C# version of the fixture (`fixture/godot-csharp/`, contracts `demo1-csharp.json` / `demo2-csharp.json`) carries the same design with the allocation sensor from the original design (alloc_bytes_per_tick, threshold 0). It requires the .NET SDK and was **not run** in the build environment (no `dotnet` there); it is verified on the operator's machine. One honest limitation of the Python mirror: its sensor counts arithmetic on the values the sampler stores, so an implementation that converts inputs to plain floats at push time would under-report — the C# allocation sensor has no equivalent blind spot. The sensor's docstring states this.
+
+A real Lesson, exactly as the v1 demo run wrote it:
+
+```json
+{
+  "id": "lsn_0001",
+  "domain": "code.game",
+  "outcome": "ctr_demo_1_a failed the measured gate: ops_per_tick 120.0, threshold <= 8",
+  "cause": "per-tick arithmetic grows with buffer size: ops_per_tick 120.0 vs threshold <= 8",
+  "rule": "keep per-tick work O(1): pre-allocate the buffer and maintain a running total instead of recomputing",
+  "route_change": {"category": "code", "demote": "solver-naive", "reason": "lost on measured gate"},
+  "evidence": ["verdict:ctr_demo_1", "measurement:ctr_demo_1_a:ops_per_tick"],
+  "written_to": "plugin_store"
+}
+```
+
+One deviation from the original design document, stated plainly: the design called for lessons to be written to Hermes memory (`written_to: hermes_memory`). Hermes exposes no plugin API for writing its memory — the built-in memory file is written only by the agent's own memory tool. The buildable equivalent, and what this plugin does, is `written_to: plugin_store`: lessons live in the plugin's own SQLite store under the Hermes plugin-data directory, and are consumed through the `pre_llm_call` context-injection hook (10,000-character cap). The loop the design wanted — lesson written at verdict, present in the next session's context — is real; only the storage label differs.
+
+## Architecture
+
+| Layer | Modules | Responsibility |
+|---|---|---|
+| Contest | `executors.py`, `executors_api.py`, `worktrees.py`, `shellrun.py` | Adapters for all eight panel families (CLI + ollama + API); one git worktree per candidate; every subprocess captured with log hashes as evidence |
+| Gates | `contracts.py`, `gates.py`, `judges.py`, `rubrics.py` | Contract validation, the baseline rule, gate evaluation in rank order, the legacy blinded judge protocol (non-matrix rubrics) |
+| Matrix | `matrix.py`, `bracket.py` | The peer validity matrix (self-cells stripped in code, calibration × confidence weighting, dissent + gate re-run requests, calibration from history) and the step-down bracket (pure cuts over recorded scores) |
+| State | `state.py` | SQLite store with the twelve domain objects: targets, contracts, candidates, measurements, scores, verdicts, final_answers, experts, routes, ledger, lessons, events |
+| Memory | `lessons.py`, `router.py` | Evidence-derived Lesson writing, route-table updates from verdicts (panel + scoring carried on the route), session lesson ranking/injection |
+| Surface | `plugin.py`, `hooks.py`, `cli.py`, `loop.py`, `reports.py` | Hermes registration (4 tools, `/critic`, `hermes critic`, 4 hooks), the queue/orchestration loop, DB-only reporting |
+
+Reports print only database rows; anything absent prints as `not run` or `not reported` — token and cost totals are never estimated.
+
+## Scope and roadmap
+
+Shipped in this entry (v0.3): the panel contest (eight family seats), the peer validity matrix with dissent and calibration, the scored step-down bracket, cost per validity point, the durable events log, Lesson writeback with route-table demotion/promotion, and session-start lesson injection — the design's Phase 0 + Phase 1. Deliberately later (the design's Phase 2, not built): decomposition and stability matrix rows, a revision round, an attacker seat, the spec wave, and registry scoring beyond win rate + calibration.

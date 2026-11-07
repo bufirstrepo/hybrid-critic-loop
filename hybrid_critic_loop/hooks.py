@@ -1,0 +1,97 @@
+"""Hermes lifecycle hooks for the Hybrid Critic Loop.
+
+Plain functions; the caller (plugin.py) resolves ``data_dir`` and binds the
+store.  Observers must never break the host: every hook swallows its own
+exceptions.  ``pre_llm_call`` is the one directive hook — it returns
+``{"context": ...}`` to inject prior lessons into the current turn, or
+None when there is nothing to inject.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .lessons import lessons_context
+
+
+def _utc_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _session_domain(data_dir):
+    try:
+        raw = (Path(data_dir) / "session.json").read_text(encoding="utf-8")
+        data = json.loads(raw)
+        return data.get("domain") or None
+    except Exception:
+        return None
+
+
+def on_session_start(store, data_dir, **kw) -> None:
+    """Bookkeeping only: remember the session's domain. Never raises."""
+    try:
+        data_dir = Path(data_dir)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "domain": kw.get("domain") or "code",
+            "session_id": kw.get("session_id"),
+        }
+        (data_dir / "session.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+    except Exception:
+        pass
+    return None
+
+
+def pre_llm_call(store, data_dir, **kw):
+    """Return {"context": lessons} for this turn, or None. Never raises."""
+    try:
+        domain = kw.get("domain") or _session_domain(data_dir) or "code"
+        tags = kw.get("tags")
+        ctx_text = lessons_context(store, domain, tags)
+        if ctx_text:
+            return {"context": ctx_text}
+        return None
+    except Exception:
+        return None
+
+
+def post_tool_call(store, **kw) -> None:
+    """Observe a tool call against the latest open contract. Never raises."""
+    try:
+        contract = store.latest_open_contract()
+        if contract:
+            store.append_observation(
+                contract["id"],
+                {
+                    "kind": "tool_call",
+                    "tool": kw.get("tool_name") or kw.get("name"),
+                    "ok": kw.get("error") is None,
+                    "ts": _utc_iso(),
+                },
+            )
+    except Exception:
+        pass
+    return None
+
+
+def post_llm_call(store, **kw) -> None:
+    """Observe an LLM call against the latest open contract. Never raises."""
+    try:
+        contract = store.latest_open_contract()
+        if contract:
+            store.append_observation(
+                contract["id"],
+                {
+                    "kind": "llm_call",
+                    "tokens_in": kw.get("tokens_in"),
+                    "tokens_out": kw.get("tokens_out"),
+                    "ts": _utc_iso(),
+                },
+            )
+    except Exception:
+        pass
+    return None

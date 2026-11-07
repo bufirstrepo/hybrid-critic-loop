@@ -1,0 +1,28 @@
+manifest_version: 2
+api_version: 1
+name: the-millionaire-matrix
+display_name: "The Millionaire Matrix"
+version: "0.3.0"
+description: "The Millionaire Matrix (package: Hybrid Critic Loop) — every model family you have a seat for generates, all of them blind-score each other on a validity matrix anchored by real tests, and verified lessons carry into your next session."
+author: "Dino Silvestri"
+license: MIT
+kind: standalone
+requires_hermes: ">=0.21.0"
+provides_tools:
+  - critic_run
+  - critic_matrix
+  - critic_lessons
+  - critic_ledger
+provides_hooks:
+  - on_session_start
+  - pre_llm_call
+  - post_tool_call
+  - post_llm_call
+# python_dependencies: stdlib only — the plugin builds on the Hermes ctx
+# surface plus the Python standard library, so there is nothing to install.
+python_dependencies: []
+tags:
+  - critic
+  - code-review
+  - multi-model
+  - lessons

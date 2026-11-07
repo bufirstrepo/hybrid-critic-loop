@@ -1,0 +1,181 @@
+
+========================================================================
+THE MILLIONAIRE MATRIX — END-TO-END DEMO
+========================================================================
+Eight models walk in. Two battle in the final round. One
+answer walks out. (Owner's framing — the field here is the
+honest local one: three solver families, labelled as such.)
+Generators in this environment: the live model CLIs are attempted
+first (Phase A); the full loop then runs on deterministic local
+solver programs (Phase B). No output below is simulated: every
+number comes from a real run of the plugin's own machinery.
+
+========================================================================
+PHASE A — live CLI attempt (codex vs grok) on contract 1
+========================================================================
+executor codex: available=True (/opt/hatch-image/bin/codex)
+executor grok: available=False (grok binary not found on PATH)
+{
+  "contract_id": "ctr_demo_1",
+  "status": "escalated",
+  "detail": "all candidate experts refused or unavailable and no fallback remains",
+  "verdict_id": "vrd_0001",
+  "lesson_id": "lsn_0001",
+  "events": []
+}
+
+ledger:
+codex: dispatches=1 completed=0 refused=1 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=not run cpvp=not reported
+grok: dispatches=1 completed=0 refused=1 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=not run cpvp=not reported
+events: not run
+
+Phase A outcome (expected here): both live executors fail to
+produce a candidate, the ledger records the refusals, and the
+queue escalates. On a machine with logged-in CLIs this same
+call is the real panel contest.
+
+========================================================================
+PHASE B — contract 1: panel of three local solver families
+========================================================================
+Panel: solver-naive (local-naive), solver-ring (local-ring),
+solver-balanced (local-balanced); peer judges are deterministic
+local demo judges over packet text — labelled, not models.
+Route before run 1: primary=solver-naive, compete_with=solver-balanced
+{
+  "contract_id": "ctr_demo_1",
+  "status": "completed",
+  "winner": "ctr_demo_1_c",
+  "verdict_id": "vrd_0001",
+  "lesson_id": "lsn_0001",
+  "tie_break": "single_passer",
+  "events": [
+    {
+      "type": "human_gate",
+      "detail": "winner ctr_demo_1_c awaits the human gate"
+    }
+  ],
+  "human_gate": "approved",
+  "commit": "git:f32b2864dbb1b68799df41788eda7d19e89c41d2",
+  "winner_commit": "git:c24b12f469180c0a7a909a0c757a744004dcfb12",
+  "waiver": null
+}
+measurement ctr_demo_1_a (solver-naive): ops_per_tick = 120.0 (required <= 8) pass=False
+measurement ctr_demo_1_b (solver-balanced): ops_per_tick = 120.0 (required <= 8) pass=False
+measurement ctr_demo_1_c (solver-ring): ops_per_tick = 1.0 (required <= 8) pass=True
+
+The validity matrix for contract 1 (peer scores, blind):
+matrix: not run
+(run 1's matrix did not run: the measured gate left a single
+survivor, so the anchor alone decided — see run 2 for the matrix.)
+panel_status: None
+
+Lesson written at the verdict:
+1. [lsn_0001] code.game: keep per-tick work O(1): pre-allocate the buffer and maintain a running total instead of recomputing — ctr_demo_1_a failed the measured gate: ops_per_tick 120.0, threshold <= 8
+lesson rule: keep per-tick work O(1): pre-allocate the buffer and maintain a running total instead of recomputing
+lesson route_change: {'category': 'code', 'demote': 'solver-naive', 'reason': 'lost on measured gate'}
+lesson written_to: plugin_store
+Route after run 1: primary=solver-balanced, compete_with=solver-naive
+
+ledger:
+solver-naive: dispatches=2 completed=1 refused=0 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=0W-1L (0.00) cpvp=not reported validity_points=0.0
+solver-balanced: dispatches=1 completed=1 refused=0 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=0W-1L (0.00) cpvp=not reported validity_points=0.0
+solver-ring: dispatches=1 completed=1 refused=0 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=1W-0L (1.00) cpvp=not reported validity_points=10.0
+judge-naive: dispatches=1 completed=0 refused=1 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=0W-1L (0.00) cpvp=not reported validity_points=0.0
+judge-ring: dispatches=1 completed=0 refused=1 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=0W-1L (0.00) cpvp=not reported validity_points=0.0
+judge-balanced: dispatches=1 completed=0 refused=1 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=0W-1L (0.00) cpvp=not reported validity_points=0.0
+events:
+id=1, type=human_gate, contract_id=ctr_demo_1, detail=winner ctr_demo_1_c awaits the human gate, created_at=2026-11-07T15:31:30.879689+00:00
+
+========================================================================
+PHASE B — fresh session: the lesson is already in context
+========================================================================
+## Lessons from prior Hybrid Critic Loop runs (domain: code.game)
+- [lsn lsn_0001] RULE: keep per-tick work O(1): pre-allocate the buffer and maintain a running total instead of recomputing (from: ctr_demo_1_a failed the measured gate: ops_per_tick 120.0, threshold <= 8; evidence: verdict:ctr_demo_1, measurement:ctr_demo_1_a:ops_per_tick)
+
+========================================================================
+PHASE B — contract 2: the bracket steps the full field down
+========================================================================
+Route for run 2: primary=solver-balanced, compete_with=solver-naive
+{
+  "contract_id": "ctr_demo_2",
+  "status": "completed",
+  "winner": "ctr_demo_2_b",
+  "verdict_id": "vrd_0002",
+  "lesson_id": "lsn_0002",
+  "tie_break": "bracket_validity",
+  "events": [
+    {
+      "type": "human_gate",
+      "detail": "winner ctr_demo_2_b awaits the human gate"
+    }
+  ],
+  "human_gate": "approved",
+  "commit": "git:70339d3f349708ddce42e2ca0a0ed735401aff52",
+  "winner_commit": "git:493af28e67ee79dcdcc93ee5f9049e600d7598b3",
+  "waiver": null
+}
+measurement ctr_demo_2_a (solver-balanced): ops_per_tick = 1.0 (required <= 8) pass=True
+measurement ctr_demo_2_b (solver-naive): ops_per_tick = 1.0 (required <= 8) pass=True
+measurement ctr_demo_2_c (solver-ring): ops_per_tick = 1.0 (required <= 8) pass=True
+
+The validity matrix for contract 2:
+matrix for ctr_demo_2 (validity_matrix_v1):
+panel_status: full
+candidate ctr_demo_2_a (expert=solver-balanced, family=local-balanced):
+question_fidelity: judge-naive=6.0, judge-ring=7.0
+completeness: judge-naive=6.0, judge-ring=7.0
+evidence: judge-naive=2.5, judge-ring=2.0
+test_agreement: judge-naive=9.5, judge-ring=9.5
+candidate ctr_demo_2_b (expert=solver-naive, family=local-naive):
+question_fidelity: judge-ring=7.0, judge-balanced=8.0
+completeness: judge-ring=7.0, judge-balanced=8.0
+evidence: judge-ring=2.0, judge-balanced=3.5
+test_agreement: judge-ring=9.5, judge-balanced=9.5
+candidate ctr_demo_2_c (expert=solver-ring, family=local-ring):
+question_fidelity: judge-naive=6.0, judge-balanced=8.0
+completeness: judge-naive=6.0, judge-balanced=8.0
+evidence: judge-naive=2.5, judge-balanced=3.5
+test_agreement: judge-naive=9.5, judge-balanced=9.5
+candidate ctr_demo_2_d (expert=judge-naive, family=local-naive):
+question_fidelity: not reported
+completeness: not reported
+evidence: not reported
+test_agreement: not reported
+candidate ctr_demo_2_e (expert=judge-ring, family=local-ring):
+question_fidelity: not reported
+completeness: not reported
+evidence: not reported
+test_agreement: not reported
+candidate ctr_demo_2_f (expert=judge-balanced, family=local-balanced):
+question_fidelity: not reported
+completeness: not reported
+evidence: not reported
+test_agreement: not reported
+bracket round 1: field 3 -> 2, cut line 6.0, eliminated ['ctr_demo_2_c']
+bracket round 2: field 2 -> 1, cut line 6.375, eliminated ['ctr_demo_2_a']
+panel_status: full
+
+ledger:
+solver-naive: dispatches=3 completed=2 refused=0 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=1W-1L (0.50) cpvp=not reported validity_points=6.375
+solver-balanced: dispatches=2 completed=2 refused=0 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=0W-2L (0.00) cpvp=not reported validity_points=6.0
+solver-ring: dispatches=2 completed=2 refused=0 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=1W-1L (0.50) cpvp=not reported validity_points=10.0
+judge-naive: dispatches=2 completed=0 refused=2 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=0W-2L (0.00) cpvp=not reported validity_points=0.0
+judge-ring: dispatches=2 completed=0 refused=2 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=0W-2L (0.00) cpvp=not reported validity_points=0.0
+judge-balanced: dispatches=2 completed=0 refused=2 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=0W-2L (0.00) cpvp=not reported validity_points=0.0
+queue: dispatches=2 completed=0 refused=0 timeout=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=not run cpvp=not reported
+events:
+id=2, type=human_gate, contract_id=ctr_demo_2, detail=winner ctr_demo_2_b awaits the human gate, created_at=2026-11-07T15:31:33.620312+00:00
+id=1, type=human_gate, contract_id=ctr_demo_1, detail=winner ctr_demo_1_c awaits the human gate, created_at=2026-11-07T15:31:30.879689+00:00
+
+Winner merged on main: True
+
+========================================================================
+DEMO RESULT
+========================================================================
+All demo expectations met: the measured gate eliminated the
+allocating candidates in run 1 (anchor decision, one survivor),
+the lesson was written and demoted its expert, a fresh session
+injected the lesson, and in run 2 the peer matrix filled in
+over the full field and the bracket stepped it down 3 -> 2 -> 1.
+Ledger, matrix and lessons above are database rows.
+DEMO EXIT=0

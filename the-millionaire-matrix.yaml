@@ -1,0 +1,26 @@
+# The Millionaire Matrix — plugin catalog entry
+# For the catalog PR to NousResearch/hermes-agent (plugin-catalog/).
+# The sha below is a PLACEHOLDER: replace it with the full 40-character
+# commit SHA of the public repository's release commit before opening
+# the PR (the catalog pins content by SHA; see SUBMISSION.md step 1).
+name: the-millionaire-matrix
+version: "0.3.0"
+repo: https://github.com/dynoshippedit/hybrid-critic-loop
+sha: "REPLACE-WITH-FULL-40-CHAR-COMMIT-SHA"
+description: "Every model family you have a seat for generates a candidate; all of them blind-score each other on a peer validity matrix anchored by real tests (hard and measured gates outrank the matrix), the field steps down round by round to one answer behind a human gate, and verified lessons carry into your next session."
+category: tools
+tier: community
+maintainer: dynoshippedit
+requires_hermes: ">=0.21.0"
+capabilities:
+  provides_tools:
+    - critic_run
+    - critic_matrix
+    - critic_lessons
+    - critic_ledger
+  provides_hooks:
+    - on_session_start
+    - pre_llm_call
+    - post_tool_call
+    - post_llm_call
+requires_env: []

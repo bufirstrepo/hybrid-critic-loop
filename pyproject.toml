@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0,<81.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybrid-critic-loop"
+version = "0.1.0"
+description = "Hybrid Critic Loop - a Hermes plugin that tests competing AI solutions against testable contracts and carries verified lessons back to your agent."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Dino Silvestri" }]
+requires-python = ">=3.11,<3.14"
+# The plugin core uses only the Python standard library at runtime.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<9.0"]
+
+[project.scripts]
+hcl = "hybrid_critic_loop.cli:main"
+
+[tool.setuptools]
+packages = ["hybrid_critic_loop"]

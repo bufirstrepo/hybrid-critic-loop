@@ -1,0 +1,289 @@
+"""Worker D tests: plugin registration against a FakeCtx.
+
+Registration must work with no loop.py import at module level and no
+Hermes runtime — a recording fake ctx is the whole surface.  The data dir
+is redirected to a temp dir via HCL_DATA_DIR so no real state is touched.
+"""
+
+import importlib.util
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from hybrid_critic_loop import plugin
+
+
+class FakeCtx:
+    """Records every registration call plugin.register makes."""
+
+    def __init__(self):
+        self.tools = {}
+        self.commands = {}
+        self.cli_commands = {}
+        self.hooks = {}
+
+    def register_tool(self, name=None, toolset=None, schema=None, handler=None):
+        self.tools[name] = {
+            "toolset": toolset, "schema": schema, "handler": handler,
+        }
+
+    def register_command(self, name, handler, description):
+        self.commands[name] = {"handler": handler, "description": description}
+
+    def register_cli_command(self, name, help, setup_fn, handler_fn):
+        self.cli_commands[name] = {
+            "help": help, "setup_fn": setup_fn, "handler_fn": handler_fn,
+        }
+
+    def register_hook(self, name, callback):
+        self.hooks[name] = callback
+
+
+class FakeCtxNoCli:
+    """Older ctx surface without register_cli_command."""
+
+    def __init__(self):
+        self.tools = {}
+        self.commands = {}
+        self.hooks = {}
+
+    def register_tool(self, name=None, toolset=None, schema=None, handler=None):
+        self.tools[name] = {"handler": handler, "schema": schema}
+
+    def register_command(self, name, handler, description):
+        self.commands[name] = {"handler": handler, "description": description}
+
+    def register_hook(self, name, callback):
+        self.hooks[name] = callback
+
+
+class TestRegistration(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = mock.patch.dict(
+            os.environ, {"HCL_DATA_DIR": self._tmp.name}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        plugin.REGISTRATION_NOTES.clear()
+
+    def test_register_tools_command_cli_hooks(self):
+        ctx = FakeCtx()
+        plugin.register(ctx)
+        self.assertEqual(
+            set(ctx.tools),
+            {"critic_run", "critic_matrix", "critic_lessons", "critic_ledger"},
+        )
+        for entry in ctx.tools.values():
+            self.assertTrue(entry["schema"].get("description"))
+            self.assertTrue(callable(entry["handler"]))
+        self.assertIn("critic", ctx.commands)
+        self.assertIn("critic", ctx.cli_commands)
+        self.assertTrue(callable(ctx.cli_commands["critic"]["setup_fn"]))
+        self.assertTrue(callable(ctx.cli_commands["critic"]["handler_fn"]))
+        self.assertEqual(
+            set(ctx.hooks),
+            {"on_session_start", "pre_llm_call", "post_tool_call", "post_llm_call"},
+        )
+
+    def test_register_without_cli_command_support(self):
+        ctx = FakeCtxNoCli()
+        before = len(plugin.REGISTRATION_NOTES)
+        plugin.register(ctx)  # must not raise
+        self.assertEqual(
+            set(ctx.tools),
+            {"critic_run", "critic_matrix", "critic_lessons", "critic_ledger"},
+        )
+        self.assertGreater(len(plugin.REGISTRATION_NOTES), before)
+        self.assertTrue(
+            any("register_cli_command" in n for n in plugin.REGISTRATION_NOTES)
+        )
+
+    def test_critic_lessons_handler_returns_seeded_lesson(self):
+        ctx = FakeCtx()
+        store = plugin.register(ctx)
+        self.assertIsNotNone(store)
+        store.create_lesson(
+            contract_id="seed-1", domain="code", tags=["x"],
+            outcome="seeded outcome", cause="seeded cause",
+            rule="seeded rule xyz", route_change=None,
+            evidence=["verdict:seed-1"], written_to="plugin_store",
+            provenance="generated",
+        )
+        handler = ctx.tools["critic_lessons"]["handler"]
+        out = json.loads(handler({"domain": "code"}))
+        rules = [lesson.get("rule") for lesson in out["lessons"]]
+        self.assertIn("seeded rule xyz", rules)
+
+    def test_critic_ledger_handler_shape(self):
+        ctx = FakeCtx()
+        plugin.register(ctx)
+        handler = ctx.tools["critic_ledger"]["handler"]
+        out = json.loads(handler({}))
+        self.assertIn("summary", out)
+        self.assertIn("report", out)
+        self.assertIsInstance(out["summary"], list)
+
+    def test_critic_ledger_handler_events_key_matches_store_surface(self):
+        ctx = FakeCtx()
+        store = plugin.register(ctx)
+        handler = ctx.tools["critic_ledger"]["handler"]
+        out = json.loads(handler({}))
+        if hasattr(store, "events_for"):
+            self.assertIn("events", out)
+            self.assertIsInstance(out["events"], list)
+        else:
+            # Guarded surface: no events key promised until the store
+            # actually records events.
+            self.assertNotIn("events", out)
+
+    def test_critic_matrix_handler_requires_contract_id(self):
+        ctx = FakeCtx()
+        plugin.register(ctx)
+        handler = ctx.tools["critic_matrix"]["handler"]
+        out = json.loads(handler({}))
+        self.assertIn("error", out)
+
+    def test_critic_matrix_handler_not_run_on_empty_store(self):
+        ctx = FakeCtx()
+        plugin.register(ctx)
+        handler = ctx.tools["critic_matrix"]["handler"]
+        out = json.loads(handler({"contract_id": "ctr-none"}))
+        self.assertEqual(out["contract_id"], "ctr-none")
+        self.assertEqual(out["rubric"], "validity_matrix_v1")
+        self.assertEqual(out["note"], "not run")
+        self.assertEqual(out["candidates"], {})
+        self.assertEqual(len(out["rows"]), 4)
+        self.assertIn("panel_status", out)
+
+    def test_critic_matrix_handler_populated_shape(self):
+        ctx = FakeCtx()
+        store = plugin.register(ctx)
+        cid = store.create_candidate(
+            "ctr-matrix", 1, "implement", "expert-a", "fam-a",
+            "a", "/wt/a", "basehash",
+        )
+        # Seed with plain positional add_score calls only.
+        store.add_score(
+            cid, "matrix", "validity_matrix_v1", "judge-1", "fam-j",
+            True, 1, {"correctness": 9.0, "evidence": 8.0}, 8.5,
+        )
+        # A non-matrix score row for the same candidate must not leak in.
+        store.add_score(
+            cid, "judged", "code_quality_v1", "judge-9", "fam-x",
+            True, 1, {"correctness": 1.0}, 1.0,
+        )
+        handler = ctx.tools["critic_matrix"]["handler"]
+        out = json.loads(handler({"contract_id": "ctr-matrix"}))
+        self.assertIsNone(out["note"])
+        self.assertIn("correctness", out["rows"])
+        self.assertIn("evidence", out["rows"])
+        candidate = out["candidates"][cid]
+        self.assertEqual(candidate["expert_id"], "expert-a")
+        self.assertEqual(candidate["family"], "fam-a")
+        self.assertEqual(set(candidate["cells"]), {"judge-1"})
+        cell = candidate["cells"]["judge-1"]
+        self.assertEqual(cell["judge_family"], "fam-j")
+        self.assertEqual(cell["items"]["correctness"], 9.0)
+        self.assertEqual(cell["items"]["evidence"], 8.0)
+        self.assertEqual(cell["mean"], 8.5)
+        self.assertIn("confidence", cell)
+        self.assertIn("details", cell)
+        self.assertEqual(candidate["row_results"], {})
+        self.assertEqual(candidate["dissent"], [])
+
+    def test_critic_run_requires_repo_path(self):
+        ctx = FakeCtx()
+        plugin.register(ctx)
+        handler = ctx.tools["critic_run"]["handler"]
+        out = json.loads(handler({"contract": {"id": "x"}}))
+        self.assertIn("error", out)
+
+    def test_command_handler_reports(self):
+        ctx = FakeCtx()
+        plugin.register(ctx)
+        handler = ctx.commands["critic"]["handler"]
+        self.assertIn("ledger: not run", handler("ledger"))
+        self.assertIn("lessons: not run", handler("lessons"))
+        help_text = handler("")
+        self.assertIn("critic run", help_text)
+        self.assertIn("unknown critic subcommand", handler("bogus"))
+
+    def test_hooks_bound_and_functional(self):
+        ctx = FakeCtx()
+        store = plugin.register(ctx)
+        store.create_lesson(
+            contract_id="seed-1", domain="code", tags=[],
+            outcome="o", cause="c", rule="hook rule abc",
+            route_change=None, evidence=["verdict:seed-1"],
+            written_to="plugin_store", provenance="generated",
+        )
+        result = ctx.hooks["pre_llm_call"]()
+        self.assertIsNotNone(result)
+        self.assertIn("hook rule abc", result["context"])
+        # Observers accept kwargs and stay quiet with no open contract.
+        ctx.hooks["on_session_start"](domain="code", session_id="s1")
+        session_file = Path(self._tmp.name) / "session.json"
+        self.assertTrue(session_file.exists())
+        ctx.hooks["post_tool_call"](tool_name="x")
+        ctx.hooks["post_llm_call"](tokens_in=1, tokens_out=2)
+
+    def test_cli_setup_builds_parser(self):
+        import argparse
+
+        ctx = FakeCtx()
+        plugin.register(ctx)
+        setup_fn = ctx.cli_commands["critic"]["setup_fn"]
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="top")
+        setup_fn(subparsers)
+        args = parser.parse_args(["critic", "lessons", "--domain", "code"])
+        self.assertEqual(args.critic_command, "lessons")
+        self.assertEqual(args.domain, "code")
+        args = parser.parse_args(
+            ["critic", "run", "c.json", "--repo", ".", "--approve"]
+        )
+        self.assertEqual(args.critic_command, "run")
+        self.assertEqual(args.gate, "approved")
+
+    def test_data_dir_never_plugin_dir(self):
+        data_dir = plugin.resolve_data_dir(FakeCtx())
+        self.assertEqual(data_dir, Path(self._tmp.name))
+
+    def test_root_init_exposes_register(self):
+        root_init = Path(__file__).resolve().parent.parent / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            "hcl_root_plugin", root_init
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertTrue(callable(module.register))
+
+
+class TestCliModule(unittest.TestCase):
+    def test_main_no_args_is_error(self):
+        from hybrid_critic_loop import cli
+
+        self.assertEqual(cli.main([]), 1)
+
+    def test_ledger_and_lessons_and_session_start(self):
+        from hybrid_critic_loop import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(cli.main(["ledger", "--data-dir", tmp]), 0)
+            self.assertEqual(
+                cli.main(["lessons", "--domain", "code", "--data-dir", tmp]), 0
+            )
+            self.assertEqual(
+                cli.main(["session-start", "--domain", "code",
+                          "--data-dir", tmp]), 0
+            )
+            self.assertTrue((Path(tmp) / "session.json").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
