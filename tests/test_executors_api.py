@@ -3,8 +3,11 @@
 Deterministic and offline: a REAL local stub HTTP server (http.server
 in a thread on an ephemeral port) implements Ollama's /api/tags and
 /api/generate and DeepSeek's OpenAI-shaped /chat/completions. No live
-service is contacted; in the build environment both adapters honestly
-report unavailable (no ollama server, no DEEPSEEK_API_KEY).
+service is contacted and nothing here depends on the host: the negative
+availability paths are proven against a closed local port and a cleared
+key, and the model-selection variables (OLLAMA_MODEL, DEEPSEEK_MODEL) are
+removed from the environment where a test asserts the default model, so
+the suite passes identically on a PC that runs Ollama (fix pass Wave 2.0).
 """
 from __future__ import annotations
 
@@ -169,6 +172,7 @@ class TestOllamaQwenExecutor(_StubServerMixin):
         ex = OllamaQwenExecutor()
         contract = {"task": "Implement SpeedSampler", "target_file": "src/speed_sampler.py"}
         with patch.dict(os.environ, {"OLLAMA_HOST": self.base}):
+            os.environ.pop("OLLAMA_MODEL", None)  # assert the default tag, not the host's
             with tempfile.TemporaryDirectory() as td:
                 result = ex.generate(Path(td), contract, "")
                 written = Path(td) / "src" / "speed_sampler.py"
@@ -256,6 +260,7 @@ class TestDeepSeekExecutor(_StubServerMixin):
         contract = {"task": "Implement SpeedSampler", "target_file": "src/speed_sampler.py"}
         env = {"DEEPSEEK_API_KEY": "test-key-not-real"}
         with patch.dict(os.environ, env), self._patched():
+            os.environ.pop("DEEPSEEK_MODEL", None)  # assert the default model, not the host's
             with tempfile.TemporaryDirectory() as td:
                 result = ex.generate(Path(td), contract, "")
                 written = Path(td) / "src" / "speed_sampler.py"
@@ -304,24 +309,25 @@ class TestDeepSeekExecutor(_StubServerMixin):
             self.assertIsNone(ex.judge("packet text", RUBRIC))
 
 
-class TestHonestAvailabilityInThisEnvironment(unittest.TestCase):
-    """No stub, no env manipulation of the probed values: in the build
-    environment these adapters must report unavailable, not fake it."""
+class TestAvailabilityNegativesAreDeterministic(unittest.TestCase):
+    """The honest 'unavailable' reports, proven without touching the host:
+    a cleared key and a port nothing listens on. (The previous version of
+    this class asserted that the build sandbox had no Ollama server, which
+    made the suite fail on the owner's PC — fix pass Wave 2.0, F-W20-03.)"""
 
     def test_deepseek_unavailable_without_key(self):
-        if os.environ.get("DEEPSEEK_API_KEY"):
-            self.skipTest("DEEPSEEK_API_KEY is set in this environment")
-        ok, detail = DeepSeekExecutor().available()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DEEPSEEK_API_KEY", None)
+            ok, detail = DeepSeekExecutor().available()
         self.assertFalse(ok)
         self.assertEqual(detail, "DEEPSEEK_API_KEY not set")
 
-    def test_ollama_unavailable_without_server(self):
-        host = os.environ.get("OLLAMA_HOST")
-        if host:
-            self.skipTest("OLLAMA_HOST is set in this environment")
-        ok, detail = OllamaQwenExecutor().available()
+    def test_ollama_unavailable_when_nothing_listens(self):
+        host = f"http://127.0.0.1:{_closed_port()}"
+        with patch.dict(os.environ, {"OLLAMA_HOST": host}):
+            ok, detail = OllamaQwenExecutor().available()
         self.assertFalse(ok)
-        self.assertIn("ollama not reachable", detail)
+        self.assertEqual(detail, f"ollama not reachable at {host}")
 
 
 if __name__ == "__main__":
