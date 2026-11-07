@@ -4,25 +4,29 @@
 Runs the loop against the python-sampler fixture:
 
   Phase A (live attempt): the demo contract is dispatched to the real
-  model CLIs (Codex, Grok). In THIS build environment both are
-  unavailable — codex is installed but not logged in and cannot reach
-  its provider; grok is not installed — so the run records genuine
-  refusals in the ledger and escalates. That failure path is real and
-  is shown, not hidden.
+  model CLIs (Codex, Grok) and whatever happens is recorded. In the
+  build sandbox both were unavailable (codex installed but not logged
+  in, grok absent) and the ledger recorded the refusals. On a machine
+  where the CLIs are logged in, this phase dispatches them for real —
+  and spends their tokens — and the outcome printed below is read back
+  from the recorded rows, never from a canned sentence.
 
   Phase B (local panel): the same contract pair runs with a panel of
   three deterministic local solver families (local-naive, local-ring,
   local-balanced — labelled as such everywhere) plus three local demo
   judges (deterministic packet-text scorers, NOT models). Run 1: the
-  naive candidate dies on the measured gate (the anchor), the matrix
-  fills in over the two survivors, the bracket's final scored round
-  picks the one answer. A fresh session then injects run 1's Lesson.
-  Run 2: the lesson-conditioned panel all passes the measured gate
-  and the bracket steps the field down 3 -> 2 -> 1 on the matrix.
+  naive and balanced candidates die on the measured gate (the anchor),
+  one survivor stands, so the anchor alone decides — the matrix does
+  not run. A fresh session then injects run 1's Lesson. Run 2: the
+  lesson-conditioned panel all passes the measured gate, the peer
+  matrix fills in over the full field and the bracket steps it down
+  3 -> 2 -> 1.
 
-On the operator's machine, Phase B is replaced by the live panel:
-the model CLIs there are logged in, and the C# fixture/contracts
-(contracts/demo*-csharp.json) drive the filmed version.
+Phase B always runs this local panel; nothing in this script switches
+it to live seats. The C# fixture and its contracts
+(fixture/godot-csharp/, contracts/demo*-csharp.json) are for a live
+contest driven from the CLI or the critic_run tool on the operator's
+machine, not from this script.
 
 Usage: python3 demo/run_demo.py [--keep]
 Output is a transcript; state lands in demo-output/ (regenerable).
@@ -122,6 +126,33 @@ def show_result(result: dict) -> None:
     print(json.dumps(result, indent=2, default=str))
 
 
+def phase_a_outcome_lines(result: dict, summary) -> list:
+    """Phase A's outcome, read back from the run result and the ledger
+    summary rows — never a canned expectation (fix pass Wave 2.2).
+
+    ``summary`` is ``store.ledger_summary()``: one row per expert with
+    dispatches / completed / refused / timeout counts.
+    """
+    status = (result or {}).get("status")
+    head = f"Phase A outcome (recorded): status={status}"
+    detail = (result or {}).get("detail")
+    if detail:
+        head += f" — {detail}"
+    lines = [head]
+    for row in summary or []:
+        if row.get("expert_id") not in ("codex", "grok"):
+            continue
+        lines.append(
+            f"  {row.get('expert_id')}: dispatches={row.get('dispatches')} "
+            f"completed={row.get('completed')} refused={row.get('refused')} "
+            f"timeout={row.get('timeout')}"
+        )
+    lines.append("A seat that completed produced a real candidate from its CLI; a refused or")
+    lines.append("unavailable seat produced none and is recorded as such. On a machine with")
+    lines.append("logged-in CLIs this call dispatches the real seats and spends their tokens.")
+    return lines
+
+
 def show_bracket(store, contract_id: str) -> None:
     verdict = store.latest_verdict(contract_id)
     judged = (verdict or {}).get("judged") or {}
@@ -171,10 +202,8 @@ def main() -> int:
     print()
     print(ledger_report(store_a))
     print()
-    print("Phase A outcome (expected here): both live executors fail to")
-    print("produce a candidate, the ledger records the refusals, and the")
-    print("queue escalates. On a machine with logged-in CLIs this same")
-    print("call is the real panel contest.")
+    for line in phase_a_outcome_lines(result_a, store_a.ledger_summary()):
+        print(line)
 
     # ------------------------------------------------------------------
     banner("PHASE B — contract 1: panel of three local solver families")

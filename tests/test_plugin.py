@@ -334,6 +334,119 @@ class TestDataDirPrecedence(unittest.TestCase):
         self.assertEqual(cli._resolve_data_dir("~/x"), Path("~/x").expanduser())
 
 
+class TestDocsMatchTheCode(unittest.TestCase):
+    """Mechanical pins for statements the documents make about the code
+    (fix pass Wave 2.2): the catalog disclosure equals the README's, the
+    versions agree, the catalog mirrors the manifest, and the README's
+    usage examples parse against the real parsers."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def _read(self, name):
+        return (self.ROOT / name).read_text(encoding="utf-8")
+
+    def _section(self, text, heading):
+        start = text.index(heading)
+        rest = text[start + len(heading):]
+        end = rest.find("\n## ")
+        return rest if end < 0 else rest[:end]
+
+    def test_submission_disclosure_equals_the_readme_and_names_the_api_seats(self):
+        readme = self._section(self._read("README.md"), "## Disclosures (read first)")
+        readme_bullets = [l for l in readme.splitlines() if l.startswith("- **")]
+        submission = self._read("SUBMISSION.md")
+        quoted = [l.strip()[2:] for l in submission.splitlines() if l.strip().startswith("> - **")]
+        self.assertEqual(len(readme_bullets), 5)
+        self.assertEqual(quoted, readme_bullets)
+        joined = "\n".join(quoted)
+        self.assertIn("ollama", joined)
+        self.assertIn("DeepSeek", joined)
+        self.assertNotIn("makes no network calls of its own", joined)
+
+    def test_versions_agree_across_pyproject_manifest_and_catalog(self):
+        import re
+
+        py = re.search(r'^version\s*=\s*"([^"]+)"', self._read("pyproject.toml"), re.M).group(1)
+        manifest = re.search(r'^version:\s*"([^"]+)"', self._read("plugin.yaml"), re.M).group(1)
+        catalog = re.search(r'^version:\s*"([^"]+)"', self._read("the-millionaire-matrix.yaml"), re.M).group(1)
+        self.assertEqual(py, manifest)
+        self.assertEqual(manifest, catalog)
+        self.assertIn(f"v{manifest.rsplit('.', 1)[0]}", self._read("SUBMISSION.md"))
+
+    def test_catalog_capabilities_mirror_the_manifest(self):
+        import re
+
+        def items(text, key):
+            block = re.search(rf"^\s*{key}:\n((?:\s+- .+\n)+)", text, re.M)
+            self.assertIsNotNone(block, key)
+            return [l.strip()[2:] for l in block.group(1).splitlines()]
+
+        manifest = self._read("plugin.yaml")
+        catalog = self._read("the-millionaire-matrix.yaml")
+        self.assertEqual(items(catalog, "provides_tools"), items(manifest, "provides_tools"))
+        self.assertEqual(items(catalog, "provides_hooks"), items(manifest, "provides_hooks"))
+        self.assertEqual(
+            items(manifest, "provides_tools"),
+            ["critic_run", "critic_matrix", "critic_lessons", "critic_ledger"],
+        )
+
+    def test_readme_hcl_example_parses_with_the_real_parser(self):
+        import argparse
+        import shlex
+
+        from hybrid_critic_loop import cli
+
+        line = next(l for l in self._read("README.md").splitlines() if l.startswith("hcl "))
+        parser = argparse.ArgumentParser(prog="hcl")
+        cli._add_subcommands(parser.add_subparsers(dest="command"))
+        args = parser.parse_args(shlex.split(line)[1:])  # raises SystemExit if the example is wrong
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.contract, "contract.json")
+        self.assertEqual(args.gate, "approved")
+        self.assertEqual(args.data_dir, "./hcl-data")
+
+    def test_readme_slash_usage_matches_the_handler_help(self):
+        readme = self._read("README.md")
+        self.assertIn("`/critic run <contract.json> [repo_path]`", readme)
+        self.assertNotIn("/critic run <task>", readme)
+        with mock.patch.dict(os.environ, {"HCL_DATA_DIR": tempfile.mkdtemp()}):
+            ctx = FakeCtx()
+            plugin.register(ctx)
+            help_text = ctx.commands["critic"]["handler"]("")
+        self.assertIn("critic run <contract.json> [repo_path]", help_text)
+
+
+class TestDemoNarration(unittest.TestCase):
+    """The demo's Phase A outcome is built from recorded rows, not from a
+    canned expectation (fix pass Wave 2.2)."""
+
+    def _demo(self):
+        root = Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location("run_demo_under_test", root / "demo" / "run_demo.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_phase_a_narration_reads_the_rows(self):
+        demo = self._demo()
+        summary = [
+            {"expert_id": "codex", "dispatches": 1, "completed": 1, "refused": 0, "timeout": 0},
+            {"expert_id": "grok", "dispatches": 1, "completed": 0, "refused": 1, "timeout": 0},
+            {"expert_id": "queue", "dispatches": 1, "completed": 0, "refused": 0, "timeout": 0},
+        ]
+        lines = demo.phase_a_outcome_lines(
+            {"status": "escalated", "detail": "peer matrix passed no candidate"}, summary
+        )
+        text = "\n".join(lines)
+        self.assertIn("status=escalated — peer matrix passed no candidate", lines[0])
+        self.assertIn("codex: dispatches=1 completed=1 refused=0 timeout=0", text)
+        self.assertIn("grok: dispatches=1 completed=0 refused=1 timeout=0", text)
+        self.assertNotIn("queue:", text)
+        self.assertNotIn("expected here", text)
+        quiet = demo.phase_a_outcome_lines({"status": "completed"}, [])
+        self.assertEqual(quiet[0], "Phase A outcome (recorded): status=completed")
+
+
 class TestCliModule(unittest.TestCase):
     def test_main_no_args_is_error(self):
         from hybrid_critic_loop import cli

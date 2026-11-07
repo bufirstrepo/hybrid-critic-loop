@@ -19,10 +19,14 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
   hermes plugins validate
   ```
 
-  Status: **PASSED on the operator's machine for v0.1.0** (Hermes v0.21.5, all 13 checks — see BUILD-LOG.md). The v0.3 entry adds one tool (`critic_matrix`); capabilities in the YAML mirror `plugin.yaml` exactly (4 tools, 4 hooks) because the validator checks them against what the code registers — re-run validate on the submission machine for the v0.3 tree before opening the PR.
-- [ ] PR description must carry the Rule 13 disclosure (the same disclosure that opens the README). Copy verbatim:
+  Status: **PASSED on the operator's machine for the v0.3 tree** (2026-11-07, Hermes v0.21.5: all 13 checks, security scan safe, both the plain and the `--install-deps` form — see BUILD-LOG.md, parent verification). Capabilities in the YAML mirror `plugin.yaml` exactly (4 tools, 4 hooks) because the validator checks them against what the code registers. The release commit will differ from that validated tree (the fix pass landed after it), so re-run validate on the exact release commit before opening the PR and record the result here.
+- [ ] PR description must carry the Rule 13 disclosure — the same five bullets that open the README ("Disclosures (read first)"), copied verbatim:
 
-  > This plugin executes shell commands: the model CLIs (`codex exec`, `grok -p`), the operator-authored acceptance and sensor commands from each contract, and `git` worktree/merge operations. It makes no network calls of its own and holds no API keys; model traffic goes through the operator's own logged-in model CLIs. It runs candidate code during acceptance testing — use a disposable repository. State (SQLite + lessons.md) is written only under the Hermes plugin-data directory.
+  > - **Executes shell commands.** It runs the model CLIs (`codex exec`, `grok -p`, and the other family adapters below), the acceptance commands written into each contract (unit tests, build commands), the sensor commands that produce measured-gate metrics, and `git` (worktree, diff, merge, branch). Contract acceptance commands are operator-authored; the plugin runs them as written, in the candidate's worktree.
+  > - **Makes network calls through the operator's own credentials.** Model traffic goes through the operator's logged-in model CLIs, the operator's local ollama server (alibaba seat), or API adapters keyed by the operator's own environment variables (DeepSeek). The plugin holds no keys of its own and sends no telemetry anywhere.
+  > - **Runs candidate code.** Acceptance tests execute the candidates' implementations. Run contests in a disposable repository, never in a tree you cannot afford to have code executed in.
+  > - **Writes local state.** A SQLite database (WAL mode) and a human-readable `lessons.md` under the Hermes plugin-data directory (`<HERMES_HOME>/plugin-data/hybrid-critic-loop/`). Nothing is written inside the plugin's own directory.
+  > - **No hosted control plane.** The queue, the gates, and the matrix all run locally. The Beam seat (Reflection) is reserved for the Nous-portal-hosted model: this build ships no Beam adapter path, the seat always reports unavailable with that note, and the entry never depends on it.
 
 ## Step 2 — Demo video
 

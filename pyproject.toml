@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hybrid-critic-loop"
-version = "0.1.0"
-description = "Hybrid Critic Loop - a Hermes plugin that tests competing AI solutions against testable contracts and carries verified lessons back to your agent."
+version = "0.3.0"
+description = "The Millionaire Matrix (package: Hybrid Critic Loop) - a Hermes plugin that makes every model family you have a seat for compete on testable contracts, blind-scored by their peers, and carries verified lessons back to your agent."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Dino Silvestri" }]
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 # The plugin core uses only the Python standard library at runtime.
 dependencies = []
 
