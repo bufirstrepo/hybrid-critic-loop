@@ -18,18 +18,20 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
 
 def _resolve_data_dir(value=None) -> Path:
+    """``--data-dir`` wins; otherwise the plugin's own chain (``HCL_DATA_DIR``,
+    then Hermes's storage helper when importable, then
+    ``<HERMES_HOME>/plugin-data/hybrid-critic-loop``), so the standalone CLI
+    reads the same store the plugin writes (Wave 2.0, F-W20-05)."""
     if value:
         return Path(value).expanduser()
-    env_dir = os.environ.get("HCL_DATA_DIR")
-    if env_dir:
-        return Path(env_dir).expanduser()
-    return Path("~/.hermes").expanduser() / "plugin-data" / "hybrid-critic-loop"
+    from .plugin import resolve_data_dir
+
+    return resolve_data_dir(None)
 
 
 def _open(data_dir):

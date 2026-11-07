@@ -264,6 +264,76 @@ class TestRegistration(unittest.TestCase):
         self.assertTrue(callable(module.register))
 
 
+class TestDataDirPrecedence(unittest.TestCase):
+    """Where state lands, in order: ctx getter, HCL_DATA_DIR, Hermes's
+    storage helper, the HERMES_HOME default — the explicit override must
+    beat an importable Hermes package (fix pass Wave 2.0, F-W20-02).
+
+    A fake ``plugins.plugin_storage`` stands in for Hermes's own helper, so
+    the precedence is tested on every interpreter, not only the Hermes venv.
+    """
+
+    HELPER_DIR = "/nonexistent/hermes-home/plugin-data/hybrid-critic-loop"
+
+    def setUp(self):
+        import sys
+        import types
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        fake = types.ModuleType("plugins.plugin_storage")
+        fake.plugin_data_dir = lambda name=None: self.HELPER_DIR
+        pkg = types.ModuleType("plugins")
+        pkg.plugin_storage = fake
+        patcher = mock.patch.dict(
+            sys.modules, {"plugins": pkg, "plugins.plugin_storage": fake}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _env_without(self, *names):
+        return {k: v for k, v in os.environ.items() if k not in names}
+
+    def test_explicit_env_outranks_the_hermes_helper(self):
+        with mock.patch.dict(os.environ, {"HCL_DATA_DIR": self._tmp.name}):
+            self.assertEqual(plugin.resolve_data_dir(FakeCtx()), Path(self._tmp.name))
+
+    def test_hermes_helper_used_when_nothing_overrides_it(self):
+        with mock.patch.dict(os.environ, self._env_without("HCL_DATA_DIR"), clear=True):
+            self.assertEqual(plugin.resolve_data_dir(FakeCtx()), Path(self.HELPER_DIR))
+
+    def test_ctx_getter_outranks_everything(self):
+        class Ctx(FakeCtx):
+            def plugin_data_dir(self):
+                return "/ctx/provided/dir"
+
+        with mock.patch.dict(os.environ, {"HCL_DATA_DIR": self._tmp.name}):
+            self.assertEqual(plugin.resolve_data_dir(Ctx()), Path("/ctx/provided/dir"))
+
+    def test_hermes_home_default_without_helper_or_override(self):
+        import sys
+
+        env = self._env_without("HCL_DATA_DIR")
+        env["HERMES_HOME"] = self._tmp.name
+        # A ``None`` entry makes ``import plugins.plugin_storage`` fail.
+        with mock.patch.dict(sys.modules, {"plugins": None, "plugins.plugin_storage": None}), \
+                mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                plugin.resolve_data_dir(FakeCtx()),
+                Path(self._tmp.name) / "plugin-data" / "hybrid-critic-loop",
+            )
+
+    def test_cli_resolves_the_same_directory_as_the_plugin(self):
+        from hybrid_critic_loop import cli
+
+        with mock.patch.dict(os.environ, {"HCL_DATA_DIR": self._tmp.name}):
+            self.assertEqual(cli._resolve_data_dir(None), plugin.resolve_data_dir(None))
+            self.assertEqual(cli._resolve_data_dir(None), Path(self._tmp.name))
+        with mock.patch.dict(os.environ, self._env_without("HCL_DATA_DIR"), clear=True):
+            self.assertEqual(cli._resolve_data_dir(None), Path(self.HELPER_DIR))
+        self.assertEqual(cli._resolve_data_dir("~/x"), Path("~/x").expanduser())
+
+
 class TestCliModule(unittest.TestCase):
     def test_main_no_args_is_error(self):
         from hybrid_critic_loop import cli

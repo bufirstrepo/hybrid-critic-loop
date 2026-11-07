@@ -33,7 +33,21 @@ ACTIVE_DATA_DIR = None
 # --------------------------------------------------------------------------
 
 def resolve_data_dir(ctx=None) -> Path:
-    """Resolve the plugin data dir without ever touching the plugin dir."""
+    """Resolve the plugin data dir without ever touching the plugin dir.
+
+    Precedence, in order:
+
+    1. the Hermes ctx's own ``plugin_data_dir()`` — the host is
+       authoritative when it hands us a directory;
+    2. an explicit ``HCL_DATA_DIR`` override;
+    3. Hermes's ``plugins.plugin_storage`` helper, when importable;
+    4. ``<HERMES_HOME>/plugin-data/hybrid-critic-loop``.
+
+    The explicit override sits above the importable helper on purpose:
+    the test suite, the standalone CLI and an operator pointing a run
+    elsewhere must never land in the live store just because Hermes's
+    package happens to be on ``sys.path`` (Wave 2.0, F-W20-02).
+    """
     if ctx is not None:
         getter = getattr(ctx, "plugin_data_dir", None)
         if callable(getter):
@@ -43,6 +57,9 @@ def resolve_data_dir(ctx=None) -> Path:
                     return Path(result)
             except Exception:
                 pass
+    env_dir = os.environ.get("HCL_DATA_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser()
     try:
         from plugins.plugin_storage import plugin_data_dir
 
@@ -55,9 +72,6 @@ def resolve_data_dir(ctx=None) -> Path:
             return Path(result)
     except Exception:
         pass
-    env_dir = os.environ.get("HCL_DATA_DIR")
-    if env_dir:
-        return Path(env_dir).expanduser()
     hermes_home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
     return hermes_home / "plugin-data" / "hybrid-critic-loop"
 
