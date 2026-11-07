@@ -589,6 +589,14 @@ def verdict_report(store, contract_id) -> str:
         panel_status = verdict.get("panel_status")
     if panel_status is not None:
         lines.append(f"panel_status: {panel_status}")
+    hold = verdict.get("route_hold")
+    if isinstance(hold, dict) and hold:
+        change = hold.get("route_change") or {}
+        lines.append(
+            f"route_change: held ({hold.get('panel_status') or 'degraded'} panel) — "
+            f"demote {_value_or_not_reported(change.get('demote'))} not applied; "
+            f"operator review required (lesson {_value_or_not_reported(hold.get('lesson_id'))})"
+        )
     lines.append(f"human_gate: {verdict.get('human_gate')}")
     return "\n".join(lines)
 

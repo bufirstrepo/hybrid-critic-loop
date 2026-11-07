@@ -91,6 +91,10 @@ class _Run:
         self.events: list[dict] = []
         self.durations: dict[str, int] = {}
         self.target_id = contract.get("target_id")
+        # Set when a lesson's route change was recorded but HELD because
+        # the verdict's panel was degraded (owner floor rule, README
+        # "Panel floor"): the run result carries it as route_change_hold.
+        self.route_hold: dict | None = None
 
     # -- events ---------------------------------------------------------
     def _emit(self, type_: str, detail: str):
@@ -813,6 +817,8 @@ class _Run:
             "winner": winner["id"], "verdict_id": verdict_id, "lesson_id": lesson_id,
             "tie_break": tie_break, "events": self.events,
         }
+        if self.route_hold is not None:
+            result["route_change_hold"] = self.route_hold
         if self.human_decider is not None:
             decision = self.human_decider(
                 {"winner": winner["id"], "waiver_offered": is_waiver, "verdict_id": verdict_id}
@@ -840,13 +846,28 @@ class _Run:
         gate_details["escalation_reason"] = reason
         lesson_id = self._write_lesson(attempt, gate_details)
         store.set_contract_status(self.contract_id, "escalated")
-        return {
+        result = {
             "contract_id": self.contract_id, "status": "escalated",
             "detail": reason, "verdict_id": verdict_id, "lesson_id": lesson_id,
             "events": self.events,
         }
+        if self.route_hold is not None:
+            result["route_change_hold"] = self.route_hold
+        return result
 
     def _write_lesson(self, attempt, gate_details):
+        """Write the Lesson; apply its route change unless the verdict's
+        panel is degraded.
+
+        Owner floor rule (README, "Panel floor"): a degraded matrix can
+        never produce the Phase-1 lesson-loop exit on its own. The Lesson
+        (evidence-derived) is always stored; when the verdict that carries
+        it has ``panel_status == "degraded"`` the route change is recorded
+        and HELD — a ledger row for the expert, a ``route_hold`` on the
+        verdict row, and ``route_change_hold`` on the run result — never
+        applied automatically. Verdicts where the matrix never ran carry
+        no panel status: the anchor decided, and the demotion applies.
+        """
         store = self.store
         verdict = store.latest_verdict(self.contract_id)
         data_dir = Path(store.db_path).parent if hasattr(store, "db_path") else Path(".")
@@ -854,11 +875,54 @@ class _Run:
             store, data_dir, self.contract, verdict, gate_details
         )
         if lesson and lesson.get("route_change"):
-            router_mod.apply_lesson_route_change(
-                store, router_mod.category_of(self.contract["domain"]),
-                lesson["route_change"], self.contract_id,
-            )
+            if gate_details.get("panel_status") == "degraded":
+                self._hold_route_change(lesson, verdict)
+            else:
+                router_mod.apply_lesson_route_change(
+                    store, router_mod.category_of(self.contract["domain"]),
+                    lesson["route_change"], self.contract_id,
+                )
         return lesson["id"] if lesson else None
+
+    def _hold_route_change(self, lesson, verdict):
+        """Record a held route change visibly: ledger row, verdict row,
+        run result. Nothing is applied."""
+        store = self.store
+        route_change = dict(lesson.get("route_change") or {})
+        demote = route_change.get("demote")
+        reason = route_change.get("reason") or ""
+        hold = {
+            "status": "held",
+            "panel_status": "degraded",
+            "lesson_id": lesson.get("id"),
+            "route_change": route_change,
+            "reason": (
+                "verdict panel degraded (fewer than two peer families scored a "
+                "candidate): the route change is recorded, not applied; "
+                "operator review required"
+            ),
+        }
+        self.route_hold = hold
+        note = (
+            f"route_change held (panel degraded): demote {demote} ({reason}) "
+            f"not applied; operator review required; lesson {lesson.get('id')} "
+            f"contract {self.contract_id}"
+        )
+        try:
+            store.add_ledger(
+                target_id=self.target_id, contract_id=self.contract_id,
+                candidate_id=None, stage=self.contract["stage"], expert_id=demote,
+                tokens_in=None, tokens_out=None, cost_usd=None,
+                outcome="observed", note=note,
+            )
+        except Exception:  # noqa: BLE001 - bookkeeping must not break a verdict
+            pass
+        setter = getattr(store, "set_verdict_route_hold", None)
+        if callable(setter) and verdict and verdict.get("id"):
+            try:
+                setter(verdict["id"], hold)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def run_contract(store, contract: dict, repo_path, executors: dict, human_decider=None) -> dict:

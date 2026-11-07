@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS verdicts (
     waiver_json TEXT,
     human_gate TEXT,
     tie_break TEXT,
+    route_hold_json TEXT,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS final_answers (
@@ -209,6 +210,10 @@ _MIGRATION_COLUMNS = {
     "routes": (
         ("panel_json", "TEXT"),
         ("scoring", "TEXT"),
+    ),
+    # v0.3.1 (fix pass Wave 2.1): a route change held on a degraded verdict.
+    "verdicts": (
+        ("route_hold_json", "TEXT"),
     ),
 }
 
@@ -637,6 +642,16 @@ class Store:
             return None
         return self._verdict_dict(row)
 
+    def set_verdict_route_hold(self, verdict_id, hold):
+        """Record a route change held on a degraded verdict (owner floor
+        rule, README "Panel floor"). ``hold`` is a dict stored as JSON, or
+        None to clear it."""
+        self._conn.execute(
+            "UPDATE verdicts SET route_hold_json=? WHERE id=?",
+            (_dumps(hold), verdict_id),
+        )
+        self._conn.commit()
+
     @staticmethod
     def _verdict_dict(row):
         return {
@@ -653,6 +668,7 @@ class Store:
             "waiver": _loads(row["waiver_json"], None),
             "human_gate": row["human_gate"],
             "tie_break": row["tie_break"],
+            "route_hold": _loads(_col(row, "route_hold_json"), None),
             "created_at": row["created_at"],
         }
 

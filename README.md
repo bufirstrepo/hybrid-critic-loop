@@ -29,7 +29,7 @@ The target panel is eight model families, expressed in the route table (`panel` 
 | moonshot | `kimi` | Kimi CLI |
 | deepseek | `deepseek` | DeepSeek API (`DEEPSEEK_API_KEY` from the environment) |
 
-Panel floor: a candidate scored by fewer than 2 distinct peer families has its verdict marked **degraded** (`judged.panel_status: full|degraded`), and a degraded matrix can never produce the Phase-1 lesson-loop exit on its own. Two-family contests keep working — the documented exception — but their verdicts say degraded.
+Panel floor: a candidate scored by fewer than 2 distinct peer families has its verdict marked **degraded** (`judged.panel_status: full|degraded`), and a degraded matrix can never produce the Phase-1 lesson-loop exit on its own: the Lesson is still written from the gate evidence, but its route change is **held, not applied** — recorded on the verdict row (`route_hold`), as a ledger row for the expert concerned, and as `route_change_hold` on the run result — for the operator to act on. Two-family contests keep working — the documented exception — but their verdicts say degraded and their route changes are held. (A verdict the anchor decided alone, with no matrix run, is not degraded; its demotion applies.)
 
 ## The peer validity matrix
 
@@ -70,7 +70,7 @@ A **validity point** is one point of final validity score from the matrix (the c
 4. **Gates, in rank order.** Hard, then measured, then the matrix. When the anchor leaves exactly one survivor there is no contest to score and the anchor's decision stands; fields of two or more go to the bracket. Hard/measured failure retries with the error log attached (attempt cap 3, then escalate); refusal/unavailability re-dispatches within the panel.
 5. **Events.** Exactly four event types ever reach the operator: spread over threshold, budget exhaustion, retry cap, and the human gate. They are surfaced in the verdict and the events log — a durable events table readable via `critic_ledger` — not via any phone or agent-room ping (no such plugin API exists).
 6. **Human gate.** The one surviving answer is presented for approval. Approval merges its worktree into the main tree and keeps the losers as branches for inspection. Rejection starts a new contract with the rejection recorded as a constraint. A human may waive a *measured* failure only — never a hard one.
-7. **Lesson writeback.** At the verdict, a Lesson is written from the deciding gate's own evidence — the failing measurement or score rows, never an invented cause — and its route change is applied (the losing expert is demoted for that task category). On the next session, lessons for the session's domain are injected into context under the real `pre_llm_call` cap (10,000 characters): ranked by domain match, tag overlap, then newest, filled to the cap, with the number dropped by the cap logged.
+7. **Lesson writeback.** At the verdict, a Lesson is written from the deciding gate's own evidence — the failing measurement or hard-gate rows, never an invented cause — and its route change is applied (the losing expert is demoted for that task category) unless the verdict's panel is degraded, in which case the change is recorded and held for the operator (see Panel floor). On the next session, lessons for the session's domain are injected into context under the real `pre_llm_call` cap (10,000 characters): ranked by domain match, tag overlap, then newest, filled to the cap, with the number dropped by the cap logged.
 
 ## Install
 

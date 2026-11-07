@@ -289,6 +289,22 @@ class TestVerdicts(StoreTestCase):
         self.assertEqual(latest["waiver"], {"reason": "ok"})
         self.assertIsNone(self.store.latest_verdict("ctr_nope"))
 
+    def test_route_hold_round_trip(self):
+        # Fix pass Wave 2.1: a route change held on a degraded verdict is a
+        # verdict-row fact, NULL until recorded.
+        cid = self._contract()
+        vid = self.store.create_verdict(
+            cid, 1, "w1", [], "pass", "fail", {"panel_status": "degraded"}, False,
+            None, None, "pending", "bracket_validity")
+        self.assertIsNone(self.store.latest_verdict(cid)["route_hold"])
+        hold = {"status": "held", "panel_status": "degraded", "lesson_id": "lsn_0001",
+                "route_change": {"category": "code", "demote": "x", "reason": "lost on measured gate"}}
+        self.store.set_verdict_route_hold(vid, hold)
+        self.assertEqual(self.store.latest_verdict(cid)["route_hold"], hold)
+        self.assertEqual(self.store.get_verdict(cid, 1)["route_hold"]["route_change"]["demote"], "x")
+        self.store.set_verdict_route_hold(vid, None)
+        self.assertIsNone(self.store.latest_verdict(cid)["route_hold"])
+
 
 class TestFinalAnswer(StoreTestCase):
     def test_create_final_answer(self):
@@ -750,6 +766,63 @@ class TestLedgerSummaryValidity(StoreTestCase):
         self.assertIsNone(ghost_row["validity_points"])
         self.assertIsNone(ghost_row["validity_cost_usd"])
         self.assertIsNone(ghost_row["cost_per_validity_point"])
+
+
+class TestVerdictHoldMigration(unittest.TestCase):
+    """A v0.3 database (verdicts without route_hold_json) opens and gains the
+    column; its old rows read back with route_hold None (fix pass Wave 2.1)."""
+
+    _V03_VERDICTS = """
+    CREATE TABLE verdicts (
+        id TEXT PRIMARY KEY,
+        contract_id TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        winner TEXT,
+        eliminated_json TEXT NOT NULL DEFAULT '[]',
+        hard TEXT,
+        measured TEXT,
+        judged_json TEXT,
+        escalated INTEGER NOT NULL DEFAULT 0,
+        escalation_reason TEXT,
+        waiver_json TEXT,
+        human_gate TEXT,
+        tie_break TEXT,
+        created_at TEXT NOT NULL
+    );
+    """
+
+    def test_v03_verdicts_table_gains_route_hold(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            db_path = Path(tmp.name) / "v03.db"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.executescript(self._V03_VERDICTS)
+                conn.execute(
+                    "INSERT INTO verdicts (id, contract_id, attempt, winner, hard,"
+                    " measured, escalated, human_gate, created_at) VALUES"
+                    " ('vrd_0001', 'ctr_old', 1, 'ctr_old_a', 'pass', 'pass', 0,"
+                    " 'approved', '2026-01-01T00:00:00+00:00')")
+                conn.commit()
+            finally:
+                conn.close()
+            store = Store(db_path)
+            try:
+                check = sqlite3.connect(str(db_path))
+                try:
+                    cols = {r[1] for r in check.execute("PRAGMA table_info(verdicts)").fetchall()}
+                finally:
+                    check.close()
+                self.assertIn("route_hold_json", cols)
+                old = store.latest_verdict("ctr_old")
+                self.assertEqual(old["id"], "vrd_0001")
+                self.assertIsNone(old["route_hold"])
+                store.set_verdict_route_hold("vrd_0001", {"status": "held"})
+                self.assertEqual(store.latest_verdict("ctr_old")["route_hold"], {"status": "held"})
+            finally:
+                store.close()
+        finally:
+            tmp.cleanup()
 
 
 if __name__ == "__main__":

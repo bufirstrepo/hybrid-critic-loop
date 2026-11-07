@@ -308,6 +308,25 @@ class TestVerdictReport(unittest.TestCase):
         self.assertIn("score=2.0 vs median=9.0", report)
         self.assertIn("evidence row far below peers", report)
 
+    def test_verdict_report_prints_a_held_route_change(self):
+        # Fix pass Wave 2.1: the hold is a verdict-row fact and prints as one.
+        verdict = {
+            "winner": "cand-2", "eliminated": ["cand-1"], "hard": "pass",
+            "measured": "fail", "judged": {"panel_status": "degraded"},
+            "escalated": False, "escalation_reason": None,
+            "route_hold": {
+                "status": "held", "panel_status": "degraded", "lesson_id": "lsn_0007",
+                "route_change": {"category": "code", "demote": "gen-a", "reason": "lost on measured gate"},
+            },
+            "human_gate": "approved",
+        }
+        report = verdict_report(FakeVerdictStore(verdict), "ctr-1")
+        self.assertIn("panel_status: degraded", report)
+        self.assertIn("route_change: held (degraded panel) — demote gen-a not applied; "
+                      "operator review required (lesson lsn_0007)", report)
+        quiet = dict(verdict, route_hold=None)
+        self.assertNotIn("route_change:", verdict_report(FakeVerdictStore(quiet), "ctr-1"))
+
     def test_verdict_report_without_dissent_stays_quiet(self):
         verdict = {
             "winner": "cand-1", "eliminated": [], "hard": "pass",

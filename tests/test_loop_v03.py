@@ -372,6 +372,112 @@ class TestDissentRerun(LoopV03Base):
         self.assertGreaterEqual(judges["judge-c"].calls, 2)
 
 
+class TestDegradedVerdictHoldsRouteChange(LoopV03Base):
+    """Owner floor rule (README "Panel floor"): a degraded matrix never
+    closes the lesson loop on its own. The Lesson is stored; a route
+    change derived from the gates is HELD — visible on the verdict row,
+    in the ledger and on the run result — never applied. A full panel
+    applies it as before. (Fix pass Wave 2.1, packet F1.)"""
+
+    def setUp(self):
+        super().setUp()
+        # The shared fake evaluator records no measurement rows; the
+        # lesson derives its route change from those rows, so record a
+        # failing one for every candidate the test eliminates at measured.
+        base_eval = gates_mod.evaluate_candidate
+        markers, eliminated_at = self.markers, self.eliminated_at
+
+        def eval_with_rows(store, contract, candidate, cwd):
+            gr = base_eval(store, contract, candidate, cwd)
+            if eliminated_at.get(markers.get(candidate["expert_id"])) == "measured":
+                store.add_measurement(
+                    candidate["id"], "ops_bench", "ops_per_tick", 120.0, "<=", 8, False
+                )
+            return gr
+
+        gates_mod.evaluate_candidate = eval_with_rows
+        loop_mod.gates_mod.evaluate_candidate = eval_with_rows
+
+    def _generators(self):
+        self.markers.update({"gen-a": "m-a", "gen-b": "m-b", "gen-c": "m-c"})
+        self.eliminated_at["m-a"] = "measured"  # the anchor kills gen-a
+        return {
+            "gen-a": FakeGen("gen-a", "fam-a", "m-a"),
+            "gen-b": FakeGen("gen-b", "fam-b", "m-b"),
+            "gen-c": FakeGen("gen-c", "fam-c", "m-c"),
+        }
+
+    def _assert_held(self, result, lesson_id):
+        verdict = self.store.latest_verdict("ctr_fake")
+        self.assertEqual(verdict["judged"]["panel_status"], "degraded")
+        lesson = self.store.get_lesson(lesson_id)
+        self.assertIsNotNone(lesson)                                      # the Lesson is stored
+        self.assertEqual(lesson["route_change"]["demote"], "gen-a")        # with its derived change
+        self.assertEqual(self.store.get_route("code")["primary"], "gen-a",
+                         "a degraded verdict must not apply the demotion")
+        hold = result.get("route_change_hold")
+        self.assertIsNotNone(hold, result)
+        self.assertEqual(hold["status"], "held")
+        self.assertEqual(hold["route_change"]["demote"], "gen-a")
+        self.assertEqual(verdict["route_hold"]["lesson_id"], lesson_id)    # on the verdict row
+        notes = [r["note"] or "" for r in self.store.ledger_rows()]
+        held = [n for n in notes if "route_change held" in n and "degraded" in n]
+        self.assertEqual(len(held), 1, notes)                             # in the ledger
+        self.assertFalse(any(n.startswith("route_change demote") for n in notes))
+
+    def test_degraded_bracket_verdict_holds_the_demotion(self):
+        executors = {**self._generators(),
+                     "judge-z": FakeJudge("judge-z", "fam-z", {"m-a": 9.0, "m-b": 8.0, "m-c": 7.0})}
+        self.panel("gen-a", "gen-b", ["gen-c", "judge-z"], ["gen-a", "gen-b", "gen-c"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(self.store.get_candidate(result["winner"])["expert_id"], "gen-b")
+        self._assert_held(result, result["lesson_id"])
+
+    def test_degraded_escalation_holds_the_demotion_too(self):
+        class ShyJudge(FakeJudge):
+            def judge(self, packet, rubric):
+                out = super().judge(packet, rubric)
+                if out:
+                    for cell in out.values():
+                        for item in cell["items"].values():
+                            item["confidence"] = 0.3
+                return out
+
+        executors = {**self._generators(),
+                     "judge-z": ShyJudge("judge-z", "fam-z", {"m-a": 8.0, "m-b": 8.0, "m-c": 8.0})}
+        self.panel("gen-a", "gen-b", ["gen-c", "judge-z"], ["gen-a", "gen-b", "gen-c"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "escalated", result)
+        self.assertIn("confidence", result["detail"])
+        self._assert_held(result, result["lesson_id"])
+
+    def test_full_panel_still_applies_the_demotion(self):
+        scores = {"m-a": 9.0, "m-b": 8.0, "m-c": 7.0}
+        executors = {**self._generators(),
+                     "judge-y": FakeJudge("judge-y", "fam-y", scores),
+                     "judge-z": FakeJudge("judge-z", "fam-z", scores)}
+        self.panel("gen-a", "gen-b", ["gen-c", "judge-y", "judge-z"], ["gen-a", "gen-b", "gen-c"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "completed", result)
+        verdict = self.store.latest_verdict("ctr_fake")
+        self.assertEqual(verdict["judged"]["panel_status"], "full")
+        self.assertIsNone(verdict["route_hold"])
+        self.assertNotIn("route_change_hold", result)
+        self.assertEqual(self.store.get_route("code")["primary"], "gen-b")
+        notes = [r["note"] or "" for r in self.store.ledger_rows()]
+        self.assertTrue(any(n.startswith("route_change demote gen-a") for n in notes), notes)
+
+
 class TestLowConfidence(LoopV03Base):
     def test_uniform_low_confidence_escalates(self):
         self.markers.update({"gen-a": "m-a", "gen-b": "m-b", "gen-c": "m-c"})
