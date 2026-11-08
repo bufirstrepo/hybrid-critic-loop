@@ -6,6 +6,7 @@ from those rows (never on invented totals).
 """
 
 import contextlib
+import inspect
 import io
 import tempfile
 import unittest
@@ -15,12 +16,24 @@ from hybrid_critic_loop import cli, hooks, standing
 from hybrid_critic_loop.reports import verdict_report
 from hybrid_critic_loop.state import Store
 
+# Tightening spec T2: add_ledger records provenance (the parallel state
+# unit's change); the dispatch helper below passes "executor-reported"
+# — what the dispatch path passes when no candidate provenance is
+# recorded — whenever the kwarg exists, so these rows count in the
+# unified totals exactly as real dispatches do.
+_DISPATCH_PROVENANCE = (
+    {"provenance": "executor-reported"}
+    if "provenance" in inspect.signature(Store.add_ledger).parameters
+    else {}
+)
+
 
 def _dispatch(store, expert="exp-1", contract="ctr-1", tin=100, tout=50,
               cost=12.5):
     return store.add_ledger(
         "tgt-1", contract, f"cand-{expert}-{id(object())}", "implement",
         expert, tin, tout, cost, "completed", None,
+        **_DISPATCH_PROVENANCE,
     )
 
 
@@ -105,6 +118,7 @@ class TestComputeStanding(_StoreCase):
         self.assertEqual(rows["exp-1"]["validity_cost_usd"], 150000.0)
         # The headline tier is the ledger's lifetime cost, not validity cost.
         self.assertEqual(result["tier"], "CLIENT")
+        self.assertEqual(rows["exp-1"]["validity_tier"], "BALLER")
 
 
 class TestStandingLine(_StoreCase):
@@ -146,12 +160,16 @@ class TestStandingReport(_StoreCase):
         self.assertNotIn("next tier:", text)
 
     def test_expert_rows_carry_their_tier(self):
+        # Tightening spec T8 (correctness F13): the per-expert label is
+        # validity_tier= — it is computed from validity cost, a
+        # different money stream than the dispatch cost beside it.
         self.store.upsert_expert("exp-1", "fam", "cli", "subscription")
         self.store.record_validity("exp-1", 10.0, 150000.0)
         _dispatch(self.store, expert="exp-1", cost=1.0)
         text = standing.standing_report(self.store)
         self.assertIn("exp-1:", text)
-        self.assertIn("tier=BALLER", text)
+        self.assertIn("validity_tier=BALLER", text)
+        self.assertNotIn(" tier=BALLER", text)
 
 
 class TestHookInjection(_StoreCase):

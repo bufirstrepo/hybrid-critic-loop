@@ -13,6 +13,7 @@ integrity against the store's own book, nothing about public claims
 """
 
 import base64
+import inspect
 import json
 import sqlite3
 import stat
@@ -22,6 +23,17 @@ from pathlib import Path
 
 from hybrid_critic_loop import chain, cli, reports
 from hybrid_critic_loop.state import Store
+
+# Tightening spec T2: add_ledger records provenance (the parallel state
+# unit's change); the dispatch helper below passes "executor-reported"
+# — what the dispatch path passes when no candidate provenance is
+# recorded — whenever the kwarg exists, so these rows count in the
+# unified totals exactly as real dispatches do.
+_DISPATCH_PROVENANCE = (
+    {"provenance": "executor-reported"}
+    if "provenance" in inspect.signature(Store.add_ledger).parameters
+    else {}
+)
 
 
 def _b64url_decode(text):
@@ -57,7 +69,8 @@ class CertificateTestCase(unittest.TestCase):
                   expert="exp-1"):
         return self.store.add_ledger(
             "tgt_0001", contract_id, "cand_1", "solve", expert,
-            tokens_in, tokens_out, cost_usd, "completed", None)
+            tokens_in, tokens_out, cost_usd, "completed", None,
+            **_DISPATCH_PROVENANCE)
 
 
 class TestStamp(CertificateTestCase):
@@ -110,6 +123,14 @@ class TestVerify(CertificateTestCase):
         self.assertAlmostEqual(payload["cost_usd"], 1.75)
         self.assertEqual(payload["chain_head"],
                          self.store.ledger_rows()[-1]["row_hash"])
+        # Tightening spec T4: the payload carries the high-water mark,
+        # the signing key's id, and the run's cost coverage.
+        self.assertEqual(payload["ledger_upto"],
+                         self.store.ledger_rows()[-1]["id"])
+        self.assertEqual(payload["kid"],
+                         chain.key_id(chain.cert_key(self.store)))
+        self.assertEqual(payload["cost_rows"], 2)
+        self.assertEqual(payload["cost_missing"], 0)
 
     def test_edited_payload_fails_the_signature(self):
         _, cert = self._issued()

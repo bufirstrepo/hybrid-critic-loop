@@ -91,6 +91,30 @@ class TestChainTamper(ChainTestCase):
         self.assertFalse(ok)
         self.assertEqual(bad, rid)
 
+    def test_prefix_verification_stops_at_upto_id(self):
+        # Tightening spec T4 (correctness F2, security F7): a
+        # certificate verifies the chain prefix up to its high-water
+        # mark, so tampering AFTER that mark does not fail the prefix —
+        # and tampering INSIDE it still does.
+        self._row()
+        rid2 = self._row(expert="exp-2")
+        rid3 = self._row(expert="exp-1")
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(
+                "UPDATE ledger SET tokens_in=999999 WHERE id=?", (rid3,))
+            conn.commit()
+        finally:
+            conn.close()
+        ok, bad = chain.verify_chain(self.store, upto_id=rid2)
+        self.assertTrue(ok, f"prefix broke at {bad}")
+        ok, bad = chain.verify_chain(self.store)
+        self.assertFalse(ok)
+        self.assertEqual(bad, rid3)
+        ok, bad = chain.verify_chain(self.store, upto_id=rid3)
+        self.assertFalse(ok)
+        self.assertEqual(bad, rid3)
+
 
 _OLD_LEDGER_SCHEMA = """
 CREATE TABLE ledger (
