@@ -37,7 +37,7 @@ from pathlib import Path
 from .executors import (
     Executor,
     GenResult,
-    _extract_first_json_object,
+    _extract_judge_verdict,
     _parse_jsonl_usage,
     build_prompt,
 )
@@ -317,7 +317,7 @@ class OllamaQwenExecutor(Executor):
             )
             if err is not None or obj is None:
                 return None
-            return _extract_first_json_object(obj.get("response") or "")
+            return _extract_judge_verdict(obj.get("response") or "")
         except Exception:
             return None
 
@@ -452,6 +452,6 @@ class DeepSeekExecutor(Executor):
             obj, err = self._chat(_judge_prompt(packet, rubric), timeout=_JUDGE_TIMEOUT_S)
             if err is not None or obj is None:
                 return None
-            return _extract_first_json_object(self._reply_text(obj))
+            return _extract_judge_verdict(self._reply_text(obj))
         except Exception:
             return None

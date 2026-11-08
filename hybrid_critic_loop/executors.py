@@ -181,6 +181,63 @@ def _extract_first_json_object(text: str):
     return None
 
 
+def _looks_like_verdict(obj) -> bool:
+    """A judge verdict maps candidate labels to {"items": {...}} blocks."""
+    return (
+        isinstance(obj, dict) and bool(obj)
+        and all(isinstance(v, dict) and "items" in v for v in obj.values())
+    )
+
+
+def _iter_json_objects(text: str):
+    """Yield every JSON object decodable from ``text``, scanning from each '{'."""
+    decoder = json.JSONDecoder()
+    i, n = 0, len(text)
+    while i < n:
+        j = text.find("{", i)
+        if j < 0:
+            return
+        try:
+            obj, end = decoder.raw_decode(text[j:])
+        except Exception:
+            i = j + 1
+            continue
+        if isinstance(obj, dict):
+            yield obj
+        i = j + max(end, 1)
+
+
+def _extract_judge_verdict(text: str, _depth: int = 0):
+    """The model's verdict from any judge output (fix pass Wave 2.5, review H2).
+
+    Finds the first JSON object with the verdict shape (label -> {"items":
+    ...}) in: plain model text; a codex ``--json`` JSONL stream (the verdict
+    sits in ``item.completed`` events' ``agent_message`` text); a claude
+    ``--output-format json`` envelope (the verdict sits in ``result``); or
+    any wrapper whose text-bearing field carries it. None when absent — the
+    matrix then records no cell for that peer, never a wrapper object.
+    """
+    if not text or _depth > 3:
+        return None
+    for obj in _iter_json_objects(text):
+        if _looks_like_verdict(obj):
+            return obj
+        for key in ("text", "result", "content", "response", "output"):
+            inner = obj.get(key)
+            if isinstance(inner, str) and "{" in inner:
+                found = _extract_judge_verdict(inner, _depth + 1)
+                if found is not None:
+                    return found
+        item = obj.get("item")
+        if isinstance(item, dict):
+            inner = item.get("text") or item.get("content")
+            if isinstance(inner, str) and "{" in inner:
+                found = _extract_judge_verdict(inner, _depth + 1)
+                if found is not None:
+                    return found
+    return None
+
+
 def _find_refusal_line(combined: str) -> str | None:
     markers = ["Not logged in", "Reconnecting", "error sending request"]
     for line in combined.splitlines():
@@ -196,6 +253,13 @@ class Executor:
 
     def available(self) -> tuple[bool, str]:
         return (False, "base executor not available")
+
+    def can_judge(self) -> bool:
+        """Whether this seat can score peers' candidates. Default: the
+        adapter overrides ``judge``. Seats whose ``judge`` is a declared
+        None (Agy, Beam, the local solvers) say False explicitly, so the
+        loop never seats them as matrix peers (fix pass Wave 2.5)."""
+        return type(self).judge is not Executor.judge
 
     def generate(self, worktree: Path, contract: dict, context: str) -> GenResult:
         return GenResult(status="unavailable", detail="base executor", log="")
@@ -254,7 +318,7 @@ class CodexExecutor(Executor):
                 return None
             if result.timed_out:
                 return None
-            parsed = _extract_first_json_object(result.stdout or "")
+            parsed = _extract_judge_verdict(result.stdout or "")
             return parsed
 
 
@@ -302,7 +366,7 @@ class GrokExecutor(Executor):
                 return None
             if result.timed_out:
                 return None
-            return _extract_first_json_object(result.stdout or "")
+            return _extract_judge_verdict(result.stdout or "")
 
 
 AGY_UNVERIFIED_DETAIL = "agy headless invocation not verified"
@@ -346,7 +410,7 @@ def _cli_judge(cmd: str, cwd: Path) -> dict | None:
         return None
     if result.timed_out:
         return None
-    return _extract_first_json_object(result.stdout or "")
+    return _extract_judge_verdict(result.stdout or "")
 
 
 class _PromptCliExecutor(Executor):
@@ -412,6 +476,9 @@ class AgyExecutor(Executor):
 
     def generate(self, worktree: Path, contract: dict, context: str) -> GenResult:
         return GenResult(status="unavailable", log="", detail=AGY_UNVERIFIED_DETAIL, duration_ms=0)
+
+    def can_judge(self) -> bool:
+        return False  # a declared None, not a judge
 
     def judge(self, packet: str, rubric: dict) -> dict | None:
         # judge()'s unavailable form is None (see CodexExecutor/GrokExecutor).
@@ -484,6 +551,9 @@ class BeamExecutor(Executor):
 
     def available(self) -> tuple[bool, str]:
         return (False, BEAM_DETAIL)
+
+    def can_judge(self) -> bool:
+        return False  # no adapter path in this build
 
     def generate(self, worktree: Path, contract: dict, context: str) -> GenResult:
         return GenResult(status="unavailable", log="", detail=BEAM_DETAIL, duration_ms=0)
@@ -563,6 +633,9 @@ class LocalSolverExecutor(Executor):
         except Exception as exc:
             duration_ms = int((time.monotonic() - start) * 1000)
             return GenResult(status="error", log=str(exc), duration_ms=duration_ms, detail=f"{detail}; {exc}")
+
+    def can_judge(self) -> bool:
+        return False  # the local solver family never judges
 
     def judge(self, packet: str, rubric: dict) -> dict | None:
         return None

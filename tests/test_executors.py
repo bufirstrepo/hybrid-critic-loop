@@ -486,5 +486,62 @@ class TestLocalJudgeExecutor(unittest.TestCase):
         self.assertEqual(result.status, "unavailable")
 
 
+class TestJudgeVerdictParsing(unittest.TestCase):
+    """Judge output becomes a verdict only when it has the verdict shape;
+    CLI envelopes are looked through (fix pass Wave 2.5, review H2)."""
+
+    VERDICT = {"A": {"items": {"evidence": {"score": 8, "confidence": 0.9, "evidence": "p", "rationale": "r"}}},
+               "B": {"items": {"evidence": {"score": 3, "confidence": 0.7, "evidence": "q", "rationale": "s"}}}}
+
+    def test_codex_jsonl_stream_yields_the_agent_message_verdict(self):
+        from hybrid_critic_loop.executors import _extract_judge_verdict
+
+        stream = "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "t1"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed", "item": {"id": "i1", "type": "agent_message",
+                                                           "text": "Here you go:\n" + json.dumps(self.VERDICT)}}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}}),
+        ])
+        self.assertEqual(_extract_judge_verdict(stream), self.VERDICT)
+
+    def test_claude_envelope_yields_the_result_verdict(self):
+        from hybrid_critic_loop.executors import _extract_judge_verdict
+
+        envelope = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                               "result": json.dumps(self.VERDICT), "total_cost_usd": 0.01,
+                               "usage": {"input_tokens": 900, "output_tokens": 40}})
+        self.assertEqual(_extract_judge_verdict(envelope), self.VERDICT)
+
+    def test_plain_text_and_prose_wrapped_verdicts(self):
+        from hybrid_critic_loop.executors import _extract_judge_verdict
+
+        self.assertEqual(_extract_judge_verdict(json.dumps(self.VERDICT)), self.VERDICT)
+        self.assertEqual(_extract_judge_verdict("Sure. " + json.dumps(self.VERDICT) + " Done."), self.VERDICT)
+
+    def test_wrapper_without_a_verdict_is_none_not_the_wrapper(self):
+        from hybrid_critic_loop.executors import _extract_judge_verdict, _extract_first_json_object
+
+        stream = json.dumps({"type": "thread.started", "thread_id": "t1"}) + "\n" + json.dumps({"type": "turn.completed"})
+        self.assertIsNone(_extract_judge_verdict(stream))
+        self.assertEqual(_extract_first_json_object(stream)["type"], "thread.started")  # the old behaviour, kept for usage parsing
+        self.assertIsNone(_extract_judge_verdict(""))
+        self.assertIsNone(_extract_judge_verdict("no json here"))
+
+    def test_can_judge_declarations(self):
+        from hybrid_critic_loop.executors import (
+            AgyExecutor, BeamExecutor, ClaudeExecutor, CodexExecutor, GrokExecutor,
+            LocalJudgeExecutor, LocalSolverExecutor,
+        )
+
+        self.assertTrue(CodexExecutor().can_judge())
+        self.assertTrue(GrokExecutor().can_judge())
+        self.assertTrue(ClaudeExecutor().can_judge())
+        self.assertTrue(LocalJudgeExecutor("j", "fam", "strict").can_judge())
+        self.assertFalse(AgyExecutor().can_judge())
+        self.assertFalse(BeamExecutor().can_judge())
+        self.assertFalse(LocalSolverExecutor("s", "naive").can_judge())
+
+
 if __name__ == "__main__":
     unittest.main()

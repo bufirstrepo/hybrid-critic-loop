@@ -72,6 +72,28 @@ KNOWN_FAMILIES = {
 EVENT_TYPES = ("spread_over_threshold", "budget_exhaustion", "retry_cap", "human_gate")
 
 
+def _can_judge(executor) -> bool:
+    """Whether a seat can act as a matrix peer / judge. Executors declare it
+    with ``can_judge()``; older adapters fall back to "overrides judge()"."""
+    fn = getattr(executor, "can_judge", None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001
+            return False
+    from .executors import Executor
+
+    return type(executor).judge is not Executor.judge
+
+
+def _is_available(executor) -> bool:
+    try:
+        ok, _why = executor.available()
+        return bool(ok)
+    except Exception:  # noqa: BLE001 - a broken probe is an unavailable seat
+        return False
+
+
 def _lesson_data_dir(store):
     """Where the readable ``lessons.md`` mirror goes: next to the store's
     database. A store with no location (``:memory:``, or no ``db_path``)
@@ -458,12 +480,14 @@ class _Run:
         store = self.store
         bracket_cfg = bracket_mod.bracket_config(self.contract)
         n_judges = int(judged_item.get("judges", 3))
-        peer_ids = [pid for pid in panel_ids if pid in self.executors]
-        peer_ids += [e for e in sorted(self.executors) if e not in peer_ids]
-        peer_ids = [pid for pid in peer_ids if pid not in {
-            c["expert_id"] for c in field
-        }][:max(n_judges, 1)]
+        peer_ids, skipped = self._seat_peers(panel_ids, n_judges)
         peer_executors = {pid: self.executors[pid] for pid in peer_ids}
+        store.add_ledger(
+            target_id=self.target_id, contract_id=self.contract_id, candidate_id=None,
+            stage=self.contract["stage"], expert_id="queue",
+            tokens_in=None, tokens_out=None, cost_usd=None, outcome="observed",
+            note=f"matrix peers seated={peer_ids}; skipped={skipped}",
+        )
         calibrations = None
         experts_arg = None
         try:
@@ -600,11 +624,46 @@ class _Run:
                 attempt, waiver_candidate, eliminated, gate_results, judged_map, None,
                 waiver_candidate=waiver_candidate, last_gate_details=last_gate_details,
             )
-        self._emit("retry_cap", "peer matrix passed no candidate; no bracket winner")
+        # No retry cap was reached here; the verdict row and the run result
+        # carry the reason (fix pass Wave 2.5: a false retry_cap event was
+        # emitted before).
         return self._escalate(
             attempt, "peer matrix passed no candidate", last_gate_details,
             judged=judged_map,
         )
+
+    def _seat_peers(self, panel_ids, n_judges):
+        """Peers for the validity matrix (fix pass Wave 2.5, review H1).
+
+        Every executor that can judge and is available is a peer, in route
+        order — **contestants included**: the matrix strips self-cells by
+        family (``matrix.build_matrix_cells``), so a seat never scores its
+        own family's candidate, and every other family's candidate gets
+        scored by it. Seats whose family is unknown, that declare they
+        cannot judge, or that report unavailable are skipped and named.
+        The contract's judge count caps the seated peers (a cost dial).
+        Returns ``(seated_ids, [(id, reason), ...])``.
+        """
+        ordered = [pid for pid in panel_ids if pid in self.executors]
+        ordered += [e for e in sorted(self.executors) if e not in ordered]
+        seated, skipped = [], []
+        for pid in ordered:
+            ex = self.executors[pid]
+            if getattr(ex, "family", None) is None:
+                skipped.append((pid, "family unknown"))
+                continue
+            if not _can_judge(ex):
+                skipped.append((pid, "cannot judge"))
+                continue
+            try:
+                ok, why = ex.available()
+            except Exception as exc:  # noqa: BLE001 - a broken probe is an unavailable seat
+                ok, why = False, f"available() raised {type(exc).__name__}"
+            if not ok:
+                skipped.append((pid, f"unavailable: {why}"))
+                continue
+            seated.append(pid)
+        return seated[:max(n_judges, 1)], skipped
 
     def _matrix_judged_map(self, outcome, bracket_cfg, rounds):
         """The verdict's judged block for a matrix run: per-candidate
@@ -637,14 +696,12 @@ class _Run:
         for jid in route.get("judges", []):
             if jid not in experts_map and jid in KNOWN_FAMILIES:
                 experts_map[jid] = {"id": jid, "family": KNOWN_FAMILIES[jid]}
-        # Availability = the executor overrides the base judge() (the base
-        # implementation, inherited by LocalSolverExecutor, returns None:
-        # the local family never judges).
-        from .executors import Executor
-
+        # A seat judges only if it declares it can and reports available
+        # (fix pass Wave 2.5, review 1D-03): Agy, Beam and the local
+        # solvers declare they cannot.
         judge_available = {
             eid for eid, ex in self.executors.items()
-            if type(ex).judge is not Executor.judge
+            if _can_judge(ex) and _is_available(ex)
         }
         contest_families = {c["family"] for c in survivors}
         try:

@@ -509,6 +509,104 @@ class TestInMemoryStoreLeavesTheCwdAlone(LoopV03Base):
         self.assertIsNone(loop_mod._lesson_data_dir(self.store))
 
 
+class FakeSeat(FakeJudge):
+    """A real-panel seat: generates AND judges (the codex/grok/claude shape)."""
+
+    def __init__(self, expert_id, family, marker, scores):
+        super().__init__(expert_id, family, scores)
+        self.marker = marker
+
+    def generate(self, worktree, contract, context):
+        return GenResult(status="completed", log=f"generated {self.marker}",
+                         tokens_in=100, tokens_out=50, cost_usd=None,
+                         request_ids=[], duration_ms=10,
+                         detail=f"marker={self.marker}")
+
+
+class TestSeatsJudgeEachOther(LoopV03Base):
+    """Fix pass Wave 2.5 (review H1, 1D-03, M1): the peer matrix seats every
+    judge-capable, available executor — contestants included, self-cells
+    stripped by family — skips the rest by name, and never calls a no-pass
+    escalation a retry cap."""
+
+    SCORES = {"m-a": 9.0, "m-b": 8.0, "m-c": 7.0}
+
+    def _seats(self, names):
+        for n in names:
+            self.markers[f"seat-{n}"] = f"m-{n}"
+        return {f"seat-{n}": FakeSeat(f"seat-{n}", f"fam-{n}", f"m-{n}", self.SCORES) for n in names}
+
+    def test_three_live_seats_that_generate_and_judge_complete_with_a_full_panel(self):
+        executors = self._seats("abc")
+        self.panel("seat-a", "seat-b", ["seat-c"], ["seat-a", "seat-b", "seat-c"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "completed", result)
+        verdict = self.store.latest_verdict("ctr_fake")
+        self.assertEqual(verdict["judged"]["panel_status"], "full")
+        self.assertEqual(self.store.get_candidate(result["winner"])["expert_id"], "seat-a")
+        rounds = [(r["field_in"], r["field_out"]) for r in verdict["judged"]["bracket"]["rounds"]]
+        self.assertEqual(rounds, [(3, 2), (2, 1)])
+        for cand in self.store.candidates_for("ctr_fake"):
+            for sc in self.store.scores_for(cand["id"]):
+                self.assertNotEqual(sc["judge_family"], cand["family"])  # no self-score, ever
+        notes = [r["note"] or "" for r in self.store.ledger_rows()]
+        self.assertTrue(any(n.startswith("matrix peers seated=['seat-a', 'seat-b', 'seat-c']") for n in notes), notes)
+
+    def test_two_live_seats_reach_a_degraded_verdict_instead_of_escalating(self):
+        executors = self._seats("ab")
+        self.panel("seat-a", "seat-b", [], ["seat-a", "seat-b"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(self.store.latest_verdict("ctr_fake")["judged"]["panel_status"], "degraded")
+        self.assertEqual(self.store.get_candidate(result["winner"])["expert_id"], "seat-a")
+
+    def test_unavailable_and_judge_less_seats_are_skipped_and_named(self):
+        class Unreachable(FakeJudge):
+            def available(self):
+                return (False, "binary not found on PATH")
+
+        class DeclinesToJudge(FakeJudge):
+            def can_judge(self):
+                return False
+
+        executors = {**self._seats("abc"),
+                     "judge-x": Unreachable("judge-x", "fam-x", self.SCORES),
+                     "judge-y": DeclinesToJudge("judge-y", "fam-y", self.SCORES)}
+        self.panel("seat-a", "seat-b", ["seat-c", "judge-x", "judge-y"], ["seat-a", "seat-b", "seat-c"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(executors["judge-x"].calls, 0)
+        self.assertEqual(executors["judge-y"].calls, 0)
+        note = next(n for n in (r["note"] or "" for r in self.store.ledger_rows()) if n.startswith("matrix peers"))
+        self.assertIn("('judge-x', 'unavailable: binary not found on PATH')", note)
+        self.assertIn("('judge-y', 'cannot judge')", note)
+        self.assertNotIn("'judge-x'", note.split("skipped=")[0])
+
+    def test_no_pass_escalation_carries_no_retry_cap_event(self):
+        low = {"m-a": 3.0, "m-b": 3.0, "m-c": 3.0}  # all below the contract min of 6
+        for n in "abc":
+            self.markers[f"seat-{n}"] = f"m-{n}"
+        executors = {f"seat-{n}": FakeSeat(f"seat-{n}", f"fam-{n}", f"m-{n}", low) for n in "abc"}
+        self.panel("seat-a", "seat-b", ["seat-c"], ["seat-a", "seat-b", "seat-c"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "escalated", result)
+        self.assertIn("peer matrix passed no candidate", result["detail"])
+        self.assertEqual([e["type"] for e in self.store.events_for("ctr_fake")], [])
+        self.assertTrue(self.store.latest_verdict("ctr_fake")["escalated"])
+
+
 class TestLowConfidence(LoopV03Base):
     def test_uniform_low_confidence_escalates(self):
         self.markers.update({"gen-a": "m-a", "gen-b": "m-b", "gen-c": "m-c"})

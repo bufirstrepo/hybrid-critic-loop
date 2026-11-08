@@ -424,6 +424,11 @@ class TestDocsMatchTheCode(unittest.TestCase):
         self.assertIn("on a session's first turn", readme)
         self.assertNotIn("injected automatically at session start for the session's domain.", readme)
 
+    def test_readme_describes_peer_seating_as_implemented(self):
+        readme = self._read("README.md")
+        self.assertIn("contestants included, up to the contract's judge count", readme)
+        self.assertIn("skipped and named in the ledger", readme)
+
     def test_readme_slash_usage_matches_the_handler_help(self):
         readme = self._read("README.md")
         self.assertIn("`/critic run <contract.json> [repo_path]`", readme)

@@ -33,7 +33,7 @@ Panel floor: a candidate scored by fewer than 2 distinct peer families has its v
 
 ## The peer validity matrix
 
-The judged gate is a blind peer review, not a judge panel. Every panel family scores every *other* family's candidate; the queue strips self-cells **in code** before dispatch, so no family can score its own work even by construction. Candidates are renamed per peer and identity terms are scrubbed from the packet.
+The judged gate is a blind peer review, not a judge panel. Every seat that can judge and reports available — contestants included, up to the contract's judge count — scores every *other* family's candidate; the queue strips self-cells **in code** before dispatch, so no family can score its own work even by construction. Seats that cannot judge or are unavailable are skipped and named in the ledger. Candidates are renamed per peer and identity terms are scrubbed from the packet.
 
 Four rows (`validity_matrix_v1`):
 
