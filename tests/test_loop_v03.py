@@ -16,6 +16,7 @@ from hybrid_critic_loop import gates as gates_mod
 from hybrid_critic_loop import loop as loop_mod
 from hybrid_critic_loop.contracts import validate_contract
 from hybrid_critic_loop.executors import Executor, GenResult
+from hybrid_critic_loop.reports import ledger_report, verdict_report
 from hybrid_critic_loop.state import Store
 
 ROWS = ["question_fidelity", "completeness", "evidence", "test_agreement"]
@@ -291,9 +292,18 @@ class TestPanelBracket(LoopV03Base):
             set(verdict["eliminated"]) & gen_ids,
             gen_ids - {result["winner"]},
         )
-        # Validity: winner earned its matrix score; cost unreported.
+        # Validity: every scored candidate earned exactly its recorded
+        # matrix median — the winner's final-round 9.0 and each bracket
+        # loser's median from the round that cut it (fix pass Wave 2.7,
+        # review H3: early-round losers were given an invented 0.0
+        # before). The judge seats, dispatched but never scored, stay
+        # unreported. Cost is unreported throughout, so CPVP is too.
         summary = {r["expert_id"]: r for r in self.store.ledger_summary()}
         self.assertAlmostEqual(summary["gen-alpha"]["validity_points"], 9.0)
+        for name, points in (("bravo", 8.0), ("charlie", 7.0), ("delta", 6.0), ("echo", 5.0)):
+            self.assertAlmostEqual(summary[f"gen-{name}"]["validity_points"], points, msg=name)
+        for name in ["alpha", "bravo", "charlie", "delta", "echo"]:
+            self.assertIsNone(summary[f"judge-{name}"]["validity_points"], name)
         for row in summary.values():
             self.assertIsNone(row["cost_per_validity_point"])
         # Events persisted (owner item 8).
@@ -605,6 +615,200 @@ class TestSeatsJudgeEachOther(LoopV03Base):
         self.assertIn("peer matrix passed no candidate", result["detail"])
         self.assertEqual([e["type"] for e in self.store.events_for("ctr_fake")], [])
         self.assertTrue(self.store.latest_verdict("ctr_fake")["escalated"])
+
+
+class TestValidityPointsComeOnlyFromTheMatrix(LoopV03Base):
+    """Fix pass Wave 2.7 (review H3, packet 1A-02/1B-08/1C-06): a validity
+    point is a recorded matrix median and nothing else. Before, an
+    anchor-only winner was handed 10.0 and every unscored candidate 0.0,
+    and the ledger printed both as if measured."""
+
+    def test_anchor_only_winner_earns_no_validity_points(self):
+        # The demo's Phase A shape: the measured anchor leaves one
+        # survivor, the matrix never runs, nothing was ever scored.
+        self.markers.update({"gen-a": "m-a", "gen-b": "m-b"})
+        self.eliminated_at["m-b"] = "measured"
+        executors = {
+            "gen-a": FakeGen("gen-a", "fam-a", "m-a"),
+            "gen-b": FakeGen("gen-b", "fam-b", "m-b"),
+            "judge-z": FakeJudge("judge-z", "fam-z", {"m-a": 9.0, "m-b": 8.0}),
+        }
+        self.panel("gen-a", "gen-b", ["judge-z"], ["gen-a", "gen-b"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(self.store.latest_verdict("ctr_fake")["tie_break"], "single_passer")
+        self.assertEqual(executors["judge-z"].calls, 0)  # the matrix never ran
+        summary = {r["expert_id"]: r for r in self.store.ledger_summary()}
+        for eid in ("gen-a", "gen-b", "judge-z"):
+            self.assertIsNone(summary[eid]["validity_points"], eid)  # no 10.0, no 0.0
+            self.assertIsNone(summary[eid]["cost_per_validity_point"], eid)
+        self.assertNotIn("validity_points=", ledger_report(self.store))
+
+
+def _record_measured_failures(test):
+    """The shared fake evaluator records no measurement rows; the lesson
+    derives its route change from those rows, so record a failing one for
+    every candidate the test eliminates at the measured gate."""
+    base_eval = gates_mod.evaluate_candidate
+    markers, eliminated_at = test.markers, test.eliminated_at
+
+    def eval_with_rows(store, contract, candidate, cwd):
+        gr = base_eval(store, contract, candidate, cwd)
+        if eliminated_at.get(markers.get(candidate["expert_id"])) == "measured":
+            store.add_measurement(
+                candidate["id"], "ops_bench", "ops_per_tick", 120.0, "<=", 8, False
+            )
+        return gr
+
+    gates_mod.evaluate_candidate = eval_with_rows
+    loop_mod.gates_mod.evaluate_candidate = eval_with_rows
+
+
+class TestMeasuredFailureNeedsAnExplicitWaiver(LoopV03Base):
+    """Fix pass Wave 2.7 (review H6, invariant 6): the only way past a
+    measured failure is an explicit waiver, recorded on the verdict row.
+    Before, a plain approval merged the failure and left the row saying
+    the waiver was merely offered."""
+
+    def setUp(self):
+        super().setUp()
+        _record_measured_failures(self)
+
+    def _executors(self):
+        self.markers.update({"gen-a": "m-a", "gen-b": "m-b"})
+        return {
+            "gen-a": FakeGen("gen-a", "fam-a", "m-a"),
+            "gen-b": FakeGen("gen-b", "fam-b", "m-b"),
+            "judge-z": FakeJudge("judge-z", "fam-z", {"m-a": 9.0, "m-b": 8.0}),
+        }
+
+    def test_approving_a_waiver_offered_verdict_is_refused_until_waived(self):
+        executors = self._executors()
+        self.eliminated_at.update({"m-a": "measured", "m-b": "measured"})  # nobody survives
+        self.panel("gen-a", "gen-b", ["judge-z"], ["gen-a", "gen-b"])
+        offered = {}
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: (offered.update(info), "approved")[1],
+        )
+        self.assertTrue(offered.get("waiver_offered"), offered)
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("waive", result["detail"])
+        verdict = self.store.latest_verdict("ctr_fake")
+        self.assertEqual(verdict["human_gate"], "pending")                 # still decidable
+        self.assertEqual(verdict["waiver"]["status"], "offered")
+        self.assertEqual(verdict["measured"], "fail")
+        self.assertEqual(self.store.get_contract("ctr_fake")["status"], "awaiting_human_gate")
+        self.assertIn("waiver: measured gate — offered", verdict_report(self.store, "ctr_fake"))
+        # An explicit waiver merges, and the record says who granted it.
+        done = loop_mod.record_human_gate(
+            self.store, "ctr_fake", "waived", "bench variance accepted by the operator"
+        )
+        self.assertEqual(done["status"], "completed", done)
+        self.assertEqual(done["waiver"]["status"], "granted")
+        verdict = self.store.latest_verdict("ctr_fake")
+        self.assertEqual(verdict["human_gate"], "waived")
+        self.assertEqual(verdict["waiver"]["status"], "granted")
+        self.assertEqual(verdict["waiver"]["by"], "human")
+        self.assertEqual(verdict["waiver"]["reason"], "bench variance accepted by the operator")
+        self.assertEqual(self.store.get_contract("ctr_fake")["status"], "completed")
+        self.assertIn("waiver: measured gate — granted by human", verdict_report(self.store, "ctr_fake"))
+        replay = loop_mod.record_human_gate(self.store, "ctr_fake", "approved")
+        self.assertEqual(replay["status"], "error")
+
+    def test_waiving_a_verdict_without_a_measured_failure_is_refused(self):
+        executors = self._executors()
+        self.eliminated_at["m-b"] = "measured"  # gen-a stands alone, clean
+        self.panel("gen-a", "gen-b", ["judge-z"], ["gen-a", "gen-b"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "waived",
+        )
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("measured failure", result["detail"])
+        self.assertIsNone(self.store.latest_verdict("ctr_fake")["waiver"])
+        done = loop_mod.record_human_gate(self.store, "ctr_fake", "approved")
+        self.assertEqual(done["status"], "completed", done)
+        self.assertIsNone(done["waiver"])
+
+
+class TestGateEvidenceIsPerAttempt(LoopV03Base):
+    """Fix pass Wave 2.7 (review H7, packet 1B-04): the lesson and the
+    escalation flags describe the attempt that decided. Before, hard
+    failures accumulated across attempts, so a retry that won was blamed
+    for the first attempt's failure — the Lesson demoted the winner's own
+    expert — and an escalation after a clean retry still said hard=fail."""
+
+    def setUp(self):
+        super().setUp()
+        base_eval = gates_mod.evaluate_candidate
+
+        def hard_fail_on_the_first_attempt(store, contract, candidate, cwd):
+            if candidate["attempt"] == 1:
+                return gates_mod.CandidateGateResult(
+                    candidate_id=candidate["id"], provenance_ok=True, eliminated_at="hard",
+                    hard=[gates_mod.HardResult(cmd="pytest -q", expected_exit=0,
+                                               exit_code=1, passed=False,
+                                               stderr_tail="1 failed")],
+                )
+            return base_eval(store, contract, candidate, cwd)
+
+        gates_mod.evaluate_candidate = hard_fail_on_the_first_attempt
+        loop_mod.gates_mod.evaluate_candidate = hard_fail_on_the_first_attempt
+        self.markers.update({"gen-a": "m-a", "gen-b": "m-b"})
+
+    def _executors(self, scores):
+        return {
+            "gen-a": FakeGen("gen-a", "fam-a", "m-a"),
+            "gen-b": FakeGen("gen-b", "fam-b", "m-b"),
+            "judge-y": FakeJudge("judge-y", "fam-y", scores),
+            "judge-z": FakeJudge("judge-z", "fam-z", scores),
+        }
+
+    def test_a_retry_that_wins_is_not_blamed_for_the_first_attempts_hard_failure(self):
+        executors = self._executors({"m-a": 9.0, "m-b": 7.0})
+        self.panel("gen-a", "gen-b", ["judge-y", "judge-z"], ["gen-a", "gen-b"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "completed", result)
+        verdict = self.store.latest_verdict("ctr_fake")
+        self.assertEqual(verdict["attempt"], 2)
+        self.assertEqual(verdict["hard"], "pass")
+        self.assertEqual(self.store.get_candidate(result["winner"])["expert_id"], "gen-a")
+        # Both attempts are still on record (generator candidates; the judge
+        # seats are dispatched too and sit beside them as unavailable rows) ...
+        attempts = sorted(c["attempt"] for c in self.store.candidates_for("ctr_fake")
+                          if c["expert_id"].startswith("gen-"))
+        self.assertEqual(attempts, [1, 1, 2, 2])
+        # ... but the Lesson is derived from the deciding attempt's gates:
+        # a clean win, no demotion of the winner's own expert.
+        lesson = self.store.get_lesson(result["lesson_id"])
+        self.assertNotIn("failed the hard gate", lesson["outcome"])
+        self.assertIsNone(lesson["route_change"], lesson)
+        self.assertEqual(self.store.get_route("code")["primary"], "gen-a")
+
+    def test_an_escalation_after_a_clean_retry_reports_the_final_attempts_gates(self):
+        executors = self._executors({"m-a": 3.0, "m-b": 3.0})  # both below the min of 6
+        self.panel("gen-a", "gen-b", ["judge-y", "judge-z"], ["gen-a", "gen-b"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "escalated", result)
+        self.assertIn("peer matrix passed no candidate", result["detail"])
+        verdict = self.store.latest_verdict("ctr_fake")
+        self.assertEqual(verdict["attempt"], 2)
+        self.assertEqual(verdict["hard"], "pass")      # the final attempt passed the hard gate
+        self.assertEqual(verdict["measured"], "pass")
+        lesson = self.store.get_lesson(result["lesson_id"])
+        self.assertIn("escalated", lesson["outcome"])
+        self.assertNotIn("failed the hard gate", lesson["outcome"])
+        self.assertIsNone(lesson["route_change"], lesson)
 
 
 class TestLowConfidence(LoopV03Base):

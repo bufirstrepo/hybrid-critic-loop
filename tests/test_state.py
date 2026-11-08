@@ -305,6 +305,22 @@ class TestVerdicts(StoreTestCase):
         self.store.set_verdict_route_hold(vid, None)
         self.assertIsNone(self.store.latest_verdict(cid)["route_hold"])
 
+    def test_waiver_round_trip(self):
+        # Fix pass Wave 2.7 (review H6): the waiver's state is a verdict-row
+        # fact — offered at the verdict, granted by the human, never merged
+        # silently.
+        cid = self._contract()
+        offered = {"gate": "measured", "status": "offered", "candidate": "w1"}
+        vid = self.store.create_verdict(
+            cid, 1, "w1", [], "pass", "fail", None, False, None, offered, "pending", None)
+        self.assertEqual(self.store.latest_verdict(cid)["waiver"], offered)
+        granted = dict(offered, status="granted", by="human", provenance="human",
+                       reason="bench variance accepted")
+        self.store.set_verdict_waiver(vid, granted)
+        self.assertEqual(self.store.get_verdict(cid, 1)["waiver"], granted)
+        self.store.set_verdict_waiver(vid, None)
+        self.assertIsNone(self.store.latest_verdict(cid)["waiver"])
+
 
 class TestFinalAnswer(StoreTestCase):
     def test_create_final_answer(self):

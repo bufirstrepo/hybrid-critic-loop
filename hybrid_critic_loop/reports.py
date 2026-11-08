@@ -573,6 +573,16 @@ def verdict_report(store, contract_id) -> str:
     ]
     if verdict.get("escalation_reason"):
         lines.append(f"escalation_reason: {verdict.get('escalation_reason')}")
+    waiver = verdict.get("waiver")
+    if isinstance(waiver, dict) and waiver:
+        # The waiver's recorded state (fix pass Wave 2.7, review H6).
+        if waiver.get("status") == "granted":
+            lines.append(f"waiver: measured gate — granted by {waiver.get('by') or 'human'}")
+        else:
+            lines.append(
+                "waiver: measured gate — offered; a plain approval is refused "
+                "(waive explicitly or reject)"
+            )
     judged = verdict.get("judged")
     for entry in _collect_dissent(judged):
         lines.append(

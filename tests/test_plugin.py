@@ -429,6 +429,14 @@ class TestDocsMatchTheCode(unittest.TestCase):
         self.assertIn("contestants included, up to the contract's judge count", readme)
         self.assertIn("skipped and named in the ledger", readme)
 
+    def test_readme_states_the_one_run_validity_and_waiver_rules(self):
+        # Fix pass Wave 2.7 (review H3, H4, H6): the README's rules are the loop's.
+        readme = self._read("README.md")
+        self.assertIn("A contract id is one run", readme)
+        self.assertIn("re-verifies its baseline", readme)
+        self.assertIn("a plain approval is refused", readme)
+        self.assertIn("has no validity points to report", readme)
+
     def test_readme_slash_usage_matches_the_handler_help(self):
         readme = self._read("README.md")
         self.assertIn("`/critic run <contract.json> [repo_path]`", readme)

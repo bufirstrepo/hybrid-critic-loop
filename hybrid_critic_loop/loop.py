@@ -11,6 +11,10 @@ Queue outcomes implemented (spec, Pipeline):
   rejection written in as a constraint (an observation on the new row).
 - Phase-0 tie (both pass, no judged gate): fewer tokens wins; when
   tokens are unreported, wall-clock decides and the basis is recorded.
+- a contract id is one run: a contract that already finished (completed,
+  awaiting its human gate, escalated, rejected) or that left candidates
+  behind answers ``already_run`` and is never dispatched again; a refused
+  contract re-verifies its baseline on its next run (fix pass Wave 2.7).
 
 Exactly four event types ever reach the operator: spread_over_threshold,
 budget_exhaustion, retry_cap, human_gate. Every event is also written
@@ -71,6 +75,10 @@ KNOWN_FAMILIES = {
 
 EVENT_TYPES = ("spread_over_threshold", "budget_exhaustion", "retry_cap", "human_gate")
 
+# Contract statuses that end a run. The contract id is spent (fix pass
+# Wave 2.7, review H4 + 1C-11): a second run answers ``already_run``.
+FINISHED_STATUSES = ("completed", "awaiting_human_gate", "escalated", "rejected")
+
 
 def _can_judge(executor) -> bool:
     """Whether a seat can act as a matrix peer / judge. Executors declare it
@@ -128,6 +136,10 @@ class _Run:
         # the verdict's panel was degraded (owner floor rule, README
         # "Panel floor"): the run result carries it as route_change_hold.
         self.route_hold: dict | None = None
+        # Candidate id -> the last validity median the peer matrix recorded
+        # for it in the final attempt's bracket (fix pass Wave 2.7, review
+        # H3): the only source of validity points.
+        self.matrix_validity: dict[str, float] = {}
 
     # -- events ---------------------------------------------------------
     def _emit(self, type_: str, detail: str):
@@ -185,6 +197,33 @@ class _Run:
         if budget.get("usd") is not None and cost >= budget["usd"]:
             return f"usd budget exhausted ({cost} >= {budget['usd']})"
         return None
+
+    def _already_run(self, status) -> dict:
+        """A contract id is one run (fix pass Wave 2.7, review H4 + 1C-11):
+        the recorded status, and for a pending gate the surface that
+        completes it, instead of a second dispatch."""
+        if status == "awaiting_human_gate":
+            hint = ("its human gate is pending — decide it with the critic_gate tool, "
+                    "`/critic gate <id> approve|reject|waive` or `hermes critic gate`, "
+                    "not a re-run")
+        elif status == "completed":
+            hint = "its winner is merged and its verdict recorded"
+        elif status == "escalated":
+            hint = "it escalated to the operator; open a new contract id for another attempt"
+        elif status == "rejected":
+            verdict = self.store.latest_verdict(self.contract_id) or {}
+            follow_up = f"{self.contract_id}_rej{verdict.get('attempt', 1)}"
+            hint = f"the rejection opened {follow_up}; run that contract"
+        else:
+            hint = ("a previous run left candidates behind; open a new contract id "
+                    "for another attempt")
+        return {
+            "contract_id": self.contract_id, "status": "already_run",
+            "contract_status": status,
+            "detail": (f"contract {self.contract_id} already ran (status {status}); "
+                       f"a contract id is one run — {hint}"),
+            "events": self.events,
+        }
 
     # -- generation ----------------------------------------------------
     def _context_for(self, retry_notes: str) -> str:
@@ -261,7 +300,22 @@ class _Run:
         self._ensure_rows()
         contract_row = store.get_contract(self.contract_id)
 
-        if contract_row.get("acceptance_baseline_run") is None:
+        # A contract id is one run (fix pass Wave 2.7, review H4 + 1C-11).
+        # A finished contract is never dispatched again — its verdict,
+        # candidates and merge are facts — and a run interrupted after
+        # dispatch left candidates whose ids a second dispatch would
+        # collide with. Before, the only guard was the baseline row, which
+        # a first run had already written.
+        status = contract_row.get("status")
+        if status in FINISHED_STATUSES or store.candidates_for(self.contract_id):
+            return self._already_run(status)
+
+        # Baseline rule (invariant 3): the acceptance suite must have FAILED
+        # on the unmodified baseline before any candidate is dispatched.
+        # Only a recorded failing baseline skips the check; a refused
+        # contract (its row says "pass") is re-verified against the current
+        # tree on its next run instead of slipping past the rule.
+        if contract_row.get("acceptance_baseline_run") != "fail":
             proceed, detail = verify_baseline(store, self.contract, self.repo_path, self.mgr)
             if not proceed:
                 store.set_contract_status(self.contract_id, "refused")
@@ -276,6 +330,15 @@ class _Run:
                     "detail": "acceptance tests pass on the baseline; the contract is vacuous and was refused",
                     "baseline": detail, "events": self.events,
                 }
+            if status == "refused":
+                store.set_contract_status(self.contract_id, "open")
+                store.add_ledger(
+                    target_id=self.target_id, contract_id=self.contract_id, candidate_id=None,
+                    stage=self.contract["stage"], expert_id="queue", tokens_in=None,
+                    tokens_out=None, cost_usd=None, outcome="observed",
+                    note=("baseline re-verified on re-run: acceptance now fails on the "
+                          "baseline; contract reopened"),
+                )
 
         category = router_mod.category_of(self.contract["domain"])
         route = router_mod.route_for(store, category)
@@ -301,6 +364,14 @@ class _Run:
             if exhausted:
                 self._emit("budget_exhaustion", exhausted)
                 return self._escalate(attempt, exhausted, last_gate_details)
+
+            # Gate evidence is per attempt (fix pass Wave 2.7, review H7):
+            # the Lesson and the escalation flags describe the attempt that
+            # decided, not a hard failure a retry already recovered from.
+            # Candidate -> expert stays: it is keyed by candidate id.
+            last_gate_details["hard_failures"] = []
+            last_gate_details["measurements"] = []
+            last_gate_details["judged"] = None
 
             # Generation wave: identical inputs, isolated worktrees.
             context = self._context_for(retry_notes)
@@ -497,6 +568,8 @@ class _Run:
             calibrations = None
 
         by_id = {c["id"]: c for c, _ in generated}
+        # Validity points come from this attempt's bracket only (review H3).
+        self.matrix_validity = {}
         eliminated_total: list[str] = []
         rounds: list[dict] = []
         judged_map: dict[str, dict] = {}
@@ -515,6 +588,13 @@ class _Run:
                 calibrations=calibrations,
                 seed=attempt,
             )
+            # Every recorded median is a measured validity score (fix pass
+            # Wave 2.7, review H3): keep the last one per candidate, so a
+            # candidate the bracket cuts in an early round still earns
+            # exactly what the matrix gave it — and nothing else does.
+            for cid, entry in outcome.per_candidate.items():
+                if isinstance(entry, dict) and entry.get("median_mean") is not None:
+                    self.matrix_validity[cid] = float(entry["median_mean"])
 
             if outcome.rerun_requests and not rerun_used:
                 # A dissent cites a gate the majority may have missed:
@@ -803,23 +883,26 @@ class _Run:
 
     # -- validity / calibration -------------------------------------------
     def _record_validity(self, winner, eliminated, gate_results, judged_map):
-        """Record validity points once, at the final verdict.
+        """Record validity points once, at the final verdict — and only
+        from recorded matrix medians (fix pass Wave 2.7, review H3).
 
         A validity point is one point of final validity score from the
-        peer matrix: the winner earns its matrix median_mean, each
-        eliminated candidate earns its own (0.0 when the matrix never
-        scored it or no judged gate ran). Cost per expert is the
-        candidate's recorded cost_usd — left unreported (None) when
-        the executor did not report one, so cost-per-validity-point
-        stays "not reported" rather than invented (owner item 4).
-        Calibration is then refreshed from the score/verdict history.
+        peer matrix: a candidate's ``median_mean`` in the verdict's judged
+        map or, for a candidate the bracket cut in an earlier round of the
+        same attempt, the median that cut it (``self.matrix_validity``).
+        A candidate the matrix never scored — an anchor-only winner, a
+        gate-eliminated candidate, a seat that produced nothing, a run
+        whose matrix never ran — earns NO entry: its ledger line keeps
+        ``validity_points`` unreported instead of an invented 10.0 or 0.0,
+        and cost per validity point stays "not reported" (invariant 5:
+        never estimated). Cost per expert is the candidate's recorded
+        cost_usd — None when the executor did not report one (owner item
+        4). Calibration is then refreshed from the score/verdict history.
         """
         store = self.store
         if not hasattr(store, "record_validity"):
             return
-        by_id: dict = {}
-        for cand in store.candidates_for(self.contract_id):
-            by_id[cand["id"]] = cand
+        by_id = {cand["id"]: cand for cand in store.candidates_for(self.contract_id)}
         winner_cand = winner if isinstance(winner, dict) else by_id.get(winner)
         ordered = ([winner_cand] if winner_cand else []) + [
             by_id[cid] for cid in eliminated if cid in by_id
@@ -828,14 +911,15 @@ class _Run:
         for cand in ordered:
             if cand is None or cand["expert_id"] in seen:
                 continue
+            entry = (judged_map or {}).get(cand["id"])
+            points = entry.get("median_mean") if isinstance(entry, dict) else None
+            if points is None:
+                points = self.matrix_validity.get(cand["id"])
+            if points is None:
+                continue  # never scored by the matrix: nothing to record
             seen.add(cand["expert_id"])
-            entry = (judged_map or {}).get(cand["id"]) or {}
-            points = entry.get("median_mean")
-            points = float(points) if points is not None else (
-                10.0 if winner_cand is not None and cand["id"] == winner_cand["id"] else 0.0
-            )
             try:
-                store.record_validity(cand["expert_id"], points, cand.get("cost_usd"))
+                store.record_validity(cand["expert_id"], float(points), cand.get("cost_usd"))
             except Exception:  # noqa: BLE001 - bookkeeping must not break a verdict
                 pass
         try:
@@ -887,12 +971,15 @@ class _Run:
         }
         if self.route_hold is not None:
             result["route_change_hold"] = self.route_hold
+        # The gate is pending from here until record_human_gate completes
+        # it — whether the decider answers now or an operator does later;
+        # a refused decision leaves the contract at its gate (Wave 2.7).
+        store.set_contract_status(self.contract_id, "awaiting_human_gate")
         if self.human_decider is not None:
             decision = self.human_decider(
                 {"winner": winner["id"], "waiver_offered": is_waiver, "verdict_id": verdict_id}
             )
             return self._apply_human_gate(verdict_id, decision, result)
-        store.set_contract_status(self.contract_id, "awaiting_human_gate")
         return result
 
     def _apply_human_gate(self, verdict_id, decision, result):
@@ -1000,8 +1087,11 @@ def run_contract(store, contract: dict, repo_path, executors: dict, human_decide
 def record_human_gate(store, contract_id: str, decision: str, reason: str | None = None,
                       _result: dict | None = None, _mgr: WorktreeManager | None = None) -> dict:
     """Complete a pending human gate: approved merges the winner and
-    writes the final answer; waived applies only to a measured failure;
-    rejected creates a new contract carrying the rejection."""
+    writes the final answer — refused when the verdict carries an offered
+    waiver (the winner failed the measured gate), where only an explicit
+    ``waived`` merges and is recorded on the verdict row as granted;
+    waived applies only to a measured failure, never a hard one; rejected
+    creates a new contract carrying the rejection."""
     if decision not in ("approved", "rejected", "waived"):
         return {"contract_id": contract_id, "status": "error",
                 "detail": f"unknown human-gate decision {decision!r}"}
@@ -1046,8 +1136,22 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
         return result
 
     winner = store.get_candidate(verdict["winner"])
+    waiver = verdict.get("waiver") or {}
+    if decision == "approved" and waiver:
+        # The winner failed the measured gate (fix pass Wave 2.7, review
+        # H6, invariant 6): the only way past a measured failure is an
+        # explicit waiver, recorded as such. A plain approval would merge
+        # the failure silently with the row still saying "offered".
+        result.update({
+            "status": "error", "human_gate": "pending",
+            "detail": (
+                f"approval refused: winner {winner['id']} failed the measured gate and "
+                "the verdict carries an offered waiver; waive it explicitly (decision "
+                "'waived', with a reason) or reject — the gate stays pending"
+            ),
+        })
+        return result
     if decision == "waived":
-        waiver = verdict.get("waiver") or {}
         if waiver.get("gate") != "measured" or waiver.get("candidate") != winner["id"]:
             return {"contract_id": contract_id, "status": "error",
                     "detail": "waiver applies only to a measured failure, never a hard one"}
@@ -1062,8 +1166,20 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
     mgr.remove(wt)
     waiver_record = None
     if decision == "waived":
-        waiver_record = {"gate": "measured", "by": "human", "provenance": "human",
-                         "candidate": winner["id"]}
+        # The waiver is granted, by a human, for a reason — on the verdict
+        # row, not only in the run result (fix pass Wave 2.7, review H6).
+        waiver_record = dict(waiver)
+        waiver_record.update({
+            "gate": "measured", "status": "granted", "by": "human",
+            "provenance": "human", "candidate": winner["id"],
+            "reason": reason or "waived at the human gate",
+        })
+        setter = getattr(store, "set_verdict_waiver", None)
+        if callable(setter):
+            try:
+                setter(verdict["id"], waiver_record)
+            except Exception:  # noqa: BLE001 - bookkeeping must not undo a merge
+                pass
     store.create_final_answer(
         target_id=contract["target_id"], contract_id=contract_id,
         commit=f"git:{merged_sha}",

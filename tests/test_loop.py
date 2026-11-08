@@ -168,6 +168,54 @@ class TestRunOne(LoopTestBase):
         self.assertEqual(replay["status"], "error")
         self.assertIn("NotImplementedError", (self.repo / "src" / "speed_sampler.py").read_text())
 
+    def _head(self):
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(self.repo), capture_output=True, text=True,
+        ).stdout.strip()
+
+    def test_a_finished_contract_is_not_run_twice(self):
+        # A contract id is one run (fix pass Wave 2.7, review H4 + 1C-11):
+        # before, a second run skipped the baseline rule (the row already
+        # said "fail"), re-dispatched the panel and died on the candidate
+        # ids — now it answers already_run and touches nothing.
+        contract = load_contract_file(ROOT / "contracts" / "demo1.json")
+        first = loop_mod.run_contract(
+            self.store, contract, self.repo, _local_executors(),
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(first["status"], "completed", json.dumps(first, indent=2))
+        candidates = [c["id"] for c in self.store.candidates_for("ctr_demo_1")]
+        head = self._head()
+        again = loop_mod.run_contract(
+            self.store, contract, self.repo, _local_executors(),
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(again["status"], "already_run", again)
+        self.assertEqual(again["contract_status"], "completed")
+        self.assertIn("a contract id is one run", again["detail"])
+        self.assertEqual([c["id"] for c in self.store.candidates_for("ctr_demo_1")], candidates)
+        self.assertEqual(self._head(), head)  # nothing dispatched, nothing merged
+        self.assertEqual(self.store.latest_verdict("ctr_demo_1")["human_gate"], "approved")
+
+    def test_rerunning_a_contract_at_its_gate_points_to_the_gate(self):
+        contract = load_contract_file(ROOT / "contracts" / "demo1.json")
+        result = loop_mod.run_contract(
+            self.store, contract, self.repo, _local_executors(), human_decider=None
+        )
+        self.assertEqual(result["status"], "awaiting_human_gate")
+        again = loop_mod.run_contract(
+            self.store, contract, self.repo, _local_executors(),
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(again["status"], "already_run", again)
+        self.assertEqual(again["contract_status"], "awaiting_human_gate")
+        self.assertIn("critic_gate", again["detail"])
+        self.assertEqual(len(self.store.candidates_for("ctr_demo_1")), 2)
+        self.assertIn("NotImplementedError", (self.repo / "src" / "speed_sampler.py").read_text())
+        # The gate itself still completes the contract.
+        done = loop_mod.record_human_gate(self.store, "ctr_demo_1", "approved")
+        self.assertEqual(done["status"], "completed", done)
+
 
 class TestRepositoryPathWithWhitespace(unittest.TestCase):
     """A repository path containing a space must survive every git call.
@@ -240,7 +288,14 @@ class TestRepositoryPathWithWhitespace(unittest.TestCase):
 
 
 class TestBaselineRefusal(LoopTestBase):
-    def test_vacuous_contract_refused(self):
+    def _commit(self, message):
+        _git(["add", "-A"], self.repo)
+        _git(
+            ["-c", "user.email=t@local", "-c", "user.name=t", "commit", "-q", "-m", message],
+            self.repo,
+        )
+
+    def _pre_implement(self):
         # Pre-implement the sampler so acceptance passes on the baseline.
         impl = (FIXTURE / "src" / "speed_sampler.py").read_text()
         ring = (
@@ -265,11 +320,10 @@ class TestBaselineRefusal(LoopTestBase):
         )
         assert impl  # fixture stub read for shape only
         (self.repo / "src" / "speed_sampler.py").write_text(ring)
-        _git(["add", "-A"], self.repo)
-        _git(
-            ["-c", "user.email=t@local", "-c", "user.name=t", "commit", "-q", "-m", "pre-implemented"],
-            self.repo,
-        )
+        self._commit("pre-implemented")
+
+    def test_vacuous_contract_refused(self):
+        self._pre_implement()
         contract = load_contract_file(ROOT / "contracts" / "demo1.json")
         result = loop_mod.run_contract(
             self.store, contract, self.repo, _local_executors(),
@@ -277,6 +331,48 @@ class TestBaselineRefusal(LoopTestBase):
         )
         self.assertEqual(result["status"], "refused_baseline")
         self.assertEqual(self.store.candidates_for("ctr_demo_1"), [])
+
+    def test_a_refused_contract_is_re_verified_not_dispatched_on_the_next_run(self):
+        # Fix pass Wave 2.7 (review H4): the refusal wrote "pass" on the row
+        # and the old guard only re-checked a row with no baseline at all,
+        # so the second run of a vacuous contract dispatched the panel.
+        self._pre_implement()
+        contract = load_contract_file(ROOT / "contracts" / "demo1.json")
+        for _ in range(2):
+            result = loop_mod.run_contract(
+                self.store, contract, self.repo, _local_executors(),
+                human_decider=lambda info: "approved",
+            )
+            self.assertEqual(result["status"], "refused_baseline", result)
+        self.assertEqual(self.store.candidates_for("ctr_demo_1"), [])
+        self.assertEqual(self.store.get_contract("ctr_demo_1")["status"], "refused")
+        notes = [r["note"] or "" for r in self.store.ledger_rows()]
+        self.assertEqual(sum("refused as vacuous" in n for n in notes), 2, notes)
+
+    def test_a_refused_contract_runs_once_its_baseline_fails(self):
+        self._pre_implement()
+        contract = load_contract_file(ROOT / "contracts" / "demo1.json")
+        refused = loop_mod.run_contract(
+            self.store, contract, self.repo, _local_executors(),
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(refused["status"], "refused_baseline")
+        # The operator restores the stub: the acceptance suite fails on
+        # the baseline again, so the same contract id may now run.
+        (self.repo / "src" / "speed_sampler.py").write_text(
+            (FIXTURE / "src" / "speed_sampler.py").read_text()
+        )
+        self._commit("stub restored")
+        result = loop_mod.run_contract(
+            self.store, contract, self.repo, _local_executors(),
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "completed", json.dumps(result, indent=2))
+        row = self.store.get_contract("ctr_demo_1")
+        self.assertEqual(row["acceptance_baseline_run"], "fail")
+        self.assertEqual(row["status"], "completed")
+        notes = [r["note"] or "" for r in self.store.ledger_rows()]
+        self.assertTrue(any("baseline re-verified" in n for n in notes), notes)
 
 
 if __name__ == "__main__":

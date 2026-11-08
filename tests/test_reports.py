@@ -339,5 +339,36 @@ class TestVerdictReport(unittest.TestCase):
         self.assertNotIn("panel_status:", report)
 
 
+class TestVerdictReportWaiver(unittest.TestCase):
+    """Fix pass Wave 2.7 (review H6): the verdict report prints the waiver's
+    recorded state — offered at the verdict, granted by the human — from
+    the real verdict row."""
+
+    def test_verdict_report_prints_the_waiver_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "data.db")
+            try:
+                tid = store.create_target("ask", "code", constraints=[], budget=None)
+                cid = store.create_contract(
+                    tid, stage="implement", task="t", domain="code", tags=[], acceptance=[])
+                vid = store.create_verdict(
+                    cid, 1, "w1", [], "pass", "fail", None, False, None,
+                    {"gate": "measured", "status": "offered", "candidate": "w1"},
+                    "pending", None)
+                report = verdict_report(store, cid)
+                self.assertIn("measured: fail", report)
+                self.assertIn("waiver: measured gate — offered", report)
+                self.assertIn("human_gate: pending", report)
+                store.set_verdict_waiver(
+                    vid, {"gate": "measured", "status": "granted", "candidate": "w1",
+                          "by": "human", "reason": "variance accepted"})
+                store.set_verdict_human_gate(vid, "waived")
+                report = verdict_report(store, cid)
+                self.assertIn("waiver: measured gate — granted by human", report)
+                self.assertIn("human_gate: waived", report)
+            finally:
+                store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

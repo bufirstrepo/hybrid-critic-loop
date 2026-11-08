@@ -690,6 +690,17 @@ class Store:
         )
         self._conn.commit()
 
+    def set_verdict_waiver(self, verdict_id, waiver):
+        """Record the verdict's waiver state (fix pass Wave 2.7, review H6):
+        ``offered`` at the verdict when the winner failed the measured gate,
+        ``granted`` once a human waived it explicitly. ``waiver`` is a dict
+        stored as JSON, or None to clear it."""
+        self._conn.execute(
+            "UPDATE verdicts SET waiver_json=? WHERE id=?",
+            (_dumps(waiver), verdict_id),
+        )
+        self._conn.commit()
+
     @staticmethod
     def _verdict_dict(row):
         return {
