@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 from hybrid_critic_loop.reports import (
+    build_matrix_view,
     ledger_report,
     matrix_report,
     verdict_report,
@@ -105,6 +106,27 @@ class TestLedgerReport(unittest.TestCase):
             report = ledger_report(store)
             self.assertIn("exp-1", report)
             self.assertIn("cpvp=not reported", report)
+
+    def test_ledger_report_prints_unavailability_errors_and_the_queues_rows(self):
+        # Fix pass Wave 2.8 (review M3): what each seat did, by name; the
+        # queue's notes are printed as notes, never counted as dispatches.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._real_store(tmp)
+            store.add_ledger("tgt-1", "ctr-1", "cand-1", "implement", "exp-1",
+                             10, 5, None, "completed", None)
+            store.add_ledger("tgt-1", "ctr-1", "cand-2", "implement", "exp-1",
+                             None, None, None, "unavailable", "binary not found on PATH")
+            store.add_ledger("tgt-1", "ctr-1", None, "implement", "queue",
+                             None, None, None, "observed", "bracket round 1: field 2 -> 1")
+            store.add_ledger("tgt-1", "ctr-1", None, "implement", "queue",
+                             None, None, None, "escalated",
+                             "acceptance passed on baseline; contract refused as vacuous")
+            report = ledger_report(store)
+            self.assertIn(
+                "exp-1: dispatches=2 completed=1 refused=0 timeout=0 unavailable=1 error=0", report)
+            self.assertIn("queue: observed — bracket round 1: field 2 -> 1", report)
+            self.assertIn("queue: escalated — acceptance passed on baseline", report)
+            self.assertNotIn("queue: dispatches=", report)
 
     @unittest.skipUnless(
         hasattr(Store, "record_validity"),
@@ -226,6 +248,45 @@ class TestMatrixReport(unittest.TestCase):
     def test_matrix_report_not_run_on_empty_store(self):
         store = FakeMatrixStore([], {})
         self.assertEqual(matrix_report(store, "ctr-1"), "matrix: not run")
+
+    def test_not_run_view_names_the_validity_rubrics_rows(self):
+        # Fix pass Wave 2.8 (review M6 / 1C-14): the rows are the validity
+        # rubric's own, also before anything ran.
+        from hybrid_critic_loop import reports as reports_mod
+        from hybrid_critic_loop.matrix import VALIDITY_ROWS
+
+        self.assertEqual(reports_mod.MATRIX_ROWS, list(VALIDITY_ROWS))
+        candidates = [{
+            "id": "cand-1", "contract_id": "ctr-1", "attempt": 1,
+            "expert_id": "exp-a", "family": "fam-a",
+        }]
+        view = build_matrix_view(FakeMatrixStore(candidates, {}), "ctr-1")
+        self.assertEqual(view["note"], "not run")
+        self.assertEqual(view["rows"], list(VALIDITY_ROWS))
+        self.assertNotIn("correctness", view["rows"])
+
+    def test_a_cell_scored_in_several_rounds_is_marked(self):
+        # Fix pass Wave 2.8 (review M5): a judge scores the same candidate
+        # once per bracket round; the view keeps the last cell and says so.
+        candidates = [{
+            "id": "cand-1", "contract_id": "ctr-1", "attempt": 1,
+            "expert_id": "exp-a", "family": "fam-a",
+        }]
+        scores = {
+            "cand-1": [
+                _matrix_score("cand-1", "judge-1", {"question_fidelity": 7.0}, 7.0),
+                _matrix_score("cand-1", "judge-1", {"question_fidelity": 8.0}, 8.0),
+                _matrix_score("cand-1", "judge-2", {"question_fidelity": 6.0}, 6.0),
+            ],
+        }
+        view = build_matrix_view(FakeMatrixStore(candidates, scores), "ctr-1")
+        cells = view["candidates"]["cand-1"]["cells"]
+        self.assertEqual(cells["judge-1"]["items"]["question_fidelity"], 8.0)
+        self.assertEqual(cells["judge-1"]["rounds_scored"], 2)
+        self.assertEqual(cells["judge-2"]["rounds_scored"], 1)
+        report = matrix_report(FakeMatrixStore(candidates, scores), "ctr-1")
+        self.assertIn("judge-1=8.0 (last of 2 rounds)", report)
+        self.assertNotIn("judge-2=6.0 (last", report)
 
     def test_matrix_report_seeded_grid_renders_dissent(self):
         candidates = [{

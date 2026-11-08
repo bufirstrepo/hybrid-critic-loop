@@ -784,6 +784,78 @@ class TestLedgerSummaryValidity(StoreTestCase):
         self.assertIsNone(ghost_row["cost_per_validity_point"])
 
 
+class TestLedgerGenerationOutcomes(StoreTestCase):
+    """Fix pass Wave 2.8 (review M3): the ledger records what a seat did —
+    unavailable and error are outcomes of their own — and the summary counts
+    a dispatch only for a generation row, so the queue's notes never read as
+    dispatches."""
+
+    def test_unavailable_and_error_are_outcomes_and_only_generations_count(self):
+        tid = self._target()
+        cid = self._contract(tid)
+        for outcome in ("completed", "refused", "unavailable", "error"):
+            self.store.add_ledger(tid, cid, f"cand-{outcome}", "solve", "exp-1",
+                                  None, None, None, outcome)
+        self.store.add_ledger(tid, cid, None, "solve", "exp-1", None, None, None,
+                              "observed", note="route_change held")
+        self.store.add_ledger(tid, cid, None, "solve", "queue", None, None, None,
+                              "observed", note="bracket round 1")
+        self.store.add_ledger(tid, cid, None, "solve", "queue", None, None, None,
+                              "escalated", note="refused as vacuous")
+        summary = {s["expert_id"]: s for s in self.store.ledger_summary()}
+        row = summary["exp-1"]
+        self.assertEqual(row["dispatches"], 4)
+        self.assertEqual(
+            (row["completed"], row["refused"], row["unavailable"], row["error"], row["timeout"]),
+            (1, 1, 1, 1, 0))
+        self.assertNotIn("queue", summary)
+        self.assertEqual([r["outcome"] for r in self.store.ledger_rows("queue")],
+                         ["observed", "escalated"])
+
+
+class TestTwoStoresOnOneFile(StoreTestCase):
+    """Fix pass Wave 2.8 (review M7 / 1C-11, queued F-W20-07): two Store
+    objects on one database file — the plugin's and the CLI's — must never
+    hand out the same generated id. The scan-and-insert runs inside a write
+    transaction, so the second store waits for the first."""
+
+    def test_generated_ids_do_not_collide_across_stores(self):
+        import threading
+        import time
+
+        other = Store(self.db_path)
+        try:
+            tid = self._target()
+            first = self.store
+            original = first._next_id
+
+            def slow_next_id(prefix, table):
+                value = original(prefix, table)
+                time.sleep(0.4)  # the window in which the other store scans
+                return value
+
+            first._next_id = slow_next_id
+            results, errors = {}, []
+
+            def create_a():
+                try:
+                    results["a"] = first.create_contract(
+                        tid, stage="solve", task="a", domain="code", tags=[], acceptance=[])
+                except Exception as exc:  # noqa: BLE001 - the test reports it
+                    errors.append(repr(exc))
+
+            worker = threading.Thread(target=create_a)
+            worker.start()
+            time.sleep(0.1)
+            results["b"] = other.create_contract(
+                tid, stage="solve", task="b", domain="code", tags=[], acceptance=[])
+            worker.join(15)
+            self.assertEqual(errors, [])
+            self.assertEqual(sorted(results.values()), ["ctr_0001", "ctr_0002"])
+        finally:
+            other.close()
+
+
 class TestVerdictHoldMigration(unittest.TestCase):
     """A v0.3 database (verdicts without route_hold_json) opens and gains the
     column; its old rows read back with route_hold None (fix pass Wave 2.1)."""

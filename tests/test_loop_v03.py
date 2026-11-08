@@ -306,6 +306,21 @@ class TestPanelBracket(LoopV03Base):
             self.assertIsNone(summary[f"judge-{name}"]["validity_points"], name)
         for row in summary.values():
             self.assertIsNone(row["cost_per_validity_point"])
+        # Wins and losses are charged to seats that fielded a candidate
+        # (fix pass Wave 2.8, review M3): one loss per losing generator,
+        # none for the judge seats, which produced nothing.
+        self.assertEqual((summary["gen-alpha"]["wins"], summary["gen-alpha"]["losses"]), (1, 0))
+        for name in ["bravo", "charlie", "delta", "echo"]:
+            self.assertEqual((summary[f"gen-{name}"]["wins"], summary[f"gen-{name}"]["losses"]), (0, 1), name)
+        for name in ["alpha", "bravo", "charlie", "delta", "echo"]:
+            self.assertEqual(self.store.get_expert(f"judge-{name}")["losses"], 0, name)
+        # The judge seats were dispatched and declined to generate: the
+        # ledger says `unavailable`, not `refused`, and the summary counts
+        # exactly one dispatch for each seat.
+        for name in ["alpha", "bravo", "charlie", "delta", "echo"]:
+            row = summary[f"judge-{name}"]
+            self.assertEqual((row["dispatches"], row["unavailable"], row["refused"]), (1, 1, 0), name)
+        self.assertNotIn("queue", summary)  # the queue's notes are not dispatches
         # Events persisted (owner item 8).
         types = [e["type"] for e in self.store.events_for("ctr_fake")]
         self.assertIn("human_gate", types)
@@ -614,7 +629,17 @@ class TestSeatsJudgeEachOther(LoopV03Base):
         self.assertEqual(result["status"], "escalated", result)
         self.assertIn("peer matrix passed no candidate", result["detail"])
         self.assertEqual([e["type"] for e in self.store.events_for("ctr_fake")], [])
-        self.assertTrue(self.store.latest_verdict("ctr_fake")["escalated"])
+        verdict = self.store.latest_verdict("ctr_fake")
+        self.assertTrue(verdict["escalated"])
+        # The round that ended in escalation says so (fix pass Wave 2.8,
+        # C-08): the record shows the field, how many passed, and why the
+        # ladder did not land on two.
+        rounds = verdict["judged"]["bracket"]["rounds"]
+        self.assertEqual([(r["field_in"], r["field_out"], r["passed"]) for r in rounds], [(3, 0, 0)])
+        note = next(n for n in (r["note"] or "" for r in self.store.ledger_rows())
+                    if n.startswith("bracket round 1"))
+        self.assertIn("passed=0", note)
+        self.assertIn("no candidate passed the matrix", note)
 
 
 class TestValidityPointsComeOnlyFromTheMatrix(LoopV03Base):
@@ -791,6 +816,10 @@ class TestGateEvidenceIsPerAttempt(LoopV03Base):
         self.assertNotIn("failed the hard gate", lesson["outcome"])
         self.assertIsNone(lesson["route_change"], lesson)
         self.assertEqual(self.store.get_route("code")["primary"], "gen-a")
+        # The winner is not charged a loss for its own first attempt
+        # (fix pass Wave 2.8, review M3).
+        self.assertEqual((self.store.get_expert("gen-a")["wins"], self.store.get_expert("gen-a")["losses"]), (1, 0))
+        self.assertEqual(self.store.get_expert("gen-b")["losses"], 1)
 
     def test_an_escalation_after_a_clean_retry_reports_the_final_attempts_gates(self):
         executors = self._executors({"m-a": 3.0, "m-b": 3.0})  # both below the min of 6
@@ -809,6 +838,151 @@ class TestGateEvidenceIsPerAttempt(LoopV03Base):
         self.assertIn("escalated", lesson["outcome"])
         self.assertNotIn("failed the hard gate", lesson["outcome"])
         self.assertIsNone(lesson["route_change"], lesson)
+
+
+class TestBracketRecordIsComplete(LoopV03Base):
+    """Fix pass Wave 2.8 (review M5, C-08): the matrix-pass anchor is applied
+    before the cut, every round records who was scored how, and a dissent
+    re-run refreshes the evidence the Lesson is derived from."""
+
+    def test_a_matrix_failer_does_not_displace_a_passer_at_the_cut(self):
+        for n in "abcd":
+            self.markers[f"gen-{n}"] = f"m-{n}"
+        scores = {"m-a": 9.5, "m-b": 8.0, "m-c": 7.0, "m-d": 6.5}
+        # gen-a: the highest median, but one rubric row far below the
+        # floor — the matrix fails it. It must not consume a slot that a
+        # passer below it would have advanced into.
+        low_row = {("m-a", "evidence"): _cell(1.0)}
+        executors = {f"gen-{n}": FakeGen(f"gen-{n}", f"fam-{n}", f"m-{n}") for n in "abcd"}
+        executors["judge-y"] = FakeJudge("judge-y", "fam-y", scores, overrides=low_row, repeat_overrides=True)
+        executors["judge-z"] = FakeJudge("judge-z", "fam-z", scores, overrides=low_row, repeat_overrides=True)
+        self.panel("gen-a", "gen-b", ["gen-c", "gen-d", "judge-y", "judge-z"], ["gen-a", "gen-b", "gen-c", "gen-d"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(self.store.get_candidate(result["winner"])["expert_id"], "gen-b")
+        verdict = self.store.latest_verdict("ctr_fake")
+        by_expert = {c["expert_id"]: c["id"] for c in self.store.candidates_for("ctr_fake")}
+        rounds = verdict["judged"]["bracket"]["rounds"]
+        # Four in; three passed; the fixed cut of two applies to the three
+        # passers (3 -> 2), the failer is out by score: 4 -> 2 -> 1.
+        self.assertEqual([(r["field_in"], r["field_out"], r["passed"]) for r in rounds], [(4, 2, 3), (2, 1, 2)])
+        self.assertEqual(set(rounds[0]["eliminated"]), {by_expert["gen-a"], by_expert["gen-d"]})
+        self.assertEqual(set(rounds[1]["scores"]), {by_expert["gen-b"], by_expert["gen-c"]})  # c reached round 2
+        self.assertFalse(rounds[0]["scores"][by_expert["gen-a"]]["pass"])
+        self.assertAlmostEqual(rounds[0]["scores"][by_expert["gen-d"]]["median_mean"], 6.5)
+        # The judged block covers every candidate the matrix scored, with
+        # the round it was last scored in.
+        judged = verdict["judged"]
+        self.assertEqual({judged[by_expert[e]]["round"] for e in ("gen-a", "gen-d")}, {1})
+        self.assertEqual({judged[by_expert[e]]["round"] for e in ("gen-b", "gen-c")}, {2})
+        self.assertFalse(judged[by_expert["gen-a"]]["pass"])
+        note = next(n for n in (r["note"] or "" for r in self.store.ledger_rows())
+                    if n.startswith("bracket round 1"))
+        self.assertIn("field 4 -> 2", note)
+        self.assertIn("passed=3", note)
+
+    def test_a_dissent_rerun_that_anchors_refreshes_the_lessons_evidence(self):
+        self.markers.update({"gen-a": "m-a", "gen-b": "m-b", "gen-c": "m-c"})
+        base_eval = gates_mod.evaluate_candidate
+        markers, eval_counts = self.markers, self.eval_counts
+
+        def second_look_fails_b(store, contract, candidate, cwd):
+            gr = base_eval(store, contract, candidate, cwd)
+            if markers.get(candidate["expert_id"]) == "m-b" and eval_counts.get("m-b", 0) >= 2:
+                # The re-run reads the sensor again and the metric fails.
+                store.add_measurement(candidate["id"], "ops_bench", "ops_per_tick", 120.0, "<=", 8, False)
+                return gates_mod.CandidateGateResult(
+                    candidate_id=candidate["id"], provenance_ok=True, eliminated_at="measured",
+                    hard=[], measured=gr.measured,
+                )
+            return gr
+
+        gates_mod.evaluate_candidate = second_look_fails_b
+        loop_mod.gates_mod.evaluate_candidate = second_look_fails_b
+        dissent_cell = {"score": 1.0, "confidence": 0.9,
+                        "evidence": "ops_per_tick reading disputed",
+                        "rationale": "the ops_per_tick sensor looks misread"}
+        scores = {"m-a": 8.0, "m-b": 7.0, "m-c": 9.0}
+        executors = {
+            "gen-a": FakeGen("gen-a", "fam-a", "m-a"),
+            "gen-b": FakeGen("gen-b", "fam-b", "m-b"),
+            "gen-c": FakeGen("gen-c", "fam-c", "m-c"),
+            "judge-a": FakeJudge("judge-a", "fam-a", scores),
+            "judge-b": FakeJudge("judge-b", "fam-b", scores),
+            "judge-c": FakeJudge("judge-c", "fam-c", scores,
+                                 overrides={("m-b", "test_agreement"): dissent_cell},
+                                 repeat_overrides=True),
+        }
+        self.panel("gen-a", "gen-b", ["gen-c", "judge-a", "judge-b", "judge-c"], ["gen-a", "gen-b", "gen-c"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(self.store.get_candidate(result["winner"])["expert_id"], "gen-c")
+        self.assertEqual(self.eval_counts["m-b"], 2)  # the dissent re-ran b's gates once
+        b_cand = next(c for c in self.store.candidates_for("ctr_fake") if c["expert_id"] == "gen-b")
+        verdict = self.store.latest_verdict("ctr_fake")
+        self.assertEqual(verdict["measured"], "fail")
+        self.assertIn(b_cand["id"], verdict["eliminated"])
+        # The Lesson is derived from the re-run's measurement row, not
+        # from the first pass that the dissent disputed.
+        lesson = self.store.get_lesson(result["lesson_id"])
+        self.assertIn("failed the measured gate", lesson["outcome"])
+        self.assertEqual(lesson["route_change"]["demote"], "gen-b")
+        self.assertIn(f"measurement:{b_cand['id']}:ops_per_tick", lesson["evidence"])
+        # The record counts the re-run as part of round 1, not as a round
+        # of its own: 3 in, b anchored out, 2 advanced, then the final.
+        rounds = verdict["judged"]["bracket"]["rounds"]
+        self.assertEqual([r["round"] for r in rounds], [1, 2])
+        self.assertEqual((rounds[0]["field_in"], rounds[0]["field_out"]), (3, 2))
+
+
+class TestNobodyGenerates(LoopV03Base):
+    """Fix pass Wave 2.8 (review M2, M3): there is no re-dispatch — every
+    seat is already in the contest — so when no seat produces a candidate
+    the run escalates with that reason, and the ledger says what each seat
+    did: refused is refused, unavailable is unavailable."""
+
+    def test_refused_and_unavailable_seats_are_recorded_as_such_and_the_run_escalates(self):
+        class Refuses(FakeGen):
+            def generate(self, worktree, contract, context):
+                return GenResult(status="refused", log="I cannot help with that.",
+                                 tokens_in=20, tokens_out=5, cost_usd=None, request_ids=[],
+                                 duration_ms=5, detail="I cannot help with that.")
+
+        class Unreachable(FakeGen):
+            def available(self):
+                return (False, "binary not found on PATH")
+
+        self.markers.update({"gen-a": "m-a", "gen-b": "m-b"})
+        executors = {"gen-a": Refuses("gen-a", "fam-a", "m-a"),
+                     "gen-b": Unreachable("gen-b", "fam-b", "m-b")}
+        self.panel("gen-a", "gen-b", [], ["gen-a", "gen-b"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "escalated", result)
+        self.assertIn("no seat produced a candidate", result["detail"])
+        outcomes = {r["expert_id"]: r["outcome"] for r in self.store.ledger_rows() if r["candidate_id"]}
+        self.assertEqual(outcomes, {"gen-a": "refused", "gen-b": "unavailable"})
+        summary = {r["expert_id"]: r for r in self.store.ledger_summary()}
+        self.assertEqual((summary["gen-a"]["dispatches"], summary["gen-a"]["refused"], summary["gen-a"]["unavailable"]), (1, 1, 0))
+        self.assertEqual((summary["gen-b"]["dispatches"], summary["gen-b"]["refused"], summary["gen-b"]["unavailable"]), (1, 0, 1))
+        self.assertNotIn("queue", summary)
+        queue_rows = [r for r in self.store.ledger_rows() if r["expert_id"] == "queue"]
+        self.assertEqual([r["outcome"] for r in queue_rows], ["escalated"])
+        report = ledger_report(self.store)
+        self.assertIn("gen-b: dispatches=1 completed=0 refused=0 timeout=0 unavailable=1 error=0", report)
+        self.assertIn("queue: escalated — ", report)
+        self.assertNotIn("queue: dispatches=", report)
+        # Nobody won, nobody lost: no candidate was fielded.
+        for eid in ("gen-a", "gen-b"):
+            self.assertEqual(self.store.get_expert(eid)["losses"], 0)
 
 
 class TestLowConfidence(LoopV03Base):

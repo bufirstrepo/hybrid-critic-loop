@@ -8,6 +8,7 @@ is redirected to a temp dir via HCL_DATA_DIR so no real state is touched.
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -437,6 +438,16 @@ class TestDocsMatchTheCode(unittest.TestCase):
         self.assertIn("a plain approval is refused", readme)
         self.assertIn("has no validity points to report", readme)
 
+    def test_readme_states_the_no_pass_round_and_the_ledger_counters(self):
+        # Fix pass Wave 2.8 (C-08, M3, M6): the ladder's one exception, the
+        # ledger's per-seat counts, and the hooks docstring's first-turn rule.
+        from hybrid_critic_loop import hooks as hooks_mod
+
+        readme = self._read("README.md")
+        self.assertIn("unless the matrix fails every remaining candidate", readme)
+        self.assertIn("unavailable", self._section(readme, "## Cost per validity point"))
+        self.assertIn("first turn", hooks_mod.__doc__)
+
     def test_readme_slash_usage_matches_the_handler_help(self):
         readme = self._read("README.md")
         self.assertIn("`/critic run <contract.json> [repo_path]`", readme)
@@ -462,8 +473,10 @@ class TestDemoNarration(unittest.TestCase):
     def test_phase_a_narration_reads_the_rows(self):
         demo = self._demo()
         summary = [
-            {"expert_id": "codex", "dispatches": 1, "completed": 1, "refused": 0, "timeout": 0},
-            {"expert_id": "grok", "dispatches": 1, "completed": 0, "refused": 1, "timeout": 0},
+            {"expert_id": "codex", "dispatches": 1, "completed": 1, "refused": 0, "timeout": 0,
+             "unavailable": 0, "error": 0},
+            {"expert_id": "grok", "dispatches": 1, "completed": 0, "refused": 0, "timeout": 0,
+             "unavailable": 1, "error": 0},
             {"expert_id": "queue", "dispatches": 1, "completed": 0, "refused": 0, "timeout": 0},
         ]
         lines = demo.phase_a_outcome_lines(
@@ -471,12 +484,38 @@ class TestDemoNarration(unittest.TestCase):
         )
         text = "\n".join(lines)
         self.assertIn("status=escalated — peer matrix passed no candidate", lines[0])
-        self.assertIn("codex: dispatches=1 completed=1 refused=0 timeout=0", text)
-        self.assertIn("grok: dispatches=1 completed=0 refused=1 timeout=0", text)
+        self.assertIn("codex: dispatches=1 completed=1 refused=0 timeout=0 unavailable=0 error=0", text)
+        # An unavailable seat is named as such (fix pass Wave 2.8, review M3).
+        self.assertIn("grok: dispatches=1 completed=0 refused=0 timeout=0 unavailable=1 error=0", text)
         self.assertNotIn("queue:", text)
         self.assertNotIn("expected here", text)
         quiet = demo.phase_a_outcome_lines({"status": "completed"}, [])
         self.assertEqual(quiet[0], "Phase A outcome (recorded): status=completed")
+
+
+class TestStoreOpening(unittest.TestCase):
+    """Fix pass Wave 2.8 (review M7 / 1C-10): the in-memory fallback exists
+    for a partial checkout without state.py — never for a database that
+    cannot be opened, which must fail loudly instead of silently losing
+    every run."""
+
+    def test_an_unopenable_database_raises_instead_of_falling_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "data.db").mkdir()  # a directory where the database file should be
+            with self.assertRaises(Exception) as caught:
+                plugin._open_store(Path(td))
+            self.assertIn("data.db", str(caught.exception))
+
+    def test_the_fallback_store_serves_only_a_missing_state_module(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(sys.modules, {"hybrid_critic_loop.state": None}):
+                store = plugin._open_store(Path(td))
+            self.assertIsInstance(store, plugin._FallbackStore)
+            real = plugin._open_store(Path(td))
+            try:
+                self.assertNotIsInstance(real, plugin._FallbackStore)
+            finally:
+                real.close()
 
 
 class TestHostSurface(unittest.TestCase):

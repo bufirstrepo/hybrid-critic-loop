@@ -2,9 +2,10 @@
 
 Plain functions; the caller (plugin.py) resolves ``data_dir`` and binds the
 store.  Observers must never break the host: every hook swallows its own
-exceptions.  ``pre_llm_call`` is the one directive hook — it returns
-``{"context": ...}`` to inject prior lessons into the current turn, or
-None when there is nothing to inject.
+exceptions.  ``pre_llm_call`` is the one directive hook — on the session's
+first turn it returns ``{"context": ...}`` to inject prior lessons (ranked
+by domain family, under the 10,000-character cap), and None on every later
+turn or when there is nothing to inject.
 """
 
 from __future__ import annotations

@@ -130,8 +130,9 @@ def phase_a_outcome_lines(result: dict, summary) -> list:
     """Phase A's outcome, read back from the run result and the ledger
     summary rows — never a canned expectation (fix pass Wave 2.2).
 
-    ``summary`` is ``store.ledger_summary()``: one row per expert with
-    dispatches / completed / refused / timeout counts.
+    ``summary`` is ``store.ledger_summary()``: one row per dispatched expert
+    with dispatches / completed / refused / timeout / unavailable / error
+    counts (a seat whose CLI is missing is `unavailable`, not `refused`).
     """
     status = (result or {}).get("status")
     head = f"Phase A outcome (recorded): status={status}"
@@ -145,7 +146,8 @@ def phase_a_outcome_lines(result: dict, summary) -> list:
         lines.append(
             f"  {row.get('expert_id')}: dispatches={row.get('dispatches')} "
             f"completed={row.get('completed')} refused={row.get('refused')} "
-            f"timeout={row.get('timeout')}"
+            f"timeout={row.get('timeout')} unavailable={row.get('unavailable', 0)} "
+            f"error={row.get('error', 0)}"
         )
     lines.append("A seat that completed produced a real candidate from its CLI; a refused or")
     lines.append("unavailable seat produced none and is recorded as such. On a machine with")

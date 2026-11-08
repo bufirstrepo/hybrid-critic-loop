@@ -18,7 +18,14 @@ from pathlib import Path
 __all__ = ["Store"]
 
 _COST_TIERS = {"free", "subscription", "api"}
-_LEDGER_OUTCOMES = {"completed", "refused", "timeout", "escalated", "observed"}
+# What a dispatched seat did — one ledger row per dispatch (fix pass Wave
+# 2.8, review M3: a refusal, a missing binary and an adapter error are
+# different facts) ...
+_GENERATION_OUTCOMES = ("completed", "refused", "timeout", "unavailable", "error")
+# ... plus the queue's own notes: an escalation, or an observation (bracket
+# rounds, seated peers, held route changes). Only generation rows count as
+# dispatches in ``ledger_summary``.
+_LEDGER_OUTCOMES = set(_GENERATION_OUTCOMES) | {"escalated", "observed"}
 _CANDIDATE_UPDATE_FIELDS = {
     "payload_hash",
     "provenance",
@@ -333,6 +340,16 @@ class Store:
 
     # -- internal helpers -------------------------------------------------
 
+    def _begin_write(self):
+        """Open a write transaction before an id is generated (fix pass Wave
+        2.8, review M7 / 1C-11, F-W20-07): ``BEGIN IMMEDIATE`` takes the
+        database's write lock, so a second Store on the same file — the CLI
+        beside the plugin — waits for this insert to commit instead of
+        scanning the same ids. The INSERT that follows runs inside it and
+        the method's ``commit`` ends it."""
+        if not self._conn.in_transaction:
+            self._conn.execute("BEGIN IMMEDIATE")
+
     def _next_id(self, prefix, table):
         """Derive the next sequential id like ``tgt_0007`` for a table.
 
@@ -367,6 +384,7 @@ class Store:
 
     def create_target(self, ask, domain, constraints=None, budget=None,
                       done_when="human_gate"):
+        self._begin_write()
         target_id = self._next_id("tgt", "targets")
         created = _now()
         self._conn.execute(
@@ -401,6 +419,7 @@ class Store:
     def create_contract(self, target_id, stage, task, domain, tags,
                         acceptance, depends_on=None, test_author_family=None,
                         repo_path=None, attempt=1, contract_id=None):
+        self._begin_write()
         cid = contract_id if contract_id is not None else self._next_id(
             "ctr", "contracts")
         created = _now()
@@ -642,6 +661,7 @@ class Store:
     def create_verdict(self, contract_id, attempt, winner, eliminated, hard,
                        measured, judged, escalated, escalation_reason, waiver,
                        human_gate, tie_break):
+        self._begin_write()
         verdict_id = self._next_id("vrd", "verdicts")
         self._conn.execute(
             "INSERT INTO verdicts (id, contract_id, attempt, winner,"
@@ -987,10 +1007,21 @@ class Store:
         }
 
     def ledger_summary(self):
+        """One row per expert that was dispatched at least once.
+
+        A dispatch is a generation row (completed / refused / timeout /
+        unavailable / error). The queue's ``observed`` and ``escalated``
+        notes are not dispatches, and an expert with no generation rows —
+        the ``queue`` pseudo-expert — has no summary row (fix pass Wave 2.8,
+        review M3). Tokens and cost are summed over reported values only;
+        None when nothing was reported.
+        """
         rows = self.ledger_rows()
         order = []
         agg = {}
         for row in rows:
+            if row["outcome"] not in _GENERATION_OUTCOMES:
+                continue
             eid = row["expert_id"]
             if eid not in agg:
                 order.append(eid)
@@ -1000,14 +1031,15 @@ class Store:
                     "completed": 0,
                     "refused": 0,
                     "timeout": 0,
+                    "unavailable": 0,
+                    "error": 0,
                     "_tin": [],
                     "_tout": [],
                     "_cost": [],
                 }
             entry = agg[eid]
             entry["dispatches"] += 1
-            if row["outcome"] in ("completed", "refused", "timeout"):
-                entry[row["outcome"]] += 1
+            entry[row["outcome"]] += 1
             entry["_tin"].append(row["tokens_in"])
             entry["_tout"].append(row["tokens_out"])
             entry["_cost"].append(row["cost_usd"])
@@ -1041,6 +1073,8 @@ class Store:
                 "completed": entry["completed"],
                 "refused": entry["refused"],
                 "timeout": entry["timeout"],
+                "unavailable": entry["unavailable"],
+                "error": entry["error"],
                 "tokens_in": _sum_or_none(entry["_tin"]),
                 "tokens_out": _sum_or_none(entry["_tout"]),
                 "cost_usd": _sum_or_none(entry["_cost"]),
@@ -1058,6 +1092,7 @@ class Store:
     def create_lesson(self, contract_id, domain, tags, outcome, cause, rule,
                       route_change, evidence, written_to,
                       provenance="generated"):
+        self._begin_write()
         lesson_id = self._next_id("lsn", "lessons")
         self._conn.execute(
             'INSERT INTO lessons (id, contract_id, domain, tags_json,'

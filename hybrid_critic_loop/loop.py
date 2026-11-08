@@ -4,9 +4,11 @@ human gate -> lesson.
 Queue outcomes implemented (spec, Pipeline):
 - hard/measured fail: retry with the error log attached, attempt + 1,
   cap 3, then escalate.
-- both candidates fail to generate (refusal/unavailable): re-dispatch to
-  the fallback experts; the judge panel is recomputed.
-- both below the judged minimum: retry once, then escalate.
+- no seat produces a candidate (every seat refused or was unavailable):
+  escalate — every seat is already in the contest, so there is nobody to
+  re-dispatch to; the ledger records what each seat did (fix pass Wave 2.8).
+- below the judged minimum: a legacy rubric retries once, then escalates;
+  the peer matrix escalates as soon as it passes nobody.
 - human rejection: a new contract against the same target, with the
   rejection written in as a constraint (an observation on the new row).
 - Phase-0 tie (both pass, no judged gate): fewer tokens wins; when
@@ -79,6 +81,10 @@ EVENT_TYPES = ("spread_over_threshold", "budget_exhaustion", "retry_cap", "human
 # Wave 2.7, review H4 + 1C-11): a second run answers ``already_run``.
 FINISHED_STATUSES = ("completed", "awaiting_human_gate", "escalated", "rejected")
 
+# What a dispatched seat can have done; ledgered as itself (fix pass Wave
+# 2.8, review M3). Mirrors state._GENERATION_OUTCOMES.
+GENERATION_OUTCOMES = ("completed", "refused", "timeout", "unavailable", "error")
+
 
 def _can_judge(executor) -> bool:
     """Whether a seat can act as a matrix peer / judge. Executors declare it
@@ -111,6 +117,17 @@ def _lesson_data_dir(store):
     if not db_path or str(db_path) == ":memory:":
         return None
     return Path(str(db_path)).expanduser().parent
+
+
+def _round_scores(outcome) -> dict:
+    """A bracket round's own score record: every candidate the matrix
+    scored in it (fix pass Wave 2.8, review M5)."""
+    return {
+        cid: {"median_mean": entry["median_mean"], "min_item": entry["min_row"],
+              "spread": entry["spread"], "pass": entry["pass"]}
+        for cid, entry in outcome.per_candidate.items()
+        if isinstance(entry, dict)
+    }
 
 
 def _tokens_total(candidate: dict) -> float:
@@ -280,7 +297,9 @@ class _Run:
             cost_usd=gen.cost_usd,
             status=gen.status,
         )
-        outcome = {"completed": "completed", "timeout": "timeout"}.get(gen.status, "refused")
+        # The ledger records what the seat did: a refusal, a missing binary
+        # and an adapter error are different facts. Unknown -> error.
+        outcome = gen.status if gen.status in GENERATION_OUTCOMES else "error"
         store.add_ledger(
             target_id=self.target_id, contract_id=self.contract_id, candidate_id=cand_id,
             stage=self.contract["stage"], expert_id=expert_id,
@@ -350,7 +369,6 @@ class _Run:
         ordered += list(route.get("fallback", []))
         ordered += sorted(self.executors)
         contestants = [c for c in dict.fromkeys(ordered) if c and c in self.executors]
-        fallback_pool: list = []  # re-dispatch draws from the panel itself
 
         retry_notes = ""
         judged_retries = 0
@@ -384,31 +402,16 @@ class _Run:
                 last_gate_details["candidate_experts"][cand["id"]] = expert_id
 
             generated = [(c, g) for c, g in wave if g.status == "completed"]
-            if len(generated) < len([c for c in contestants if c in self.executors]):
-                # Refusal/unavailable path: substitute fallback experts and
-                # re-dispatch; the judge panel is recomputed afterwards
-                # because the contest families changed.
-                subs = []
-                failed_experts = {c["expert_id"] for c, g in wave if g.status != "completed"}
-                kept = [c for c in contestants if c not in failed_experts]
-                for fb in fallback_pool:
-                    if fb in self.executors and fb not in kept and len(kept) + len(subs) < len(contestants):
-                        subs.append(fb)
-                if subs:
-                    contestants = kept + subs
-                    fallback_pool = [f for f in fallback_pool if f not in subs]
-                    retry_notes = (
-                        "RE-DISPATCH: a previous expert refused or was unavailable; "
-                        "the contest was re-dispatched to fallback experts and the "
-                        "judge panel recomputed."
-                    )
-                    continue
-                if not generated:
-                    return self._escalate(
-                        attempt,
-                        "all candidate experts refused or unavailable and no fallback remains",
-                        last_gate_details,
-                    )
+            if not generated:
+                # Every seat is already in the contest: there is nobody to
+                # re-dispatch to (the v0.2 fallback re-dispatch was dead
+                # code — fix pass Wave 2.8, review M2). The ledger rows say
+                # what each seat did.
+                return self._escalate(
+                    attempt,
+                    "no seat produced a candidate: every seat refused or was unavailable",
+                    last_gate_details,
+                )
 
             if len(generated) > len(SLOTS):
                 return self._escalate(
@@ -570,15 +573,20 @@ class _Run:
         by_id = {c["id"]: c for c, _ in generated}
         # Validity points come from this attempt's bracket only (review H3).
         self.matrix_validity = {}
+        # Every candidate the matrix scored, with the round it was last
+        # scored in (fix pass Wave 2.8, review M5): the verdict's judged
+        # block covers the whole bracket, not only the final round.
+        history: dict[str, dict] = {}
         eliminated_total: list[str] = []
         rounds: list[dict] = []
         judged_map: dict[str, dict] = {}
         outcome = None
         rerun_used = False
-        round_no = 0
 
         while True:
-            round_no += 1
+            # A dissent re-run repeats the matrix for the SAME round; the
+            # round number advances only when a round is recorded.
+            round_no = len(rounds) + 1
             outcome = matrix_mod.run_matrix(
                 store, self.contract, field, gate_results, diffs,
                 peer_executors,
@@ -595,6 +603,8 @@ class _Run:
             for cid, entry in outcome.per_candidate.items():
                 if isinstance(entry, dict) and entry.get("median_mean") is not None:
                     self.matrix_validity[cid] = float(entry["median_mean"])
+            for cid in outcome.per_candidate:
+                history[cid] = {"round": round_no, "outcome": outcome}
 
             if outcome.rerun_requests and not rerun_used:
                 # A dissent cites a gate the majority may have missed:
@@ -603,6 +613,8 @@ class _Run:
                 # still cites afterwards, proceed and let the record
                 # speak (the dissent stays in the verdict).
                 rerun_used = True
+                field_before = [c["id"] for c in field]
+                anchored: list[str] = []
                 for cid in outcome.rerun_requests:
                     cand = by_id.get(cid)
                     if cand is None:
@@ -611,13 +623,56 @@ class _Run:
                         store, self.contract, cand, Path(cand["worktree"])
                     )
                     gate_results[cid] = new_gr
-                    if new_gr.eliminated_at is not None and cid in [c["id"] for c in field]:
+                    # The re-run's rows are the deciding evidence from here
+                    # (fix pass Wave 2.8, review M5): refresh what the Lesson
+                    # and the escalation flags read.
+                    for hr in new_gr.hard:
+                        if not hr.passed:
+                            last_gate_details["hard_failures"].append(
+                                {"candidate_id": cid, "cmd": hr.cmd, "exit_code": hr.exit_code}
+                            )
+                    last_gate_details["measurements"] = [
+                        m for c2, _ in generated for m in store.measurements_for(c2["id"])
+                    ]
+                    if new_gr.eliminated_at is not None and cid in field_before and cid not in anchored:
                         # The re-run anchored the dissent: the candidate
                         # is out regardless of its matrix score.
                         field = [c for c in field if c["id"] != cid]
                         eliminated_total.append(cid)
+                        anchored.append(cid)
+                if anchored:
+                    # The anchor decided this round: record it (before, a
+                    # candidate the re-run eliminated appeared in no round
+                    # of the bracket record). The matrix then re-scores the
+                    # survivors as the next round.
+                    rounds.append({
+                        "round": round_no,
+                        "field_in": len(field_before),
+                        "field_out": len(field),
+                        "passed": sum(
+                            1 for cid in field_before
+                            if outcome.per_candidate.get(cid, {}).get("pass")
+                        ),
+                        "cut_line": None,
+                        "eliminated": list(anchored),
+                        "anchored_by_gate_rerun": list(anchored),
+                        "scores": _round_scores(outcome),
+                        "dissent": list(outcome.dissent),
+                    })
+                    store.add_ledger(
+                        target_id=self.target_id, contract_id=self.contract_id,
+                        candidate_id=None, stage=self.contract["stage"], expert_id="queue",
+                        tokens_in=None, tokens_out=None, cost_usd=None,
+                        outcome="observed",
+                        note=(
+                            f"bracket round {round_no}: field {len(field_before)} -> {len(field)}; "
+                            f"dissent gate re-run anchored out {anchored}; "
+                            f"panel_status={outcome.panel_status}"
+                        ),
+                    )
                 if not field:
-                    last_gate_details["judged"] = self._matrix_judged_map(outcome, bracket_cfg, rounds)
+                    last_gate_details["judged"] = self._matrix_judged_map(
+                        outcome, bracket_cfg, rounds, history)
                     last_gate_details["panel_status"] = outcome.panel_status
                     return self._escalate(
                         attempt,
@@ -631,7 +686,8 @@ class _Run:
                 reason = outcome.escalation_reason or "matrix escalation"
                 if "spread" in reason:
                     self._emit("spread_over_threshold", reason)
-                last_gate_details["judged"] = self._matrix_judged_map(outcome, bracket_cfg, rounds)
+                last_gate_details["judged"] = self._matrix_judged_map(
+                    outcome, bracket_cfg, rounds, history)
                 last_gate_details["panel_status"] = outcome.panel_status
                 last_gate_details["dissent"] = list(outcome.dissent)
                 return self._escalate(
@@ -642,24 +698,32 @@ class _Run:
             validity = {
                 cid: entry["median_mean"] for cid, entry in outcome.per_candidate.items()
             }
-            cut = bracket_mod.apply_cut(field, validity, bracket_cfg, self.durations)
-            advanced, cut_out = cut["advanced"], cut["eliminated"]
-            # Anchor at the cut: matrix-pass is required to advance —
-            # a candidate the panel failed is eliminated by score at
-            # this round even if the raw ranking kept it.
-            still, dropped = [], []
-            for cand in advanced:
+            # Anchor BEFORE the cut (fix pass Wave 2.8, review M5): a
+            # candidate the panel failed is out by score at this round and
+            # never holds a slot a passer below it would have advanced
+            # into. The ladder's cut ranks the passers only.
+            passers, failers = [], []
+            for cand in field:
                 entry = outcome.per_candidate.get(cand["id"], {})
-                (still if entry.get("pass") else dropped).append(cand)
-            advanced = still
-            cut_out = cut_out + dropped
+                (passers if entry.get("pass") else failers).append(cand)
+            cut = bracket_mod.apply_cut(
+                passers, validity, bracket_cfg, self.durations, field_size=field_in
+            )
+            advanced = cut["advanced"]
+            cut_out = cut["eliminated"] + failers
             rounds.append({
                 "round": round_no,
                 "field_in": field_in,
                 "field_out": len(advanced),
+                "passed": len(passers),
                 "cut_line": cut["cut_line"],
                 "eliminated": [c["id"] for c in cut_out],
+                # The round's own record: every scored candidate and the
+                # dissent raised in it (the verdict keeps all rounds).
+                "scores": _round_scores(outcome),
+                "dissent": list(outcome.dissent),
             })
+            no_pass = "" if advanced else "; no candidate passed the matrix — nothing left to cut"
             store.add_ledger(
                 target_id=self.target_id, contract_id=self.contract_id,
                 candidate_id=None, stage=self.contract["stage"], expert_id="queue",
@@ -667,9 +731,9 @@ class _Run:
                 outcome="observed",
                 note=(
                     f"bracket round {round_no}: field {field_in} -> {len(advanced)}; "
-                    f"cut_line={cut['cut_line']}; "
+                    f"passed={len(passers)}; cut_line={cut['cut_line']}; "
                     f"eliminated={[c['id'] for c in cut_out]}; "
-                    f"panel_status={outcome.panel_status}"
+                    f"panel_status={outcome.panel_status}{no_pass}"
                 ),
             )
             eliminated_total.extend(c["id"] for c in cut_out)
@@ -677,7 +741,7 @@ class _Run:
             if len(field) <= 1:
                 break
 
-        judged_map = self._matrix_judged_map(outcome, bracket_cfg, rounds)
+        judged_map = self._matrix_judged_map(outcome, bracket_cfg, rounds, history)
         last_gate_details["judged"] = judged_map
         last_gate_details["panel_status"] = outcome.panel_status if outcome else "full"
         last_gate_details["dissent"] = list(outcome.dissent) if outcome else []
@@ -745,22 +809,35 @@ class _Run:
             seated.append(pid)
         return seated[:max(n_judges, 1)], skipped
 
-    def _matrix_judged_map(self, outcome, bracket_cfg, rounds):
-        """The verdict's judged block for a matrix run: per-candidate
-        summary in the v0.3 shape, plus the bracket record."""
+    def _matrix_judged_map(self, outcome, bracket_cfg, rounds, history=None):
+        """The verdict's judged block for a matrix run: one entry per
+        candidate the matrix scored in ANY round — taken from the round it
+        was last scored in, which the entry names (fix pass Wave 2.8,
+        review M5) — plus the bracket record with every round's scores."""
         judged: dict = {}
+        scored: dict = {
+            cid: (record["round"], record["outcome"])
+            for cid, record in (history or {}).items()
+        }
         if outcome is not None:
-            for cid, entry in outcome.per_candidate.items():
-                judged[cid] = {
-                    "median_mean": entry["median_mean"],
-                    "min_item": entry["min_row"],
-                    "spread": entry["spread"],
-                    "pass": entry["pass"],
-                    "dissent": [d for d in outcome.dissent if d["candidate_id"] == cid],
-                    "panel_status": entry["panel_status"],
-                    "mean_confidence": entry["mean_confidence"],
-                    "rows": entry["rows"],
-                }
+            final_round = len(rounds) if rounds else 1
+            for cid in outcome.per_candidate:
+                scored.setdefault(cid, (final_round, outcome))
+        for cid, (round_no, out) in scored.items():
+            entry = out.per_candidate.get(cid)
+            if not isinstance(entry, dict):
+                continue
+            judged[cid] = {
+                "median_mean": entry["median_mean"],
+                "min_item": entry["min_row"],
+                "spread": entry["spread"],
+                "pass": entry["pass"],
+                "round": round_no,
+                "dissent": [d for d in out.dissent if d["candidate_id"] == cid],
+                "panel_status": entry["panel_status"],
+                "mean_confidence": entry["mean_confidence"],
+                "rows": entry["rows"],
+            }
         judged["panel_status"] = outcome.panel_status if outcome is not None else "full"
         judged["bracket"] = {"config": bracket_cfg, "rounds": rounds}
         return judged
@@ -869,6 +946,7 @@ class _Run:
                     judged_summary[cid] = {
                         "median_mean": v["median_mean"], "min_item": v["min_item"],
                         "spread": v["spread"], "pass": v["pass"],
+                        "round": v.get("round"),
                         "dissent": v.get("dissent", []),
                         "panel_status": v.get("panel_status"),
                         "mean_confidence": v.get("mean_confidence"),
@@ -955,9 +1033,21 @@ class _Run:
         category = router_mod.category_of(self.contract["domain"])
         store.record_expert_result(winner["expert_id"], category, won=True)
         self._record_validity(winner, eliminated, gate_results, judged_map)
-        for eid in {last_gate_details["candidate_experts"].get(c) for c in eliminated}:
-            if eid:
-                store.record_expert_result(eid, category, won=False)
+        # A loss is charged once to each seat that FIELDED a candidate and
+        # did not win (fix pass Wave 2.8, review M3) — never to a seat that
+        # produced nothing (unavailable, refused) and never to the winner
+        # for its own earlier attempt.
+        by_id = {c["id"]: c for c in store.candidates_for(self.contract_id)}
+        losers: list = []
+        for cid in eliminated:
+            cand = by_id.get(cid)
+            if cand is None or cand.get("status") != "completed":
+                continue
+            eid = cand.get("expert_id")
+            if eid and eid != winner["expert_id"] and eid not in losers:
+                losers.append(eid)
+        for eid in losers:
+            store.record_expert_result(eid, category, won=False)
         last_gate_details["winner_expert"] = winner["expert_id"]
         last_gate_details["loser_experts"] = [
             last_gate_details["candidate_experts"].get(c) for c in eliminated
@@ -996,6 +1086,13 @@ class _Run:
             measured="fail" if any(not m["pass"] for m in gate_details.get("measurements", [])) else "pass",
             judged=judged, escalated=True, escalation_reason=reason, waiver=None,
             human_gate="not_reached", tie_break=None,
+        )
+        # The ledger carries the escalation as the queue's own row (fix pass
+        # Wave 2.8, review M3), beside the baseline refusals it already had.
+        store.add_ledger(
+            target_id=self.target_id, contract_id=self.contract_id, candidate_id=None,
+            stage=self.contract["stage"], expert_id="queue", tokens_in=None,
+            tokens_out=None, cost_usd=None, outcome="escalated", note=reason,
         )
         self._record_validity(None, [], {}, judged)
         gate_details["escalation_reason"] = reason

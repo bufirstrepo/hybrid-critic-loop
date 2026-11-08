@@ -220,19 +220,28 @@ class _FallbackStore:
 
 
 def _open_store(data_dir):
+    """Open the plugin's SQLite store at ``<data_dir>/data.db``.
+
+    The in-memory ``_FallbackStore`` serves exactly one case: a partial
+    checkout without ``state.py``. A database that cannot be opened (locked,
+    corrupt, a directory in its place) raises with the path in the message
+    — silently falling back would register a plugin that forgets every run
+    (fix pass Wave 2.8, review M7 / 1C-10).
+    """
     db_path = Path(data_dir) / "data.db"
     try:
         from .state import Store
-
-        return Store(db_path)
-    except Exception:
-        pass
+    except ImportError:
+        try:
+            from hybrid_critic_loop.state import Store
+        except ImportError:
+            return _FallbackStore(db_path)
     try:
-        from hybrid_critic_loop.state import Store
-
         return Store(db_path)
-    except Exception:
-        return _FallbackStore(db_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"hybrid-critic-loop: cannot open its database at {db_path}: {exc}"
+        ) from exc
 
 
 # --------------------------------------------------------------------------

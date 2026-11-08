@@ -20,11 +20,14 @@ import statistics
 
 MATRIX_RUBRIC_ID = "validity_matrix_v1"
 
-# Canonical validity-matrix rows, used only when neither the rubric
-# registry nor any recorded matrix score row names the rows.  Rows are
-# otherwise taken from the validity_matrix_v1 rubric (when a sibling
-# module registers it) and/or the recorded score items themselves.
-MATRIX_ROWS = ["correctness", "completeness", "evidence", "reproducibility"]
+try:  # the validity rubric's own rows (fix pass Wave 2.8, review M6 / 1C-14)
+    from .matrix import VALIDITY_ROWS as _VALIDITY_ROWS
+except Exception:  # noqa: BLE001 - a partial checkout keeps the reports importable
+    _VALIDITY_ROWS = ("question_fidelity", "completeness", "evidence", "test_agreement")
+
+# The validity_matrix_v1 rows, used when no recorded score row names them
+# (a matrix that has not run yet). Recorded rows are added as observed.
+MATRIX_ROWS = list(_VALIDITY_ROWS)
 
 _DEFAULT_DISSENT_THRESHOLD = 3.0
 
@@ -156,6 +159,8 @@ def ledger_report(store) -> str:
             f"completed={row.get('completed', 0)} "
             f"refused={row.get('refused', 0)} "
             f"timeout={row.get('timeout', row.get('timeouts', row.get('timed_out', 0)))} "
+            f"unavailable={row.get('unavailable', 0)} "
+            f"error={row.get('error', 0)} "
             f"tokens_in={_value_or_not_reported(row.get('tokens_in'))} "
             f"tokens_out={_value_or_not_reported(row.get('tokens_out'))} "
             f"cost_usd={_value_or_not_reported(row.get('cost_usd'))} "
@@ -168,6 +173,14 @@ def ledger_report(store) -> str:
         if cal_text is not None:
             line += f" {cal_text}"
         lines.append(line)
+    # The queue's own rows — escalations and observations (bracket rounds,
+    # seated peers, held route changes) — are notes, not dispatches (fix
+    # pass Wave 2.8, review M3): printed as recorded.
+    for row in rows or []:
+        if isinstance(row, dict) and row.get("expert_id") == "queue":
+            lines.append(
+                f"queue: {row.get('outcome')} — {_value_or_not_reported(row.get('note'))}"
+            )
     if not summary and rows:
         # Rows exist but no summary implementation produced aggregates.
         for row in rows:
@@ -181,14 +194,16 @@ def ledger_report(store) -> str:
 # --------------------------------------------------------------------------
 
 def _matrix_rubric_rows():
+    """The validity rubric's rows, from ``matrix.validity_rubric()`` (where
+    the rubric lives), else the module constant."""
     try:
-        from .rubrics import get_rubric
+        from .matrix import validity_rubric
 
-        rubric = get_rubric(MATRIX_RUBRIC_ID)
+        rubric = validity_rubric()
         items = rubric.get("items") if isinstance(rubric, dict) else None
-        return list(items) if items else []
+        return list(items) if items else list(MATRIX_ROWS)
     except Exception:
-        return []
+        return list(MATRIX_ROWS)
 
 
 def _dissent_threshold_for(store, contract_id):
@@ -409,12 +424,17 @@ def build_matrix_view(store, contract_id, attempt=None) -> dict:
                 continue
             items, confidence, details = _parse_matrix_cell(score_row)
             judge_id = score_row.get("judge_id")
+            previous = cells.get(judge_id)
             cells[judge_id] = {
                 "judge_family": score_row.get("judge_family"),
                 "items": items,
                 "confidence": confidence,
                 "details": details,
                 "mean": score_row.get("mean"),
+                # A judge scores a candidate once per bracket round; the
+                # view keeps the last cell and counts the rounds (fix pass
+                # Wave 2.8, review M5).
+                "rounds_scored": (previous.get("rounds_scored", 1) + 1) if previous else 1,
             }
             has_matrix_scores = True
             for row_name in items:
@@ -513,6 +533,8 @@ def matrix_report(store, contract_id) -> str:
             for judge_id, cell in candidate["cells"].items():
                 if row_name in cell["items"]:
                     text = f"{judge_id}={cell['items'][row_name]}"
+                    if cell.get("rounds_scored", 1) > 1:
+                        text += f" (last of {cell['rounds_scored']} rounds)"
                     if (row_name, judge_id) in dissent_keys:
                         text += " DISSENT"
                     cells.append(text)

@@ -20,7 +20,10 @@ Cut size is configurable per contract (owner refinement):
 
 Either way the ladder always lands on a final TWO, and then a final
 scored round decides the one: if a cut would jump past 2 it cuts to
-exactly 2.
+exactly 2. The one exception is a round in which the matrix passes
+nobody: the anchor removes every candidate before the cut, the round
+records the empty field (``passed=0``) and the run escalates or offers
+a measured waiver — there is nothing left to cut.
 
 Rules that never bend:
 
@@ -110,20 +113,27 @@ def rank_candidates(candidates, validity: dict, durations: dict | None = None) -
 
 
 def apply_cut(field, validity: dict, config: dict,
-              durations: dict | None = None) -> dict:
-    """Cut ``field`` (candidate dicts, all gate survivors this round)
-    down to the next ladder size by recorded validity.
+              durations: dict | None = None, field_size: int | None = None) -> dict:
+    """Cut ``field`` (candidate dicts: this round's matrix passers) down
+    to the next ladder size by recorded validity.
+
+    ``field_size`` is the size of the whole field this round — the passers
+    plus the candidates the matrix failed, which the anchor has already
+    removed. The ladder steps down from it, so a failer counts as one of
+    the round's eliminations and never displaces a passer at the line
+    (fix pass Wave 2.8, review M5). Defaults to ``len(field)``.
 
     Returns {advanced, eliminated, cut_line}: ``cut_line`` is the
-    validity score of the last candidate to advance, or None when the
-    field already fits (no cut) or is empty.
+    validity score of the last candidate to advance, or None when nobody
+    was cut (the field already fits) or nobody advanced.
     """
     ranked = rank_candidates(field, validity, durations)
-    target = next_field_size(len(ranked), config)
+    whole = field_size if field_size is not None else len(ranked)
+    target = next_field_size(whole, config)
     advanced = ranked[:target]
     eliminated = ranked[target:]
     cut_line = None
-    if eliminated and advanced:
+    if advanced and (eliminated or whole > len(ranked)):
         score = validity.get(advanced[-1]["id"])
         cut_line = float(score) if score is not None else None
     return {"advanced": advanced, "eliminated": eliminated, "cut_line": cut_line}
