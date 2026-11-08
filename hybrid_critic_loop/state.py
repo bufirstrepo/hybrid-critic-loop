@@ -10,6 +10,7 @@ Timestamps are UTC ISO strings.
 
 import json
 import functools
+import math
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -182,7 +183,9 @@ CREATE TABLE IF NOT EXISTS ledger (
     note TEXT,
     created_at TEXT NOT NULL,
     prev_hash TEXT,
-    row_hash TEXT
+    row_hash TEXT,
+    provenance TEXT,
+    sealed_via TEXT
 );
 CREATE TABLE IF NOT EXISTS lessons (
     id TEXT PRIMARY KEY,
@@ -232,9 +235,15 @@ _MIGRATION_COLUMNS = {
     # previous row's hash (see chain.py). Backfilled once on first open;
     # PRAGMA user_version bit 1 is the store meta flag recording that the
     # backfill has run.
+    # Tightening spec T2: ledger provenance (who reported the row's
+    # numbers) and sealed_via (how the row got its chain hashes:
+    # "append" / "backfill" / "repair"). Pre-migration rows backfill
+    # provenance to "legacy-import" (see _migrate).
     "ledger": (
         ("prev_hash", "TEXT"),
         ("row_hash", "TEXT"),
+        ("provenance", "TEXT"),
+        ("sealed_via", "TEXT"),
     ),
 }
 
@@ -308,6 +317,49 @@ def _cost_per_validity_point(validity_points, validity_cost_usd):
     return None
 
 
+def _validate_token_count(name, value):
+    """Ledger token counts (tightening spec T7; security F8,
+    correctness F5): None, or a non-negative integer. Integral floats
+    are accepted and stored as int; bool, str, NaN/Inf, fractions and
+    negatives raise ValueError — the store never writes a row its own
+    chain seal would reject or a stamp would print as negative spend.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        result = value
+    elif (isinstance(value, float) and math.isfinite(value)
+            and value.is_integer()):
+        result = int(value)
+    else:
+        raise ValueError(
+            f"invalid {name} {value!r}: must be None or a non-negative"
+            " integer")
+    if result < 0:
+        raise ValueError(
+            f"invalid {name} {value!r}: must be None or a non-negative"
+            " integer")
+    return result
+
+
+def _validate_cost_usd(value):
+    """Ledger cost (tightening spec T7): None, or a finite
+    non-negative number, stored as float. Bool/str/NaN/Inf/negative
+    raise ValueError."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"invalid cost_usd {value!r}: must be None or a finite"
+            " non-negative number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise ValueError(
+            f"invalid cost_usd {value!r}: must be None or a finite"
+            " non-negative number")
+    return result
+
+
 class Store:
     """SQLite-backed store for Hybrid Critic Loop state.
 
@@ -330,6 +382,11 @@ class Store:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._migrate()
+        # Tightening spec T3: rows the open-time sealing pass sealed, by
+        # route — "backfill" (pre-chain store) / "repair" (flagged store,
+        # unsealed suffix). Set by _backfill_chain below.
+        self.chain_backfilled = 0
+        self.chain_repairs = 0
         self._backfill_chain()
 
     def _migrate(self):
@@ -352,38 +409,105 @@ class Store:
                     self._conn.execute(
                         f"ALTER TABLE {table} ADD COLUMN"
                         f" {col_name} {col_type}")
+        # Tightening spec T2: rows written before the provenance column
+        # existed carry no attribution; label them "legacy-import"
+        # (counted by the totals, but never mistaken for rows a writer
+        # attributed at insert time). Idempotent: after the first open
+        # no row has NULL provenance.
+        ledger_cols = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(ledger)").fetchall()
+        }
+        if "provenance" in ledger_cols:
+            self._conn.execute(
+                "UPDATE ledger SET provenance='legacy-import'"
+                " WHERE provenance IS NULL")
         self._conn.commit()
 
     def _backfill_chain(self):
-        """Seal pre-chain ledger rows, once (standing spec, Unit B).
+        """Seal unsealed ledger rows on open (tightening spec T3;
+        correctness F1/F9, security F1/F4).
 
-        Databases written before the hash chain have NULL ``prev_hash`` /
-        ``row_hash``. On first open (``PRAGMA user_version`` below
-        ``_CHAIN_BACKFILL_VERSION``) every such row is hashed in id order,
-        continuing from any row that already carries a hash, and the meta
-        flag is set so the pass never runs again. Later appends hash at
-        insert time (see ``add_ledger``), so after this pass every row in
-        the book seals.
+        The pass is gated on NULL hashes existing, not only on the
+        ``PRAGMA user_version`` flag — a flagged store can still gain
+        unsealed rows when a pre-chain writer appends beside the chained
+        build. Three cases:
+
+        - Pre-chain store (``user_version`` below
+          ``_CHAIN_BACKFILL_VERSION``): every unsealed row is sealed in
+          id order with ``sealed_via="backfill"`` and the flag is set.
+        - Flagged store: an unsealed SUFFIX — rows after the last hashed
+          row, the legacy-writer append case — is sealed with
+          ``sealed_via="repair"``.
+        - Corruption: NULL hashes in the middle (a hashed row exists
+          after them), or a pre-existing hash that does not recompute.
+          Pre-existing hashes are recomputed during the pass, never
+          trusted as links (the old pass trusted them, so a tampered
+          row's stored hash became the seal for everything after it).
+          Corrupt rows and everything after them are left exactly as
+          found: ``verify_chain`` names the first bad row, and
+          ``add_ledger`` refuses to extend a book whose last row is
+          unsealed.
+
+        ``self.chain_backfilled`` / ``self.chain_repairs`` record how
+        many rows this open sealed by each route.
         """
+        self.chain_backfilled = 0
+        self.chain_repairs = 0
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if version >= _CHAIN_BACKFILL_VERSION:
-            return
+        pre_chain = version < _CHAIN_BACKFILL_VERSION
         rows = self._all("SELECT * FROM ledger ORDER BY id ASC")
+        if not rows:
+            if pre_chain:
+                self._conn.execute(
+                    f"PRAGMA user_version = {_CHAIN_BACKFILL_VERSION}")
+                self._conn.commit()
+            return
+        first_unsealed = None
+        for idx, row in enumerate(rows):
+            if not _col(row, "prev_hash") or not _col(row, "row_hash"):
+                first_unsealed = idx
+                break
+        # Recompute the sealed prefix (every row before the first
+        # unsealed one); a stored hash that does not recompute, or does
+        # not link to its predecessor, is corruption — seal nothing.
+        prefix = rows if first_unsealed is None else rows[:first_unsealed]
         prev = _chain.GENESIS_HASH
-        for row in rows:
-            existing = _col(row, "row_hash")
-            if existing:
-                prev = existing
-                continue
+        for row in prefix:
+            entry = self._ledger_dict(row)
+            if _col(row, "prev_hash") != prev:
+                return
+            if _chain.row_hash(prev, entry) != _col(row, "row_hash"):
+                return
+            prev = _col(row, "row_hash")
+        if first_unsealed is None:
+            if pre_chain:
+                self._conn.execute(
+                    f"PRAGMA user_version = {_CHAIN_BACKFILL_VERSION}")
+                self._conn.commit()
+            return
+        suffix = rows[first_unsealed:]
+        if any(_col(row, "row_hash") for row in suffix):
+            # A hashed row exists after an unsealed one: middle-NULL
+            # corruption. Leave the book exactly as found.
+            return
+        sealed_via = "backfill" if pre_chain else "repair"
+        for row in suffix:
             entry = self._ledger_dict(row)
             digest = _chain.row_hash(prev, entry)
             self._conn.execute(
-                "UPDATE ledger SET prev_hash=?, row_hash=? WHERE id=?",
-                (prev, digest, row["id"]),
+                "UPDATE ledger SET prev_hash=?, row_hash=?, sealed_via=?"
+                " WHERE id=?",
+                (prev, digest, sealed_via, row["id"]),
             )
             prev = digest
-        self._conn.execute(
-            f"PRAGMA user_version = {_CHAIN_BACKFILL_VERSION}")
+        if pre_chain:
+            self.chain_backfilled = len(suffix)
+            self._conn.execute(
+                f"PRAGMA user_version = {_CHAIN_BACKFILL_VERSION}")
+        else:
+            self.chain_repairs = len(suffix)
         self._conn.commit()
 
     # -- internal helpers -------------------------------------------------
@@ -433,15 +557,21 @@ class Store:
     def create_target(self, ask, domain, constraints=None, budget=None,
                       done_when="human_gate"):
         self._begin_write()
-        target_id = self._next_id("tgt", "targets")
-        created = _now()
-        self._conn.execute(
-            "INSERT INTO targets (id, ask, domain, constraints_json,"
-            " budget_json, done_when, created_at) VALUES (?,?,?,?,?,?,?)",
-            (target_id, ask, domain, _dumps(list(constraints or [])),
-             _dumps(budget), done_when, created),
-        )
-        self._conn.commit()
+        try:
+            target_id = self._next_id("tgt", "targets")
+            created = _now()
+            self._conn.execute(
+                "INSERT INTO targets (id, ask, domain, constraints_json,"
+                " budget_json, done_when, created_at) VALUES (?,?,?,?,?,?,?)",
+                (target_id, ask, domain, _dumps(list(constraints or [])),
+                 _dumps(budget), done_when, created),
+            )
+            self._conn.commit()
+        except Exception:
+            # Tightening spec T7 (correctness F7 audit): roll back so a
+            # failed write never leaks its open transaction.
+            self._conn.rollback()
+            raise
         return target_id
 
     def get_target(self, target_id):
@@ -468,21 +598,27 @@ class Store:
                         acceptance, depends_on=None, test_author_family=None,
                         repo_path=None, attempt=1, contract_id=None):
         self._begin_write()
-        cid = contract_id if contract_id is not None else self._next_id(
-            "ctr", "contracts")
-        created = _now()
-        self._conn.execute(
-            "INSERT INTO contracts (id, target_id, stage, attempt, task,"
-            " domain, tags_json, depends_on_json, acceptance_json,"
-            " acceptance_baseline_run, test_author_family, repo_path,"
-            " status, observations_json, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (cid, target_id, stage, attempt, task, domain,
-             _dumps(list(tags or [])), _dumps(list(depends_on or [])),
-             _dumps(list(acceptance or [])), None, test_author_family,
-             repo_path, "open", _dumps([]), created),
-        )
-        self._conn.commit()
+        try:
+            cid = contract_id if contract_id is not None else self._next_id(
+                "ctr", "contracts")
+            created = _now()
+            self._conn.execute(
+                "INSERT INTO contracts (id, target_id, stage, attempt, task,"
+                " domain, tags_json, depends_on_json, acceptance_json,"
+                " acceptance_baseline_run, test_author_family, repo_path,"
+                " status, observations_json, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (cid, target_id, stage, attempt, task, domain,
+                 _dumps(list(tags or [])), _dumps(list(depends_on or [])),
+                 _dumps(list(acceptance or [])), None, test_author_family,
+                 repo_path, "open", _dumps([]), created),
+            )
+            self._conn.commit()
+        except Exception:
+            # Tightening spec T7 (correctness F7 audit): roll back so a
+            # failed write never leaks its open transaction.
+            self._conn.rollback()
+            raise
         return cid
 
     def get_contract(self, contract_id):
@@ -710,18 +846,24 @@ class Store:
                        measured, judged, escalated, escalation_reason, waiver,
                        human_gate, tie_break):
         self._begin_write()
-        verdict_id = self._next_id("vrd", "verdicts")
-        self._conn.execute(
-            "INSERT INTO verdicts (id, contract_id, attempt, winner,"
-            " eliminated_json, hard, measured, judged_json, escalated,"
-            " escalation_reason, waiver_json, human_gate, tie_break,"
-            " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (verdict_id, contract_id, attempt, winner,
-             _dumps(list(eliminated or [])), hard, measured, _dumps(judged),
-             1 if escalated else 0, escalation_reason, _dumps(waiver),
-             human_gate, tie_break, _now()),
-        )
-        self._conn.commit()
+        try:
+            verdict_id = self._next_id("vrd", "verdicts")
+            self._conn.execute(
+                "INSERT INTO verdicts (id, contract_id, attempt, winner,"
+                " eliminated_json, hard, measured, judged_json, escalated,"
+                " escalation_reason, waiver_json, human_gate, tie_break,"
+                " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (verdict_id, contract_id, attempt, winner,
+                 _dumps(list(eliminated or [])), hard, measured,
+                 _dumps(judged), 1 if escalated else 0, escalation_reason,
+                 _dumps(waiver), human_gate, tie_break, _now()),
+            )
+            self._conn.commit()
+        except Exception:
+            # Tightening spec T7 (correctness F7 audit): roll back so a
+            # failed write never leaks its open transaction.
+            self._conn.rollback()
+            raise
         return verdict_id
 
     def get_verdict(self, contract_id, attempt):
@@ -736,6 +878,17 @@ class Store:
         row = self._one(
             "SELECT * FROM verdicts WHERE contract_id=?"
             " ORDER BY rowid DESC LIMIT 1", (contract_id,))
+        if row is None:
+            return None
+        return self._verdict_dict(row)
+
+    def verdict_for(self, contract_id, verdict_id):
+        """The named verdict of a contract, or None (tightening spec
+        T4: certificate verification must be able to check that the
+        verdict a certificate names exists for that contract)."""
+        row = self._one(
+            "SELECT * FROM verdicts WHERE contract_id=? AND id=?",
+            (contract_id, verdict_id))
         if row is None:
             return None
         return self._verdict_dict(row)
@@ -1013,50 +1166,79 @@ class Store:
 
     def add_ledger(self, target_id, contract_id, candidate_id, stage,
                    expert_id, tokens_in, tokens_out, cost_usd, outcome,
-                   note=None):
+                   note=None, provenance=None):
         if outcome not in _LEDGER_OUTCOMES:
             raise ValueError(
                 f"invalid ledger outcome {outcome!r}: must be one of"
                 f" {sorted(_LEDGER_OUTCOMES)}")
+        # Input discipline (tightening spec T7): validate before the
+        # write transaction opens, so a rejected row never touches the
+        # book. Provenance (T2): an unattributed call is recorded as
+        # such — the totals never count it.
+        tokens_in = _validate_token_count("tokens_in", tokens_in)
+        tokens_out = _validate_token_count("tokens_out", tokens_out)
+        cost_usd = _validate_cost_usd(cost_usd)
+        if provenance is None:
+            provenance = "unattributed"
         # Hash chain (standing spec, Unit B): the new row seals the
         # previous row's hash. The id is assigned here, inside the write
         # transaction and the store lock, because the id is one of the
-        # row's own canonical fields.
+        # row's own canonical fields. On any failure the transaction is
+        # rolled back before the error propagates (correctness F7) —
+        # a leaked open transaction would let the next unrelated write
+        # commit this partial row under its own commit.
         self._begin_write()
-        last = self._one(
-            "SELECT id, row_hash FROM ledger ORDER BY id DESC LIMIT 1")
-        if last is None:
-            next_id, prev = 1, _chain.GENESIS_HASH
-        else:
-            next_id = int(last["id"]) + 1
-            prev = last["row_hash"] or _chain.GENESIS_HASH
-        created = _now()
-        entry = {
-            "id": next_id,
-            "target_id": target_id,
-            "contract_id": contract_id,
-            "candidate_id": candidate_id,
-            "stage": stage,
-            "expert_id": expert_id,
-            "tokens_in": tokens_in,
-            "tokens_out": tokens_out,
-            "cost_usd": cost_usd,
-            "outcome": outcome,
-            "note": note,
-            "created_at": created,
-        }
-        digest = _chain.row_hash(prev, entry)
-        cur = self._conn.execute(
-            "INSERT INTO ledger (id, target_id, contract_id, candidate_id,"
-            " stage, expert_id, tokens_in, tokens_out, cost_usd, outcome,"
-            " note, created_at, prev_hash, row_hash)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (next_id, target_id, contract_id, candidate_id, stage,
-             expert_id, tokens_in, tokens_out, cost_usd, outcome, note,
-             created, prev, digest),
-        )
-        self._conn.commit()
-        return cur.lastrowid
+        try:
+            last = self._one(
+                "SELECT id, row_hash FROM ledger ORDER BY id DESC LIMIT 1")
+            if last is None:
+                next_id, prev = 1, _chain.GENESIS_HASH
+            elif not last["row_hash"]:
+                # Tightening spec T3: never seal onto GENESIS over an
+                # unsealed predecessor — that would paper over an
+                # unsealed/corrupt tail. The open-time sealing pass or
+                # the operator deals with the tail first.
+                raise ValueError(
+                    f"cannot append ledger row: predecessor row"
+                    f" {last['id']} is unsealed (no row_hash); the"
+                    " chain must be repaired before the book grows")
+            else:
+                next_id = int(last["id"]) + 1
+                prev = last["row_hash"]
+            created = _now()
+            entry = {
+                "id": next_id,
+                "target_id": target_id,
+                "contract_id": contract_id,
+                "candidate_id": candidate_id,
+                "stage": stage,
+                "expert_id": expert_id,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "cost_usd": cost_usd,
+                "outcome": outcome,
+                "note": note,
+                "created_at": created,
+                "provenance": provenance,
+                "sealed_via": "append",
+            }
+            digest = _chain.row_hash(prev, entry)
+            cur = self._conn.execute(
+                "INSERT INTO ledger (id, target_id, contract_id,"
+                " candidate_id, stage, expert_id, tokens_in, tokens_out,"
+                " cost_usd, outcome, note, created_at, prev_hash,"
+                " row_hash, provenance, sealed_via)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (next_id, target_id, contract_id, candidate_id, stage,
+                 expert_id, tokens_in, tokens_out, cost_usd, outcome,
+                 note, created, prev, digest, provenance, "append"),
+            )
+            row_id = cur.lastrowid
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return row_id
 
     def ledger_rows(self, expert_id=None):
         if expert_id is None:
@@ -1084,6 +1266,8 @@ class Store:
             "created_at": row["created_at"],
             "prev_hash": _col(row, "prev_hash"),
             "row_hash": _col(row, "row_hash"),
+            "provenance": _col(row, "provenance"),
+            "sealed_via": _col(row, "sealed_via"),
         }
 
     def ledger_summary(self):
@@ -1173,17 +1357,24 @@ class Store:
                       route_change, evidence, written_to,
                       provenance="generated"):
         self._begin_write()
-        lesson_id = self._next_id("lsn", "lessons")
-        self._conn.execute(
-            'INSERT INTO lessons (id, contract_id, domain, tags_json,'
-            ' outcome, cause, "rule", route_change_json, evidence_json,'
-            " written_to, provenance, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (lesson_id, contract_id, domain, _dumps(list(tags or [])),
-             outcome, cause, rule, _dumps(route_change),
-             _dumps(list(evidence or [])), written_to, provenance, _now()),
-        )
-        self._conn.commit()
+        try:
+            lesson_id = self._next_id("lsn", "lessons")
+            self._conn.execute(
+                'INSERT INTO lessons (id, contract_id, domain, tags_json,'
+                ' outcome, cause, "rule", route_change_json, evidence_json,'
+                " written_to, provenance, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (lesson_id, contract_id, domain, _dumps(list(tags or [])),
+                 outcome, cause, rule, _dumps(route_change),
+                 _dumps(list(evidence or [])), written_to, provenance,
+                 _now()),
+            )
+            self._conn.commit()
+        except Exception:
+            # Tightening spec T7 (correctness F7 audit): roll back so a
+            # failed write never leaks its open transaction.
+            self._conn.rollback()
+            raise
         return lesson_id
 
     def get_lesson(self, lesson_id):
