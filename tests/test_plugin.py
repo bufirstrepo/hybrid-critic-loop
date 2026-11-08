@@ -448,6 +448,13 @@ class TestDocsMatchTheCode(unittest.TestCase):
         self.assertIn("unavailable", self._section(readme, "## Cost per validity point"))
         self.assertIn("first turn", hooks_mod.__doc__)
 
+    def test_readme_states_the_adapter_rules(self):
+        # Fix pass Wave 2.9 (review M8): the exit code decides a CLI seat's
+        # outcome; an API seat needs a target_file and declines without one.
+        readme = self._read("README.md")
+        self.assertIn("the exit code decides", readme)
+        self.assertIn("declines a contract without a `target_file`", readme)
+
     def test_readme_slash_usage_matches_the_handler_help(self):
         readme = self._read("README.md")
         self.assertIn("`/critic run <contract.json> [repo_path]`", readme)

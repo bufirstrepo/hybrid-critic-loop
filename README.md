@@ -16,7 +16,7 @@ Catalog Rule 13 disclosure — this plugin, by design:
 
 ## The panel — eight families
 
-The target panel is eight model families, expressed in the route table (`panel` + `scoring: "peer_matrix; no self-scoring; blind"`). Each seat is an adapter behind one interface; each reports available or unavailable honestly from the environment it runs in. Every seat in the route is dispatched; a seat that reports unavailable (or refuses) yields no candidate and is recorded as such in the ledger, so a contest runs on what exists. Nothing is faked: an absent CLI reports unavailable, and in this build two of the eight seats (agy, Beam) decline every dispatch and say so.
+The target panel is eight model families, expressed in the route table (`panel` + `scoring: "peer_matrix; no self-scoring; blind"`). Each seat is an adapter behind one interface; each reports available or unavailable honestly from the environment it runs in. Every seat in the route is dispatched; a seat that reports unavailable (or refuses) yields no candidate and is recorded as such in the ledger, so a contest runs on what exists. Nothing is faked: an absent CLI reports unavailable, and in this build two of the eight seats (agy, Beam) decline every dispatch and say so. For a CLI seat the exit code decides between completed and refused — a refusal marker in the output explains a failure and never overrides a successful exit — and a timeout is recorded as a timeout; a prompt or packet too large for a single argument is refused before anything runs, with the reason. An API seat (`qwen-local`, `deepseek`) writes the reply's fenced code block to the contract's `target_file` and declines a contract without a `target_file` before any request is made.
 
 | Family | Seat | How it runs |
 |---|---|---|

@@ -9,6 +9,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+# Linux MAX_ARG_STRLEN: the kernel refuses (E2BIG) any single argv string
+# longer than this. Checked before execve (fix pass Wave 2.9, review M8 /
+# 1D-09) so an oversize prompt or judge packet is reported with its cause
+# instead of surfacing as a bare OSError.
+MAX_ARG_STRLEN = 131072
+
+
 @dataclass
 class RunResult:
     cmd: str
@@ -38,6 +45,16 @@ def run_command(cmd: str, cwd=None, timeout_s: int = 900) -> RunResult:
     if not parts:
         duration_ms = int((time.monotonic() - start) * 1000)
         return RunResult(cmd=cmd_str, exit_code=None, stdout="", stderr="empty command", duration_ms=duration_ms, timed_out=False)
+
+    biggest = max(len(str(p).encode("utf-8", errors="replace")) for p in parts)
+    if biggest > MAX_ARG_STRLEN:
+        duration_ms = int((time.monotonic() - start) * 1000)
+        return RunResult(
+            cmd=cmd_str, exit_code=None, stdout="",
+            stderr=(f"E2BIG: a single argument of {biggest} bytes exceeds the "
+                    f"{MAX_ARG_STRLEN}-byte limit; the command was not run"),
+            duration_ms=duration_ms, timed_out=False,
+        )
 
     try:
         proc = subprocess.run(

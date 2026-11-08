@@ -543,5 +543,124 @@ class TestJudgeVerdictParsing(unittest.TestCase):
         self.assertFalse(LocalSolverExecutor("s", "naive").can_judge())
 
 
+def _fake_run(result):
+    """A stand-in for shellrun.run_command returning one scripted result."""
+    def fake(cmd, cwd=None, timeout_s=900):
+        fake.calls.append(cmd)
+        return result
+    fake.calls = []
+    return fake
+
+
+class TestCliResultClassification(unittest.TestCase):
+    """Fix pass Wave 2.9 (review M8 / 1D-05, 1D-09): the exit code decides a
+    CLI seat's outcome; a refusal marker explains a failure and never
+    overrides a success; a run the OS refused to start names its cause."""
+
+    ADAPTERS = [(CodexExecutor, "codex"), (GrokExecutor, "grok"), (ClaudeExecutor, "claude")]
+
+    def _run(self, cls, binary, result):
+        from hybrid_critic_loop.shellrun import RunResult  # noqa: F401 - shape under test
+
+        fake = _fake_run(result)
+        with patch("shutil.which", _fake_which({binary})), \
+                patch("hybrid_critic_loop.executors.run_command", fake):
+            with tempfile.TemporaryDirectory() as td:
+                gen = cls().generate(Path(td), {"task": "x"}, "")
+        self.assertEqual(len(fake.calls), 1, "the CLI must be invoked exactly once")
+        return gen
+
+    @staticmethod
+    def _result(binary, exit_code, stdout="", stderr="", timed_out=False):
+        from hybrid_critic_loop.shellrun import RunResult
+
+        return RunResult(cmd=binary, exit_code=exit_code, stdout=stdout, stderr=stderr,
+                         duration_ms=5, timed_out=timed_out)
+
+    def test_a_successful_run_that_mentions_a_marker_is_completed(self):
+        stream = ("Reconnecting to the session...\n"
+                  + json.dumps({"type": "turn.completed",
+                                "usage": {"input_tokens": 12, "output_tokens": 3}}) + "\n")
+        for cls, binary in self.ADAPTERS:
+            gen = self._run(cls, binary, self._result(binary, 0, stdout=stream))
+            self.assertEqual(gen.status, "completed", (binary, gen.detail))
+            self.assertIn("Reconnecting", gen.detail)  # noted, not decisive
+            self.assertEqual((gen.tokens_in, gen.tokens_out), (12, 3), binary)
+
+    def test_a_failed_run_with_a_marker_is_refused(self):
+        for cls, binary in self.ADAPTERS:
+            gen = self._run(cls, binary, self._result(binary, 1, stderr="Not logged in. Run login first.\n"))
+            self.assertEqual(gen.status, "refused", (binary, gen.detail))
+            self.assertIn("Not logged in", gen.detail)
+
+    def test_a_failed_run_without_a_marker_is_an_error_naming_the_exit(self):
+        gen = self._run(CodexExecutor, "codex", self._result("codex", 2, stderr="usage: codex exec ..."))
+        self.assertEqual(gen.status, "error")
+        self.assertIn("exited 2", gen.detail)
+
+    def test_a_run_the_os_refused_to_start_names_the_cause(self):
+        reason = ("E2BIG: a single argument of 200000 bytes exceeds the 131072-byte limit; "
+                  "the command was not run")
+        gen = self._run(CodexExecutor, "codex", self._result("codex", None, stderr=reason))
+        self.assertEqual(gen.status, "error")
+        self.assertIn("E2BIG", gen.detail)
+        self.assertNotIn("exited None", gen.detail)
+
+    def test_a_timeout_is_a_timeout_and_a_hung_refusal_stays_refused(self):
+        gen = self._run(GrokExecutor, "grok", self._result("grok", None, stdout="working...", timed_out=True))
+        self.assertEqual(gen.status, "timeout", gen.detail)
+        gen = self._run(GrokExecutor, "grok", self._result("grok", None, stdout="Not logged in\n", timed_out=True))
+        self.assertEqual(gen.status, "refused", gen.detail)
+        self.assertIn("hung", gen.detail)
+
+
+class TestUsageParsing(unittest.TestCase):
+    """Fix pass Wave 2.9 (review M8 / 1D-06): token counts come from whole
+    JSON — a JSONL event line or one JSON document — never from prose that
+    happens to quote a usage-shaped object."""
+
+    def test_prose_quoting_a_usage_object_counts_nothing(self):
+        from hybrid_critic_loop.executors import _parse_jsonl_usage
+
+        prose = ('I noticed the earlier run reported {"usage": {"input_tokens": 999, '
+                 '"output_tokens": 888}} which looks high.\n')
+        self.assertEqual(_parse_jsonl_usage(prose)[:2], (None, None))
+
+    def test_jsonl_event_lines_and_a_whole_document_count(self):
+        from hybrid_critic_loop.executors import _parse_jsonl_usage
+
+        stream = (json.dumps({"type": "thread.started", "thread_id": "t1"}) + "\n"
+                  + json.dumps({"type": "turn.completed",
+                                "usage": {"input_tokens": 12, "output_tokens": 3}}) + "\n")
+        self.assertEqual(_parse_jsonl_usage(stream)[:2], (12, 3))
+        # One pretty-printed document (the claude --output-format json envelope).
+        envelope = json.dumps({"result": "done",
+                               "usage": {"input_tokens": 7, "output_tokens": 2}}, indent=2)
+        self.assertEqual(_parse_jsonl_usage(envelope)[:2], (7, 2))
+
+
+class TestRunCommandArgumentLimit(unittest.TestCase):
+    """Fix pass Wave 2.9 (review M8 / 1D-09): an argument above the kernel's
+    per-argument limit is refused before execve, with the reason, instead of
+    surfacing as a bare OSError the adapters cannot explain."""
+
+    def test_oversize_argument_is_refused_before_running(self):
+        from hybrid_critic_loop.shellrun import MAX_ARG_STRLEN, run_command
+
+        result = run_command("echo " + "x" * (MAX_ARG_STRLEN + 1))
+        self.assertIsNone(result.exit_code)
+        self.assertFalse(result.timed_out)
+        self.assertIn("E2BIG", result.stderr)
+        self.assertIn(str(MAX_ARG_STRLEN), result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_normal_argument_runs(self):
+        from hybrid_critic_loop.shellrun import run_command
+
+        result = run_command("echo hello")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("hello", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

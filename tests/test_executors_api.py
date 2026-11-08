@@ -17,6 +17,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,6 +46,7 @@ class _StubState:
         self.generate_reply = GENERATE_REPLY
         self.chat_reply = GENERATE_REPLY
         self.requests: list[dict] = []
+        self.delay_s = 0.0  # a slow model: the stub sleeps before answering a POST
 
 
 STATE = _StubState()
@@ -60,11 +62,14 @@ class _StubHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError:
+            pass  # the client gave up (a timeout test): nothing to answer
 
     def _read_json_body(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -86,6 +91,8 @@ class _StubHandler(BaseHTTPRequestHandler):
             {"path": self.path, "body": body,
              "authorization": self.headers.get("Authorization")}
         )
+        if STATE.delay_s:
+            time.sleep(STATE.delay_s)
         if self.path == "/api/generate":
             prompt = body.get("prompt") or ""
             reply = json.dumps(JUDGE_REPLY) if _is_judge_prompt(prompt) else STATE.generate_reply
@@ -124,6 +131,7 @@ class _StubServerMixin(unittest.TestCase):
         STATE.generate_reply = GENERATE_REPLY
         STATE.chat_reply = GENERATE_REPLY
         STATE.requests = []
+        STATE.delay_s = 0.0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _StubHandler)
         self.port = self.server.server_address[1]
         self.base = f"http://127.0.0.1:{self.port}"
@@ -203,18 +211,38 @@ class TestOllamaQwenExecutor(_StubServerMixin):
         ex = OllamaQwenExecutor()
         with patch.dict(os.environ, {"OLLAMA_HOST": host}):
             with tempfile.TemporaryDirectory() as td:
-                result = ex.generate(Path(td), {"task": "x"}, "")  # must not raise
+                result = ex.generate(  # must not raise
+                    Path(td), {"task": "x", "target_file": "src/x.py"}, "")
         self.assertEqual(result.status, "error")
         self.assertTrue(result.detail)
 
-    def test_generate_without_target_file_completes_without_writing(self):
+    def test_generate_without_target_file_is_declined_before_any_request(self):
+        # Fix pass Wave 2.9 (review M8 / 1D-12): an API seat cannot place a
+        # reply in the worktree without a target_file — it declines up front
+        # instead of spending tokens and reporting completed with nothing
+        # written (the behaviour this test used to pin).
         ex = OllamaQwenExecutor()
         with patch.dict(os.environ, {"OLLAMA_HOST": self.base}):
             with tempfile.TemporaryDirectory() as td:
                 result = ex.generate(Path(td), {"task": "explain something"}, "")
                 self.assertEqual(os.listdir(td), [])
-        self.assertEqual(result.status, "completed", result.detail)
-        self.assertIn("Here is the implementation", result.log)
+        self.assertEqual(result.status, "unavailable", result.detail)
+        self.assertIn("target_file", result.detail)
+        self.assertEqual([r for r in STATE.requests if r["path"] == "/api/generate"], [])
+
+    def test_generate_timeout_is_reported_as_timeout(self):
+        # Fix pass Wave 2.9 (review M8 / 1D-07): a slow model is a timeout,
+        # not an error — the ledger has an outcome for it.
+        STATE.delay_s = 1.0
+        ex = OllamaQwenExecutor()
+        contract = {"task": "x", "target_file": "src/speed_sampler.py"}
+        with patch.dict(os.environ, {"OLLAMA_HOST": self.base}), \
+                patch.object(executors_api, "_GENERATE_TIMEOUT_S", 0.3):
+            with tempfile.TemporaryDirectory() as td:
+                result = ex.generate(Path(td), contract, "")
+                self.assertFalse((Path(td) / "src" / "speed_sampler.py").exists())
+        self.assertEqual(result.status, "timeout", result.detail)
+        self.assertIn("timed out", result.detail)
 
     def test_judge_parses_stub_json_reply(self):
         ex = OllamaQwenExecutor()
@@ -286,13 +314,37 @@ class TestDeepSeekExecutor(_StubServerMixin):
         self.assertEqual(result.detail, "DEEPSEEK_API_KEY not set")
         self.assertEqual(STATE.requests, [])
 
+    def test_generate_without_target_file_is_declined_before_any_request(self):
+        # Fix pass Wave 2.9 (review M8 / 1D-12).
+        ex = DeepSeekExecutor()
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key-not-real"}), self._patched():
+            with tempfile.TemporaryDirectory() as td:
+                result = ex.generate(Path(td), {"task": "explain something"}, "")
+                self.assertEqual(os.listdir(td), [])
+        self.assertEqual(result.status, "unavailable", result.detail)
+        self.assertIn("target_file", result.detail)
+        self.assertEqual(STATE.requests, [])
+
+    def test_generate_timeout_is_reported_as_timeout(self):
+        # Fix pass Wave 2.9 (review M8 / 1D-07).
+        STATE.delay_s = 1.0
+        ex = DeepSeekExecutor()
+        contract = {"task": "x", "target_file": "src/speed_sampler.py"}
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key-not-real"}), self._patched(), \
+                patch.object(executors_api, "_GENERATE_TIMEOUT_S", 0.3):
+            with tempfile.TemporaryDirectory() as td:
+                result = ex.generate(Path(td), contract, "")
+        self.assertEqual(result.status, "timeout", result.detail)
+        self.assertIn("timed out", result.detail)
+
     def test_generate_error_no_exception_when_endpoint_closed(self):
         ex = DeepSeekExecutor()
         closed = f"http://127.0.0.1:{_closed_port()}/chat/completions"
         with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key-not-real"}), \
                 patch.object(executors_api, "DEEPSEEK_API_URL", closed):
             with tempfile.TemporaryDirectory() as td:
-                result = ex.generate(Path(td), {"task": "x"}, "")  # must not raise
+                result = ex.generate(  # must not raise
+                    Path(td), {"task": "x", "target_file": "src/x.py"}, "")
         self.assertEqual(result.status, "error")
         self.assertTrue(result.detail)
 

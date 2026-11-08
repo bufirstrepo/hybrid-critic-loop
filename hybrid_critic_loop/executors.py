@@ -82,28 +82,38 @@ def build_prompt(contract: dict, context: str) -> str:
 
 
 def _parse_jsonl_usage(stdout: str):
-    """Best-effort parse of JSONL for token usage and request ids. Never raises."""
+    """Token usage and request ids from a CLI's JSON output. Never raises.
+
+    Whole JSON only (fix pass Wave 2.9, review M8 / 1D-06): one JSON
+    document (claude's ``--output-format json`` envelope) or JSONL event
+    lines (codex ``--json``). A line that is not entirely JSON — model
+    prose quoting a usage-shaped object — counts for nothing; a token
+    count is a reported number or None, never a guess (invariant 5).
+    """
     tokens_in = None
     tokens_out = None
     request_ids: list[str] = []
     cost = None
     if not stdout:
         return tokens_in, tokens_out, request_ids, cost
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line or "{" not in line:
-            continue
-        # Try whole line as JSON, else find first {..}
-        obj = None
-        try:
-            obj = json.loads(line)
-        except Exception:
-            # Try to extract a JSON object substring
-            start = line.find("{")
+    objects: list = []
+    try:
+        whole = json.loads(stdout)
+    except Exception:
+        whole = None
+    if isinstance(whole, (dict, list)):
+        objects.append(whole)
+    else:
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
             try:
-                obj, _ = json.JSONDecoder().raw_decode(line[start:])
+                obj = json.loads(line)
             except Exception:
                 continue
+            objects.append(obj)
+    for obj in objects:
         # Walk dicts recursively (shallow + nested)
         stack = [obj]
         while stack:
@@ -247,6 +257,39 @@ def _find_refusal_line(combined: str) -> str | None:
     return None
 
 
+def _cli_result(binary_label: str, result, log: str, tokens_in, tokens_out, cost,
+                request_ids) -> GenResult:
+    """Classify a CLI seat's run (fix pass Wave 2.9, review M8 / 1D-05, 1D-09).
+
+    The exit code decides: 0 is ``completed`` (a refusal marker in the
+    output is noted in the detail, never decisive); a non-zero exit with a
+    marker is ``refused``, without one ``error``; a run the runner could not
+    start (``exit_code is None``: E2BIG, a vanished binary) is ``error``
+    carrying the runner's own reason; a timeout is ``timeout`` — unless the
+    output carries a refusal marker, in which case the seat refused and
+    then hung. One decision for every CLI adapter.
+    """
+    refusal = _find_refusal_line(log)
+    common = dict(log=log, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost,
+                  request_ids=request_ids, duration_ms=result.duration_ms)
+    if result.timed_out:
+        if refusal:
+            return GenResult(status="refused",
+                             detail=f"{refusal}; process then hung and was killed at the timeout",
+                             **common)
+        return GenResult(status="timeout", detail=f"{binary_label} timed out", **common)
+    if result.exit_code == 0:
+        detail = f"completed; output mentions {refusal!r}" if refusal else ""
+        return GenResult(status="completed", detail=detail, **common)
+    if result.exit_code is None:
+        lines = (result.stderr or "").strip().splitlines()
+        reason = lines[0] if lines else "the command could not be started"
+        return GenResult(status="error", detail=f"{binary_label} could not run: {reason}", **common)
+    if refusal:
+        return GenResult(status="refused", detail=refusal, **common)
+    return GenResult(status="error", detail=f"{binary_label} exited {result.exit_code}", **common)
+
+
 class Executor:
     expert_id: str = "base"
     family: str = "base"
@@ -293,17 +336,7 @@ class CodexExecutor(Executor):
         if not request_ids:
             _, _, rids2, _ = _parse_jsonl_usage(result.stderr or "")
             request_ids = rids2
-        refusal = _find_refusal_line(combined)
-        if refusal:
-            detail = refusal
-            if result.timed_out:
-                detail = f"{refusal}; process then hung and was killed at the timeout"
-            return GenResult(status="refused", log=log, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost, request_ids=request_ids, duration_ms=result.duration_ms, detail=detail)
-        if result.timed_out:
-            return GenResult(status="timeout", log=log, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost, request_ids=request_ids, duration_ms=result.duration_ms, detail="codex exec timed out")
-        if result.exit_code == 0:
-            return GenResult(status="completed", log=log, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost, request_ids=request_ids, duration_ms=result.duration_ms, detail="")
-        return GenResult(status="error", log=log, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost, request_ids=request_ids, duration_ms=result.duration_ms, detail=f"codex exited {result.exit_code}")
+        return _cli_result("codex", result, log, tokens_in, tokens_out, cost, request_ids)
 
     def judge(self, packet: str, rubric: dict) -> dict | None:
         ok, _ = self.available()
@@ -341,17 +374,7 @@ class GrokExecutor(Executor):
         result = run_command(cmd, cwd=worktree, timeout_s=300)
         combined = (result.stdout or "") + "\n" + (result.stderr or "")
         tokens_in, tokens_out, request_ids, cost = _parse_jsonl_usage(result.stdout or "")
-        refusal = _find_refusal_line(combined)
-        if refusal:
-            detail = refusal
-            if result.timed_out:
-                detail = f"{refusal}; process then hung and was killed at the timeout"
-            return GenResult(status="refused", log=combined, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost, request_ids=request_ids, duration_ms=result.duration_ms, detail=detail)
-        if result.timed_out:
-            return GenResult(status="timeout", log=combined, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost, request_ids=request_ids, duration_ms=result.duration_ms, detail="grok timed out")
-        if result.exit_code == 0:
-            return GenResult(status="completed", log=combined, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost, request_ids=request_ids, duration_ms=result.duration_ms, detail="")
-        return GenResult(status="error", log=combined, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost, request_ids=request_ids, duration_ms=result.duration_ms, detail=f"grok exited {result.exit_code}")
+        return _cli_result("grok", result, combined, tokens_in, tokens_out, cost, request_ids)
 
     def judge(self, packet: str, rubric: dict) -> dict | None:
         ok, _ = self.available()
@@ -380,8 +403,8 @@ BEAM_DETAIL = (
 def _cli_generate(binary_label: str, cmd: str, worktree: Path) -> GenResult:
     """Shared generate() body for simple ``<cli> -p <prompt>`` adapters.
 
-    Mirrors the Codex/Grok patterns: JSONL usage parse, refusal-marker
-    detection, timeout and exit-code handling.
+    Mirrors the Codex/Grok adapters: JSON usage parse, then the one
+    classification in ``_cli_result`` (exit code decides; markers explain).
     """
     result = run_command(cmd, cwd=worktree, timeout_s=300)
     combined = (result.stdout or "") + "\n" + (result.stderr or "")
@@ -389,17 +412,7 @@ def _cli_generate(binary_label: str, cmd: str, worktree: Path) -> GenResult:
     if not request_ids:
         _, _, rids2, _ = _parse_jsonl_usage(result.stderr or "")
         request_ids = rids2
-    refusal = _find_refusal_line(combined)
-    if refusal:
-        detail = refusal
-        if result.timed_out:
-            detail = f"{refusal}; process then hung and was killed at the timeout"
-        return GenResult(status="refused", log=combined, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost, request_ids=request_ids, duration_ms=result.duration_ms, detail=detail)
-    if result.timed_out:
-        return GenResult(status="timeout", log=combined, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost, request_ids=request_ids, duration_ms=result.duration_ms, detail=f"{binary_label} timed out")
-    if result.exit_code == 0:
-        return GenResult(status="completed", log=combined, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost, request_ids=request_ids, duration_ms=result.duration_ms, detail="")
-    return GenResult(status="error", log=combined, tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost, request_ids=request_ids, duration_ms=result.duration_ms, detail=f"{binary_label} exited {result.exit_code}")
+    return _cli_result(binary_label, result, combined, tokens_in, tokens_out, cost, request_ids)
 
 
 def _cli_judge(cmd: str, cwd: Path) -> dict | None:

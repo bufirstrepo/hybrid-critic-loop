@@ -186,6 +186,29 @@ def _as_int(value) -> int | None:
         return None
 
 
+def _is_timeout(err: str | None) -> bool:
+    """Whether a transport error string is a timeout (fix pass Wave 2.9,
+    review M8 / 1D-07): the ledger has an outcome for it, so a slow seat is
+    never reported as a broken one."""
+    text = (err or "").lower()
+    return "timeout" in text or "timed out" in text
+
+
+def _declined_without_target_file(contract, seat: str) -> GenResult | None:
+    """An API seat can only place its reply in the worktree through the
+    contract's ``target_file``; without one it declines BEFORE any request
+    (fix pass Wave 2.9, review M8 / 1D-12) instead of spending tokens and
+    reporting ``completed`` with nothing written."""
+    target = contract.get("target_file") if isinstance(contract, dict) else None
+    if target:
+        return None
+    return GenResult(
+        status="unavailable", log="", duration_ms=0,
+        detail=(f"{seat}: contract names no target_file; an API seat cannot place "
+                "its reply in the worktree — not dispatched"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Ollama-backed Qwen
 # ---------------------------------------------------------------------------
@@ -195,7 +218,8 @@ class OllamaQwenExecutor(Executor):
 
     The model cannot edit files itself, so ``generate()`` extracts a
     fenced code block from its reply and writes it to the contract's
-    ``target_file`` inside the worktree. ``available()`` is a live
+    ``target_file`` inside the worktree; a contract without a
+    ``target_file`` is declined before any request. ``available()`` is a live
     probe of ``{OLLAMA_HOST}/api/tags`` with a short (2s) timeout and
     requires a listed model whose name starts with ``qwen2.5-coder``;
     the exact tag found is recorded on ``self.model_tag``.
@@ -262,17 +286,22 @@ class OllamaQwenExecutor(Executor):
 
     def generate(self, worktree: Path, contract: dict, context: str) -> GenResult:
         start = time.monotonic()
+        declined = _declined_without_target_file(contract, self.expert_id)
+        if declined is not None:
+            return declined
         try:
             prompt = build_prompt(contract, context)
             obj, err = self._generate_text(prompt, timeout=_GENERATE_TIMEOUT_S)
             duration_ms = int((time.monotonic() - start) * 1000)
             if err is not None or obj is None:
+                timed_out = _is_timeout(err)
                 return GenResult(
-                    status="error",
+                    status="timeout" if timed_out else "error",
                     log="",
                     cost_usd=None,
                     duration_ms=duration_ms,
-                    detail=f"ollama generate failed at {self._host()}: {err}",
+                    detail=(f"ollama generate {'timed out' if timed_out else 'failed'} "
+                            f"at {self._host()}: {err}"),
                 )
             reply = obj.get("response") or ""
             tokens_in = _as_int(obj.get("prompt_eval_count"))
@@ -333,7 +362,8 @@ class DeepSeekExecutor(Executor):
     ``DEEPSEEK_API_KEY`` — no network probe is made by ``available()``.
     Like the Ollama adapter, the model cannot edit files, so
     ``generate()`` extracts a fenced code block from the reply for the
-    contract's ``target_file``. The API response carries no cost
+    contract's ``target_file`` (a contract without one is declined before
+    any request). The API response carries no cost
     figure, so ``cost_usd`` stays None ("not reported") — no price
     table is invented to fill it in.
     """
@@ -398,17 +428,21 @@ class DeepSeekExecutor(Executor):
         ok, detail_avail = self.available()
         if not ok:
             return GenResult(status="unavailable", log="", detail=detail_avail, duration_ms=0)
+        declined = _declined_without_target_file(contract, self.expert_id)
+        if declined is not None:
+            return declined
         try:
             prompt = build_prompt(contract, context)
             obj, err = self._chat(prompt, timeout=_GENERATE_TIMEOUT_S)
             duration_ms = int((time.monotonic() - start) * 1000)
             if err is not None or obj is None:
+                timed_out = _is_timeout(err)
                 return GenResult(
-                    status="error",
+                    status="timeout" if timed_out else "error",
                     log="",
                     cost_usd=None,
                     duration_ms=duration_ms,
-                    detail=f"deepseek generate failed: {err}",
+                    detail=f"deepseek generate {'timed out' if timed_out else 'failed'}: {err}",
                 )
             reply = self._reply_text(obj)
             tokens_in, tokens_out, request_ids = self._usage(obj)
