@@ -72,6 +72,17 @@ KNOWN_FAMILIES = {
 EVENT_TYPES = ("spread_over_threshold", "budget_exhaustion", "retry_cap", "human_gate")
 
 
+def _lesson_data_dir(store):
+    """Where the readable ``lessons.md`` mirror goes: next to the store's
+    database. A store with no location (``:memory:``, or no ``db_path``)
+    gets None and no mirror is written — never the current directory,
+    which may be the plugin's own (fix pass Wave 2.4, packet F3)."""
+    db_path = getattr(store, "db_path", None)
+    if not db_path or str(db_path) == ":memory:":
+        return None
+    return Path(str(db_path)).expanduser().parent
+
+
 def _tokens_total(candidate: dict) -> float:
     tin, tout = candidate.get("tokens_in"), candidate.get("tokens_out")
     if tin is None and tout is None:
@@ -870,9 +881,8 @@ class _Run:
         """
         store = self.store
         verdict = store.latest_verdict(self.contract_id)
-        data_dir = Path(store.db_path).parent if hasattr(store, "db_path") else Path(".")
         lesson = lessons_mod.write_lesson(
-            store, data_dir, self.contract, verdict, gate_details
+            store, _lesson_data_dir(store), self.contract, verdict, gate_details
         )
         if lesson and lesson.get("route_change"):
             if gate_details.get("panel_status") == "degraded":

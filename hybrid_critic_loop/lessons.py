@@ -134,7 +134,12 @@ def derive_outcome_cause(contract, verdict, gate_details):
 
 
 def write_lesson(store, data_dir, contract, verdict, gate_details):
-    """Derive a lesson, store it, and append a readable block to lessons.md."""
+    """Derive a lesson, store it, and append a readable block to lessons.md.
+
+    The store row is the source of truth. The markdown mirror is written
+    only when ``data_dir`` is a real location; ``None`` (an in-memory or
+    path-less store) means no mirror — never the current directory.
+    """
     contract = contract or {}
     contract_id = _contract_id(contract, verdict)
     domain = contract.get("domain") or "code"
@@ -155,8 +160,10 @@ def write_lesson(store, data_dir, contract, verdict, gate_details):
         provenance="generated",
     )
 
-    data_dir = Path(data_dir)
     try:
+        if data_dir is None:
+            raise FileNotFoundError("no data dir: in-memory store, no lessons.md mirror")
+        data_dir = Path(data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
         lessons_file = data_dir / "lessons.md"
         if not lessons_file.exists():

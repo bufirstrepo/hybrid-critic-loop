@@ -520,6 +520,30 @@ class TestHooks(unittest.TestCase):
             self.assertIn("domain: code.game", result["context"])
 
 
+class TestMirrorNeedsALocation(unittest.TestCase):
+    """write_lesson with data_dir=None stores the row and writes no file
+    anywhere (fix pass Wave 2.4, packet F3); the loop maps in-memory and
+    path-less stores to None."""
+
+    def test_write_lesson_without_a_location_writes_no_file(self):
+        import contextlib
+        import os
+        from hybrid_critic_loop import loop as loop_mod
+
+        store = FakeStore()  # db_path None
+        gate_details = {"measurements": [], "hard_failures": [], "candidate_experts": {}}
+        with tempfile.TemporaryDirectory() as td, contextlib.chdir(td):
+            lesson = lessons.write_lesson(store, None, CONTRACT, {"contract_id": "c1"}, gate_details)
+            self.assertEqual(os.listdir(td), [])
+        self.assertEqual(lesson["id"], "lsn-1")
+        self.assertEqual(store.count_lessons(), 1)
+        self.assertIsNone(loop_mod._lesson_data_dir(store))
+        store.db_path = ":memory:"
+        self.assertIsNone(loop_mod._lesson_data_dir(store))
+        store.db_path = "/some/dir/data.db"
+        self.assertEqual(loop_mod._lesson_data_dir(store), Path("/some/dir"))
+
+
 class TestInjectionCapAndTurns(unittest.TestCase):
     """The injected block is filled to the cap and its note counts the true
     remainder; pre_llm_call injects on the first turn only when the host says

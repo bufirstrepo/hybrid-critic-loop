@@ -478,6 +478,37 @@ class TestDegradedVerdictHoldsRouteChange(LoopV03Base):
         self.assertTrue(any(n.startswith("route_change demote gen-a") for n in notes), notes)
 
 
+class TestInMemoryStoreLeavesTheCwdAlone(LoopV03Base):
+    """A run on Store(':memory:') must not write lessons.md into the current
+    directory (fix pass Wave 2.4, packet F3: that is how the suite used to
+    dirty the plugin tree)."""
+
+    def test_no_lessons_md_appears_in_the_cwd(self):
+        import contextlib
+        import os
+        import tempfile
+
+        self.markers.update({"gen-a": "m-a", "gen-b": "m-b", "gen-c": "m-c"})
+        scores = {"m-a": 9.0, "m-b": 8.0, "m-c": 7.0}
+        executors = {
+            "gen-a": FakeGen("gen-a", "fam-a", "m-a"),
+            "gen-b": FakeGen("gen-b", "fam-b", "m-b"),
+            "gen-c": FakeGen("gen-c", "fam-c", "m-c"),
+            "judge-y": FakeJudge("judge-y", "fam-y", scores),
+            "judge-z": FakeJudge("judge-z", "fam-z", scores),
+        }
+        self.panel("gen-a", "gen-b", ["gen-c", "judge-y", "judge-z"], ["gen-a", "gen-b", "gen-c"])
+        with tempfile.TemporaryDirectory() as td, contextlib.chdir(td):
+            result = loop_mod.run_contract(
+                self.store, _contract(), "repo://fake", executors,
+                human_decider=lambda info: "approved",
+            )
+            self.assertEqual(result["status"], "completed", result)
+            self.assertIsNotNone(result["lesson_id"])          # the row is written ...
+            self.assertEqual(os.listdir(td), [])                # ... the cwd stays clean
+        self.assertIsNone(loop_mod._lesson_data_dir(self.store))
+
+
 class TestLowConfidence(LoopV03Base):
     def test_uniform_low_confidence_escalates(self):
         self.markers.update({"gen-a": "m-a", "gen-b": "m-b", "gen-c": "m-c"})
