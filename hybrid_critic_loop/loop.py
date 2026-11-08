@@ -1074,6 +1074,7 @@ class _Run:
         }
         if self.route_hold is not None:
             result["route_change_hold"] = self.route_hold
+        _attach_certificate(result, store, self.contract_id)
         # The gate is pending from here until record_human_gate completes
         # it — whether the decider answers now or an operator does later;
         # a refused decision leaves the contract at its gate (Wave 2.7).
@@ -1124,6 +1125,7 @@ class _Run:
         }
         if self.route_hold is not None:
             result["route_change_hold"] = self.route_hold
+        _attach_certificate(result, store, self.contract_id)
         return result
 
     def _write_lesson(self, attempt, gate_details):
@@ -1195,6 +1197,26 @@ class _Run:
                 pass
 
 
+def _attach_certificate(result, store, contract_id):
+    """Add the MM CERTIFIED certificate block to a run result (Unit B).
+
+    Issued only for a run that reached a verdict — chain.issue_certificate
+    returns None otherwise, and the key stays absent. Bookkeeping only:
+    never raises into the loop.
+    """
+    if not isinstance(result, dict) or result.get("certificate") is not None:
+        return result
+    try:
+        from . import chain as _chain
+
+        cert = _chain.issue_certificate(store, contract_id)
+    except Exception:  # noqa: BLE001 - bookkeeping must not undo a verdict
+        cert = None
+    if cert is not None:
+        result["certificate"] = cert
+    return result
+
+
 def run_contract(store, contract: dict, repo_path, executors: dict, human_decider=None) -> dict:
     """Run one contract end-to-end. See module docstring for outcomes."""
     return _Run(store, contract, repo_path, executors, human_decider).run()
@@ -1219,6 +1241,7 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
     mgr = _mgr or WorktreeManager(Path(contract["repo_path"]))
     result = dict(_result or {"contract_id": contract_id})
     result["human_gate"] = decision
+    _attach_certificate(result, store, contract_id)
 
     def _record_decision(value):
         # The decision is a verdict-row fact (fix pass Wave 2.6, review H5):

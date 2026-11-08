@@ -62,6 +62,40 @@ The funnel is a scored step-down bracket. The whole panel generates once — one
 
 A **validity point** is one point of final validity score from the matrix (the candidate's `median_mean`, 0–10). Each expert's ledger line reports dispatches (with completed, refused, timeout, unavailable and error counts — a seat that refused and a seat whose binary was missing are different facts), tokens, cost, win rate, accumulated validity points, and **cost per validity point** (cost reported on matrix-scored candidates ÷ their validity points). The undefined-cost rule is strict: CPVP is computed only when both cost and validity are measured numbers. Where an executor does not report cost, CPVP prints **"not reported"** and the ledger line shows the expert's win rate beside it — the plugin never divides by an unreported cost and never estimates one. An expert the matrix never scored — an anchor-only winner, a gate-eliminated candidate, a seat that produced nothing — has no validity points to report, and nothing is invented for it. Cost is read only where a provider reports it: the claude seat's JSON envelope carries `total_cost_usd`; codex, grok, the ollama seat and DeepSeek report tokens only, so their lines print `cpvp=not reported`.
 
+## Standing — the client book
+
+You want to prove you're rich? Show us you're running the Millionaire Matrix. A store's **standing** is its client book: *lifetime* measured spend — every measured dollar the ledger has ever recorded, summed across all runs, the way a boutique tracks a client by lifetime spend rather than one visit. Tokens are counted alongside, and never convert to dollars; where no provider reported cost, the spend reads **"not reported"** and the tier is taken from what was actually measured — nothing is estimated, here as everywhere in this plugin.
+
+| Tier | Lifetime measured spend |
+|---|---|
+| WINDOW SHOPPER | no measured spend |
+| CLIENT | $0.01–$999.99 |
+| HIGH ROLLER | $1,000–$9,999.99 |
+| PLAYER | $10,000–$99,999.99 |
+| BALLER | $100,000–$999,999.99 |
+| MILLIONAIRE | $1,000,000+ |
+
+Standing appears wherever the operator already looks:
+
+- **Session start.** The injected first-turn context opens with the standing line — `Millionaire Matrix standing: <TIER> — $<spend> lifetime measured spend · <tokens> tokens` (segments read "not reported" when unmeasured) — above the lessons, under the same 10,000-character cap. A store with dispatches but no lessons injects the line alone.
+- **`/critic standing`** (also `hermes critic standing`, `hcl standing`, and the `session-start` output) prints the full board: the standing line, the next tier and the exact additional measured spend required to reach it (nothing above MILLIONAIRE), and one row per expert — the ledger report's columns plus that expert's own tier, taken from the expert's measured validity cost where present.
+- **Every verdict report** closes with the store's current tier and the run's own recorded contribution (the tokens and cost on that contract's ledger rows, or "not reported").
+
+## Certificates and the chain
+
+A standing is only worth flexing if it cannot be rewritten after the fact, so the book seals itself. Every ledger row carries a hash chain: `row_hash = sha256(prev_hash + the row's canonical form)`, each row sealing the one before it back to a genesis hash. Rows written before the chain existed are backfilled in id order on first open (a store meta flag records that the backfill has run); every new row is hashed as it is appended, under the store's lock. Edit any stored row — inflate a token count, invent spend — and the chain no longer recomputes: `chain.verify_chain` names the first row that fails to seal.
+
+A run that reached a verdict is issued a **certificate**, printed in its run result and at the foot of its verdict report:
+
+```
+MM CERTIFIED · 1,204,311 TOKENS SPENT · $96.20 BURNED · ONE ANSWER
+cert: mm1.<base64url(payload)>.<base64url(signature)>
+```
+
+The stamp follows the book's discipline: the totals are the run's own ledger rows summed over reported values only, and where no provider reported the run's cost the dollar segment is omitted — never estimated. The payload names the contract, the verdict, those totals, the operator's tier at issue time, and the chain head (the `row_hash` of the contract's last ledger row). The signature is HMAC-SHA256 over the payload with the store's local key (`cert_key` in the plugin data directory, generated once, file perms 600). `hermes critic verify-cert <token>` (or `verify-cert` on the standalone CLI) recomputes the signature, the whole chain, the run totals and the chain head against the store and reports VALID or the first mismatch it finds.
+
+**What the local signature does and does not prove.** It proves the certificate was issued by this store and has not been altered since — a store-integrity seal. It does *not* make a public claim checkable: whoever holds the store's files holds the key, so a certificate posted on its own is only as trustworthy as the store behind it. Making a posted standing publicly verifiable is the designed next step and is **not built**: a hosted verification service the certificate ID resolves against, live receipts streamed to it as runs finish (so a rich history cannot be backfilled), and provider-record audit for the top tiers. Until that service exists, no certificate from this build proves anything to anyone who does not already trust the store.
+
 ## What it does, end to end
 
 1. **Contract.** A task is written as a contract with *structured* acceptance: hard gates (shell command + expected exit code), measured gates (a sensor command emitting JSON + metric/operator/threshold), and a judged gate naming a rubric — `validity_matrix_v1` for the peer matrix — (+ minimum, judge count, the two thresholds); a top-level `bracket` block sets the cut mode and size. Prose acceptance criteria and judged-only contracts are refused.

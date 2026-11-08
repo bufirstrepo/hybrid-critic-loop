@@ -589,7 +589,39 @@ def verdict_report(store, contract_id) -> str:
             f"operator review required (lesson {_value_or_not_reported(hold.get('lesson_id'))})"
         )
     lines.append(f"human_gate: {verdict.get('human_gate')}")
+    # Standing after this run (the client book, standing.py): the store's
+    # current tier and this contract's own recorded contribution. Stores
+    # that cannot produce standing (duck-typed fakes) simply omit it.
+    try:
+        from .standing import verdict_standing_line
+
+        standing_text = verdict_standing_line(store, contract_id)
+    except Exception:
+        standing_text = None
+    if standing_text:
+        lines.append(standing_text)
+    lines.extend(_certificate_lines(store, contract_id))
     return "\n".join(lines)
+
+
+def _certificate_lines(store, contract_id):
+    """The MM CERTIFIED block for a run that reached a verdict.
+
+    Stamp + signed token, computed from the ledger by chain.py — the
+    local signature is a store-integrity seal only (see chain.py's
+    docstring for what it does not prove). A contract with no verdict
+    gets no block; any failure to compute one prints nothing rather
+    than breaking the report.
+    """
+    try:
+        from . import chain as _chain
+
+        cert = _chain.issue_certificate(store, contract_id)
+    except Exception:  # noqa: BLE001 - a report must not break on the seal
+        return []
+    if not cert:
+        return []
+    return [cert["stamp"], f"cert: {cert['cert']}"]
 
 
 def lessons_report(store, domain=None, tags=None, limit=10) -> str:

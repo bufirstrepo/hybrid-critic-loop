@@ -6,7 +6,9 @@ Usage:
     python -m hybrid_critic_loop.cli gate <contract_id> approved|rejected|waived [--reason R] [--data-dir PATH]
     python -m hybrid_critic_loop.cli lessons [--domain D] [--tags a,b] [--data-dir PATH]
     python -m hybrid_critic_loop.cli ledger [--data-dir PATH]
+    python -m hybrid_critic_loop.cli standing [--data-dir PATH]
     python -m hybrid_critic_loop.cli session-start [--domain D] [--data-dir PATH]
+    python -m hybrid_critic_loop.cli verify-cert <token> [--data-dir PATH]
 
 The same argparse shape is reused by the Hermes CLI command registered in
 plugin.py (``hermes critic ...``) via :func:`add_parser` / :func:`dispatch`.
@@ -136,16 +138,47 @@ def _cmd_ledger(data_dir) -> int:
     return 0
 
 
+def _cmd_verify_cert(token, data_dir) -> int:
+    """Verify an MM CERTIFIED certificate token against this store."""
+    from .chain import verify_certificate
+
+    store, data_dir = _open(data_dir)
+    ok, payload_or_reason = verify_certificate(store, token)
+    if ok:
+        print("certificate: VALID")
+        print(json.dumps(payload_or_reason, indent=2, default=str))
+        return 0
+    print(f"certificate: INVALID — {payload_or_reason}")
+    return 1
+
+
+def _cmd_standing(data_dir) -> int:
+    from .standing import standing_report
+
+    store, data_dir = _open(data_dir)
+    print(standing_report(store))
+    return 0
+
+
 def _cmd_session_start(domain, data_dir) -> int:
     from . import hooks as hooks_mod
+    from .standing import standing_line
 
     store, data_dir = _open(data_dir)
     hooks_mod.on_session_start(store, data_dir, domain=domain or "code")
     result = hooks_mod.pre_llm_call(store, data_dir, domain=domain)
     if result and result.get("context"):
+        # The injected context opens with the standing line (hooks.py);
+        # it is the session-start standing surface as well.
         print(result["context"])
     else:
-        print("")
+        # Nothing to inject — still show the standing line when the
+        # store has one on record.
+        try:
+            line = standing_line(store)
+        except Exception:
+            line = None
+        print(line or "")
     return 0
 
 
@@ -186,6 +219,18 @@ def _add_subcommands(subparsers):
 
     ledger_p = subparsers.add_parser("ledger", help="show the expert ledger")
     ledger_p.add_argument("--data-dir", default=None)
+
+    standing_p = subparsers.add_parser(
+        "standing", help="show the client book: lifetime tier and spend"
+    )
+    standing_p.add_argument("--data-dir", default=None)
+
+    cert_p = subparsers.add_parser(
+        "verify-cert",
+        help="verify an MM CERTIFIED certificate token against this store",
+    )
+    cert_p.add_argument("token", help="the mm1.… certificate token")
+    cert_p.add_argument("--data-dir", default=None)
 
     session_p = subparsers.add_parser(
         "session-start",
@@ -230,12 +275,16 @@ def dispatch(args, data_dir=None) -> int:
             )
         if sub == "ledger":
             return _cmd_ledger(effective_dir)
+        if sub == "standing":
+            return _cmd_standing(effective_dir)
+        if sub == "verify-cert":
+            return _cmd_verify_cert(args.token, effective_dir)
         if sub == "session-start":
             return _cmd_session_start(getattr(args, "domain", None), effective_dir)
     except Exception as exc:  # CLI boundary: errors are exit 1, not tracebacks
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    print("error: no critic subcommand given (run|gate|lessons|ledger|session-start)",
+    print("error: no critic subcommand given (run|gate|lessons|ledger|standing|verify-cert|session-start)",
           file=sys.stderr)
     return 1
 

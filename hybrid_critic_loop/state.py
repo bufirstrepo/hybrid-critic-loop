@@ -15,6 +15,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import chain as _chain
+
 __all__ = ["Store"]
 
 _COST_TIERS = {"free", "subscription", "api"}
@@ -178,7 +180,9 @@ CREATE TABLE IF NOT EXISTS ledger (
     cost_usd REAL,
     outcome TEXT NOT NULL,
     note TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    prev_hash TEXT,
+    row_hash TEXT
 );
 CREATE TABLE IF NOT EXISTS lessons (
     id TEXT PRIMARY KEY,
@@ -224,7 +228,18 @@ _MIGRATION_COLUMNS = {
     "verdicts": (
         ("route_hold_json", "TEXT"),
     ),
+    # Standing spec (Unit B): the ledger hash chain — every row seals the
+    # previous row's hash (see chain.py). Backfilled once on first open;
+    # PRAGMA user_version bit 1 is the store meta flag recording that the
+    # backfill has run.
+    "ledger": (
+        ("prev_hash", "TEXT"),
+        ("row_hash", "TEXT"),
+    ),
 }
+
+#: PRAGMA user_version value marking the ledger-chain backfill as done.
+_CHAIN_BACKFILL_VERSION = 1
 
 
 def _now():
@@ -315,6 +330,7 @@ class Store:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._migrate()
+        self._backfill_chain()
 
     def _migrate(self):
         """Add post-v1 columns to pre-existing tables, if missing.
@@ -336,6 +352,38 @@ class Store:
                     self._conn.execute(
                         f"ALTER TABLE {table} ADD COLUMN"
                         f" {col_name} {col_type}")
+        self._conn.commit()
+
+    def _backfill_chain(self):
+        """Seal pre-chain ledger rows, once (standing spec, Unit B).
+
+        Databases written before the hash chain have NULL ``prev_hash`` /
+        ``row_hash``. On first open (``PRAGMA user_version`` below
+        ``_CHAIN_BACKFILL_VERSION``) every such row is hashed in id order,
+        continuing from any row that already carries a hash, and the meta
+        flag is set so the pass never runs again. Later appends hash at
+        insert time (see ``add_ledger``), so after this pass every row in
+        the book seals.
+        """
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if version >= _CHAIN_BACKFILL_VERSION:
+            return
+        rows = self._all("SELECT * FROM ledger ORDER BY id ASC")
+        prev = _chain.GENESIS_HASH
+        for row in rows:
+            existing = _col(row, "row_hash")
+            if existing:
+                prev = existing
+                continue
+            entry = self._ledger_dict(row)
+            digest = _chain.row_hash(prev, entry)
+            self._conn.execute(
+                "UPDATE ledger SET prev_hash=?, row_hash=? WHERE id=?",
+                (prev, digest, row["id"]),
+            )
+            prev = digest
+        self._conn.execute(
+            f"PRAGMA user_version = {_CHAIN_BACKFILL_VERSION}")
         self._conn.commit()
 
     # -- internal helpers -------------------------------------------------
@@ -970,12 +1018,42 @@ class Store:
             raise ValueError(
                 f"invalid ledger outcome {outcome!r}: must be one of"
                 f" {sorted(_LEDGER_OUTCOMES)}")
+        # Hash chain (standing spec, Unit B): the new row seals the
+        # previous row's hash. The id is assigned here, inside the write
+        # transaction and the store lock, because the id is one of the
+        # row's own canonical fields.
+        self._begin_write()
+        last = self._one(
+            "SELECT id, row_hash FROM ledger ORDER BY id DESC LIMIT 1")
+        if last is None:
+            next_id, prev = 1, _chain.GENESIS_HASH
+        else:
+            next_id = int(last["id"]) + 1
+            prev = last["row_hash"] or _chain.GENESIS_HASH
+        created = _now()
+        entry = {
+            "id": next_id,
+            "target_id": target_id,
+            "contract_id": contract_id,
+            "candidate_id": candidate_id,
+            "stage": stage,
+            "expert_id": expert_id,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cost_usd": cost_usd,
+            "outcome": outcome,
+            "note": note,
+            "created_at": created,
+        }
+        digest = _chain.row_hash(prev, entry)
         cur = self._conn.execute(
-            "INSERT INTO ledger (target_id, contract_id, candidate_id,"
+            "INSERT INTO ledger (id, target_id, contract_id, candidate_id,"
             " stage, expert_id, tokens_in, tokens_out, cost_usd, outcome,"
-            " note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (target_id, contract_id, candidate_id, stage, expert_id,
-             tokens_in, tokens_out, cost_usd, outcome, note, _now()),
+            " note, created_at, prev_hash, row_hash)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (next_id, target_id, contract_id, candidate_id, stage,
+             expert_id, tokens_in, tokens_out, cost_usd, outcome, note,
+             created, prev, digest),
         )
         self._conn.commit()
         return cur.lastrowid
@@ -1004,6 +1082,8 @@ class Store:
             "outcome": row["outcome"],
             "note": row["note"],
             "created_at": row["created_at"],
+            "prev_hash": _col(row, "prev_hash"),
+            "row_hash": _col(row, "row_hash"),
         }
 
     def ledger_summary(self):
