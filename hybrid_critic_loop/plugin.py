@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import hooks as hooks_mod
 from .reports import build_matrix_view, ledger_report, lessons_report
+from .standing import standing_report
 from .router import ensure_routes
 
 REGISTRATION_NOTES = []
@@ -562,7 +563,8 @@ def register(ctx):
                 "  critic run <contract.json> [repo_path]\n"
                 "  critic gate <contract_id> approve|reject|waive [reason]\n"
                 "  critic lessons [domain]\n"
-                "  critic ledger"
+                "  critic ledger\n"
+                "  critic standing"
             )
         sub = parts[0]
         if sub == "run":
@@ -604,12 +606,14 @@ def register(ctx):
             return lessons_report(store, domain=domain)
         if sub == "ledger":
             return ledger_report(store)
-        return f"unknown critic subcommand: {sub} (try: run, gate, lessons, ledger)"
+        if sub == "standing":
+            return standing_report(store)
+        return f"unknown critic subcommand: {sub} (try: run, gate, lessons, ledger, standing)"
 
     ctx.register_command(
         "critic",
         critic_command,
-        "Hybrid Critic Loop: run <contract.json> [repo_path] | lessons [domain] | ledger",
+        "Hybrid Critic Loop: run <contract.json> [repo_path] | lessons [domain] | ledger | standing",
     )
 
     # -- CLI command -----------------------------------------------------------
