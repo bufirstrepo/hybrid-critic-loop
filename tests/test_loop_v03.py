@@ -15,6 +15,7 @@ import unittest
 from hybrid_critic_loop import gates as gates_mod
 from hybrid_critic_loop import loop as loop_mod
 from hybrid_critic_loop.contracts import validate_contract
+from hybrid_critic_loop.errors import ContractError
 from hybrid_critic_loop.executors import Executor, GenResult
 from hybrid_critic_loop.reports import ledger_report, verdict_report
 from hybrid_critic_loop.state import Store
@@ -640,6 +641,11 @@ class TestSeatsJudgeEachOther(LoopV03Base):
                     if n.startswith("bracket round 1"))
         self.assertIn("passed=0", note)
         self.assertIn("no candidate passed the matrix", note)
+        # An escalated verdict names who was out (fix pass Wave 2.10, 1B-20):
+        # every fielded candidate of the deciding attempt.
+        fielded = sorted(c["id"] for c in self.store.candidates_for("ctr_fake") if c["status"] == "completed")
+        self.assertEqual(sorted(verdict["eliminated"]), fielded)
+        self.assertEqual(len(fielded), 3)
 
 
 class TestValidityPointsComeOnlyFromTheMatrix(LoopV03Base):
@@ -983,6 +989,62 @@ class TestNobodyGenerates(LoopV03Base):
         # Nobody won, nobody lost: no candidate was fielded.
         for eid in ("gen-a", "gen-b"):
             self.assertEqual(self.store.get_expert(eid)["losses"], 0)
+
+
+class TestContractValidation(unittest.TestCase):
+    """Fix pass Wave 2.10 (review 1B-18): a judged item's `min` is validated
+    at contract load — a number on the 0–10 scale — never after the wave has
+    spent tokens."""
+
+    def test_a_non_numeric_min_is_refused_at_load(self):
+        with self.assertRaises(ContractError) as caught:
+            _contract(acceptance=[
+                {"class": "hard", "cmd": "true", "expect": {"exit": 0}},
+                {"class": "judged", "rubric": "validity_matrix_v1", "min": "six", "judges": 3},
+            ])
+        self.assertIn("min", str(caught.exception))
+
+    def test_a_min_above_the_scale_is_refused_at_load(self):
+        with self.assertRaises(ContractError):
+            _contract(acceptance=[
+                {"class": "hard", "cmd": "true", "expect": {"exit": 0}},
+                {"class": "judged", "rubric": "validity_matrix_v1", "min": 11, "judges": 3},
+            ])
+
+    def test_a_numeric_min_is_kept_as_a_float(self):
+        contract = _contract(acceptance=[
+            {"class": "hard", "cmd": "true", "expect": {"exit": 0}},
+            {"class": "judged", "rubric": "validity_matrix_v1", "min": 6, "judges": 3},
+        ])
+        judged = next(a for a in contract["acceptance"] if a["class"] == "judged")
+        self.assertEqual(judged["min"], 6.0)
+
+
+class TestProvenanceComesFromTheAdapter(LoopV03Base):
+    """Fix pass Wave 2.10 (review 1D-18): the candidate row's provenance is
+    what the adapter reported, not a literal the store writes for every row
+    — so the provenance gate checks a fact."""
+
+    def test_the_rows_carry_the_adapters_provenance(self):
+        class HandsInSomebodyElsesWork(FakeGen):
+            def generate(self, worktree, contract, context):
+                gen = super().generate(worktree, contract, context)
+                gen.provenance = "human"
+                return gen
+
+        self.markers.update({"gen-a": "m-a", "gen-b": "m-b"})
+        executors = {"gen-a": FakeGen("gen-a", "fam-a", "m-a"),
+                     "gen-b": HandsInSomebodyElsesWork("gen-b", "fam-b", "m-b"),
+                     "judge-z": FakeJudge("judge-z", "fam-z", {"m-a": 9.0, "m-b": 8.0})}
+        self.panel("gen-a", "gen-b", ["judge-z"], ["gen-a", "gen-b"])
+        self.assertEqual(GenResult(status="completed").provenance, "generated")
+        loop_mod.run_contract(self.store, _contract(), "repo://fake", executors,
+                              human_decider=lambda info: "approved")
+        rows = {c["expert_id"]: c for c in self.store.candidates_for("ctr_fake")}
+        self.assertEqual(rows["gen-a"]["provenance"], "generated")
+        self.assertEqual(rows["gen-b"]["provenance"], "human")
+        self.assertTrue(gates_mod.check_provenance(rows["gen-a"]))
+        self.assertFalse(gates_mod.check_provenance(rows["gen-b"]))  # the real gate would eliminate it
 
 
 class TestLowConfidence(LoopV03Base):

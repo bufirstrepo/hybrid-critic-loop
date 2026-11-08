@@ -458,34 +458,15 @@ class TestHooks(unittest.TestCase):
             self.assertEqual(payload["domain"], "code.game")
             self.assertEqual(payload["session_id"], "s1")
 
-    def test_post_tool_call_appends_observation(self):
-        store = FakeStore()
-        store.open_contract = {"id": "c9"}
-        hooks.post_tool_call(store, tool_name="search", error=None)
-        obs = store.observations["c9"]
-        self.assertEqual(len(obs), 1)
-        self.assertEqual(obs[0]["kind"], "tool_call")
-        self.assertEqual(obs[0]["tool"], "search")
-        self.assertTrue(obs[0]["ok"])
-        self.assertIn("ts", obs[0])
-        hooks.post_tool_call(store, name="read", error="boom")
-        self.assertEqual(store.observations["c9"][1]["tool"], "read")
-        self.assertFalse(store.observations["c9"][1]["ok"])
-
-    def test_post_llm_call_appends_observation(self):
-        store = FakeStore()
-        store.open_contract = {"id": "c9"}
-        hooks.post_llm_call(store, tokens_in=11, tokens_out=7)
-        obs = store.observations["c9"][0]
-        self.assertEqual(obs["kind"], "llm_call")
-        self.assertEqual(obs["tokens_in"], 11)
-        self.assertEqual(obs["tokens_out"], 7)
-
-    def test_hooks_no_open_contract_is_quiet(self):
-        store = FakeStore()
-        hooks.post_tool_call(store, tool_name="x")  # must not raise
-        hooks.post_llm_call(store, tokens_in=1)     # must not raise
-        self.assertEqual(store.observations, {})
+    def test_the_module_offers_exactly_the_two_hooks_the_plugin_registers(self):
+        # Fix pass Wave 2.10 (review 1C-17): the post_tool_call / post_llm_call
+        # observers read fields Hermes never sends and wrote against a
+        # contract no finished run leaves open; they are gone, not kept for
+        # the count.
+        self.assertTrue(callable(hooks.on_session_start))
+        self.assertTrue(callable(hooks.pre_llm_call))
+        self.assertFalse(hasattr(hooks, "post_tool_call"))
+        self.assertFalse(hasattr(hooks, "post_llm_call"))
 
     def test_pre_llm_call_none_without_lessons(self):
         store = FakeStore()

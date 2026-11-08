@@ -111,7 +111,10 @@ def blind_text(text: str, strip_terms: list) -> str:
     Removes commit-metadata lines, rewrites worktree paths to a generic
     ``wt/<candidate>``, scrubs absolute home paths, and replaces every
     strip term (expert ids, family names) case-insensitively with
-    ``<expert>``.
+    ``<expert>`` — as a whole word only (letters, digits and ``_`` are word
+    characters), so a family named ``local`` leaves ``localhost`` and
+    ``a_local_var`` alone; terms shorter than four characters are skipped
+    (fix pass Wave 2.10, review 1D-11).
     """
     if not text:
         return ""
@@ -124,8 +127,11 @@ def blind_text(text: str, strip_terms: list) -> str:
     out = _WT_PATH_RE.sub("wt/<candidate>", out)
     out = _ABS_PATH_RE.sub("<path>", out)
     for term in strip_terms or []:
-        if term:
-            out = re.sub(re.escape(str(term)), "<expert>", out, flags=re.IGNORECASE)
+        term = str(term) if term else ""
+        if len(term) < 4:
+            continue
+        pattern = r"(?<![A-Za-z0-9_])" + re.escape(term) + r"(?![A-Za-z0-9_])"
+        out = re.sub(pattern, "<expert>", out, flags=re.IGNORECASE)
     return out
 
 

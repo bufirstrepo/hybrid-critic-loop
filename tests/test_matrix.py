@@ -582,5 +582,30 @@ class TestComputeCalibration(unittest.TestCase):
                 store.close()
 
 
+class TestGateCitation(unittest.TestCase):
+    """Fix pass Wave 2.10 (review 1B-17): a hard-gate citation needs the
+    command itself or a path-like token of it — plain words such as 'tests'
+    or 'discover' never trigger a paid re-run."""
+
+    CMD = "python3 -m unittest discover -s tests -p test_speed_sampler.py"
+
+    def test_generic_words_do_not_cite(self):
+        from hybrid_critic_loop.matrix import _cites_gate
+
+        for text in ("the tests look fine to me", "I would discover more with unittest",
+                     "all tests pass as far as I can see"):
+            self.assertIsNone(_cites_gate(text, [], [self.CMD]), text)
+
+    def test_paths_and_the_full_command_cite(self):
+        from hybrid_critic_loop.matrix import _cites_gate
+
+        self.assertEqual(_cites_gate("test_speed_sampler.py fails on this candidate", [], [self.CMD]), "hard")
+        self.assertEqual(_cites_gate(f"ran `{self.CMD}` locally and it failed", [], [self.CMD]), "hard")
+        # A module path is path-like too (the existing dissent test's shape).
+        self.assertEqual(_cites_gate("tests.test_smoke failed for me", [],
+                                     ["python3 -m unittest tests.test_smoke"]), "hard")
+        self.assertEqual(_cites_gate("ops_per_tick looks misread", ["ops_per_tick"], [self.CMD]), "measured")
+
+
 if __name__ == "__main__":
     unittest.main()

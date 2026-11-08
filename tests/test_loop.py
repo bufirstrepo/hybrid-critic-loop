@@ -136,6 +136,11 @@ class TestRunOne(LoopTestBase):
         self.assertIsNotNone(new_contract)
         kinds = [o["kind"] for o in new_contract["observations"]]
         self.assertIn("human_rejection", kinds)
+        # A fresh contract gets the full retry budget (fix pass Wave 2.10,
+        # 1B-21): lineage lives in its id and the observation, not in the
+        # attempt counter the loop reads.
+        self.assertEqual(new_contract["attempt"], 1)
+        self.assertEqual(result["new_contract_id"], "ctr_demo_1_rej1")
 
     def test_awaiting_human_gate_without_decider(self):
         contract = load_contract_file(ROOT / "contracts" / "demo1.json")

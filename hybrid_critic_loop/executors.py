@@ -40,6 +40,10 @@ class GenResult:
     request_ids: list[str] = field(default_factory=list)
     duration_ms: int = 0
     detail: str = ""
+    # What produced the artifact: "generated" for a model's or program's own
+    # output. The loop writes it to the candidate row, where the provenance
+    # gate reads it (fix pass Wave 2.10, review 1D-18).
+    provenance: str = "generated"
 
 
 def build_prompt(contract: dict, context: str) -> str:
@@ -155,6 +159,13 @@ def _parse_jsonl_usage(stdout: str):
                         tokens_out = int(cur["output_tokens"])
                 except Exception:
                     pass
+                # Provider-reported cost only (fix pass Wave 2.10, review
+                # 1D-16): claude's envelope carries total_cost_usd. Never a
+                # price table.
+                for key in ("total_cost_usd", "cost_usd"):
+                    if cost is None and isinstance(cur.get(key), (int, float)) \
+                            and not isinstance(cur.get(key), bool):
+                        cost = float(cur[key])
                 for key in ("request_id", "requestId"):
                     if cur.get(key):
                         rid = str(cur[key])

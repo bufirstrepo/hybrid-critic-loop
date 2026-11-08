@@ -343,5 +343,25 @@ class TestRunJudgedGate(unittest.TestCase):
         self.assertEqual(store.scores, [])
 
 
+class TestBlindTextWordBoundaries(unittest.TestCase):
+    """Fix pass Wave 2.10 (review 1D-11): a strip term is replaced only as a
+    whole word, so a family named 'local' or 'reflection' does not rewrite
+    the code a judge reads; terms shorter than four characters are skipped."""
+
+    def test_identifiers_containing_a_term_are_left_alone(self):
+        text = "conn = connect('localhost')  # local cache; uses System.Reflection\n"
+        out = blind_text(text, ["local", "reflection"])
+        self.assertIn("connect('localhost')", out)
+        self.assertIn("# <expert> cache", out)
+        self.assertIn("System.<expert>", out)  # the whole word is the family's name
+        self.assertNotIn("<expert>host", out)
+
+    def test_short_terms_and_hyphenated_ids_behave(self):
+        text = "by fam-a and expert-alpha; a_local_var stays\n"
+        out = blind_text(text, ["a", "fam-a", "expert-alpha", "local"])
+        self.assertIn("by <expert> and <expert>;", out)
+        self.assertIn("a_local_var stays", out)  # inside an identifier: untouched
+
+
 if __name__ == "__main__":
     unittest.main()

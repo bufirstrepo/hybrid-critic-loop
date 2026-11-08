@@ -31,7 +31,10 @@ DEFAULT_ROUTES = {
         "compete_with": "grok",
         "fallback": ["claude", "agy", "qwen-local", "kimi", "deepseek",
                      "beam", "local-solver"],
-        "judges": ["gemini", "beam", "grok", "qwen-local", "claude", "codex"],
+        # The google seat is `agy` (no executor is called `gemini`; fix pass
+        # Wave 2.10, review 1D-17). The matrix seats peers from the live
+        # executors anyway; this list serves the legacy judge path.
+        "judges": ["agy", "beam", "grok", "qwen-local", "claude", "codex"],
         "rule": "judge.family not in contest.families; panel recomputed on fallback",
         "panel": list(PANEL_FAMILIES),
         "scoring": "peer_matrix; no self-scoring; blind",

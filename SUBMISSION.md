@@ -19,7 +19,7 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
   hermes plugins validate
   ```
 
-  Status: **PASSED on the operator's machine for the v0.3 tree** (2026-11-07, Hermes v0.21.5: all 13 checks, security scan safe, both the plain and the `--install-deps` form — see BUILD-LOG.md, parent verification). Capabilities in the YAML mirror `plugin.yaml` exactly (5 tools, 4 hooks) because the validator checks them against what the code registers. The release commit will differ from that validated tree (the fix pass landed after it), so re-run validate on the exact release commit before opening the PR and record the result here.
+  Status: **PASSED on the operator's machine for the v0.3 tree** (2026-11-07, Hermes v0.21.5: all 13 checks, security scan safe, both the plain and the `--install-deps` form — see BUILD-LOG.md, parent verification). Capabilities in the YAML mirror `plugin.yaml` exactly (5 tools, 2 hooks) because the validator checks them against what the code registers. The release commit will differ from that validated tree (the fix pass landed after it), so re-run validate on the exact release commit before opening the PR and record the result here.
 - [ ] PR description must carry the Rule 13 disclosure — the same five bullets that open the README ("Disclosures (read first)"), copied verbatim:
 
   > - **Executes shell commands.** It runs the model CLIs (`codex exec`, `grok -p`, and the other family adapters below), the acceptance commands written into each contract (unit tests, build commands), the sensor commands that produce measured-gate metrics, and `git` (worktree, diff, merge, branch). Contract acceptance commands are operator-authored; the plugin runs them as written, in the candidate's worktree.

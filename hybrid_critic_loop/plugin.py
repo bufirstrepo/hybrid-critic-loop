@@ -650,15 +650,12 @@ def register(ctx):
     def _pre_llm_call(**kw):
         return hooks_mod.pre_llm_call(store, data_dir, **kw)
 
-    def _post_tool_call(**kw):
-        return hooks_mod.post_tool_call(store, **kw)
-
-    def _post_llm_call(**kw):
-        return hooks_mod.post_llm_call(store, **kw)
-
+    # Two hooks (fix pass Wave 2.10, review 1C-17). The post_tool_call /
+    # post_llm_call observers of v0.2 read fields Hermes never sends and
+    # wrote against a contract no finished run leaves open — a declared
+    # capability that observed nothing. They are gone from the registration,
+    # the manifest and the catalog alike.
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("pre_llm_call", _pre_llm_call)
-    ctx.register_hook("post_tool_call", _post_tool_call)
-    ctx.register_hook("post_llm_call", _post_llm_call)
 
     return store

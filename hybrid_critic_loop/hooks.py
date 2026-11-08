@@ -11,14 +11,9 @@ turn or when there is nothing to inject.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 from .lessons import lessons_context
-
-
-def _utc_iso():
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _session_domain(data_dir):
@@ -69,40 +64,3 @@ def pre_llm_call(store, data_dir, **kw):
     except Exception:
         return None
 
-
-def post_tool_call(store, **kw) -> None:
-    """Observe a tool call against the latest open contract. Never raises."""
-    try:
-        contract = store.latest_open_contract()
-        if contract:
-            store.append_observation(
-                contract["id"],
-                {
-                    "kind": "tool_call",
-                    "tool": kw.get("tool_name") or kw.get("name"),
-                    "ok": kw.get("error") is None,
-                    "ts": _utc_iso(),
-                },
-            )
-    except Exception:
-        pass
-    return None
-
-
-def post_llm_call(store, **kw) -> None:
-    """Observe an LLM call against the latest open contract. Never raises."""
-    try:
-        contract = store.latest_open_contract()
-        if contract:
-            store.append_observation(
-                contract["id"],
-                {
-                    "kind": "llm_call",
-                    "tokens_in": kw.get("tokens_in"),
-                    "tokens_out": kw.get("tokens_out"),
-                    "ts": _utc_iso(),
-                },
-            )
-    except Exception:
-        pass
-    return None

@@ -403,16 +403,24 @@ def _hard_cmds(contract, candidate_id, gate_results) -> list:
 
 
 _TOKEN_SPLIT = re.compile(r"[^A-Za-z0-9_./-]+")
-_TOKEN_STOP = {"python", "python3", "python.exe", "-m", "--", "-", "run", "test"}
+_TOKEN_STOP = {"python", "python3", "python.exe", "-m", "--", "-", "run", "test",
+               "tests", "unittest", "pytest", "discover", "dotnet", "build", "node", "npm"}
 
 
 def _hard_tokens(cmds) -> list:
+    """The distinctive tokens of the hard commands: path-like ones only
+    (containing ``/`` or ``.``, or a ``test_`` name) — never a plain word
+    such as ``tests`` or ``discover`` (fix pass Wave 2.10, review 1B-17),
+    because a citation triggers a paid gate re-run."""
     tokens = []
     for cmd in cmds:
         for token in _TOKEN_SPLIT.split(cmd or ""):
-            token = token.strip()
+            token = token.strip().strip(".")
             low = token.lower()
             if len(token) < 4 or low in _TOKEN_STOP:
+                continue
+            path_like = "/" in low or "." in low or low.startswith("test_")
+            if not path_like:
                 continue
             if low not in tokens:
                 tokens.append(low)
@@ -423,9 +431,10 @@ def _cites_gate(text: str, metric_names, hard_cmds):
     """Detect a gate citation in a dissent's evidence + rationale.
 
     "measured" when a measurement metric name for this candidate
-    appears; "hard" when a full hard cmd string, or a distinctive
-    token of one (a test file path, a runner name), appears.
-    Case-insensitive substring matching throughout.
+    appears; "hard" when a full hard cmd string, or a path-like token of
+    one (a test file, a module path, a project file), appears. Plain
+    words of the command never cite. Case-insensitive substring matching
+    throughout.
     """
     low = (text or "").lower()
     if not low.strip():

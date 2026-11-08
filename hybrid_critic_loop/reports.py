@@ -16,8 +16,6 @@ so these reports work against stores that predate them.
 
 from __future__ import annotations
 
-import statistics
-
 MATRIX_RUBRIC_ID = "validity_matrix_v1"
 
 try:  # the validity rubric's own rows (fix pass Wave 2.8, review M6 / 1C-14)
@@ -28,8 +26,6 @@ except Exception:  # noqa: BLE001 - a partial checkout keeps the reports importa
 # The validity_matrix_v1 rows, used when no recorded score row names them
 # (a matrix that has not run yet). Recorded rows are added as observed.
 MATRIX_ROWS = list(_VALIDITY_ROWS)
-
-_DEFAULT_DISSENT_THRESHOLD = 3.0
 
 
 def _win_rate_text(row):
@@ -206,24 +202,6 @@ def _matrix_rubric_rows():
         return list(MATRIX_ROWS)
 
 
-def _dissent_threshold_for(store, contract_id):
-    """The contract's judged dissent_threshold, defaulting to 3.0."""
-    get_contract = getattr(store, "get_contract", None)
-    if callable(get_contract):
-        try:
-            contract = get_contract(contract_id)
-        except Exception:
-            contract = None
-        if isinstance(contract, dict):
-            for item in contract.get("acceptance") or []:
-                if isinstance(item, dict) and item.get("class") == "judged":
-                    value = item.get("dissent_threshold")
-                    if _is_number(value) and float(value) >= 0:
-                        return float(value)
-                    break
-    return _DEFAULT_DISSENT_THRESHOLD
-
-
 def _parse_matrix_cell(score_row):
     """Split one matrix score row into (items, confidence, details).
 
@@ -395,7 +373,6 @@ def build_matrix_view(store, contract_id, attempt=None) -> dict:
     elif isinstance(verdict, dict) and verdict.get("panel_status") is not None:
         panel_status = verdict.get("panel_status")
 
-    threshold = _dissent_threshold_for(store, contract_id)
     recorded_dissent = _collect_dissent(judged)
 
     scores_for = getattr(store, "scores_for", None)
@@ -441,8 +418,7 @@ def build_matrix_view(store, contract_id, attempt=None) -> dict:
                 if row_name not in observed_rows:
                     observed_rows.append(row_name)
 
-        # Dissent: recorded entries for this candidate plus any judge
-        # whose row score deviates from the row median past threshold.
+        # Dissent: the entries the verdict recorded for this candidate.
         dissent = []
         seen = set()
         for entry in recorded_dissent:
@@ -451,39 +427,10 @@ def build_matrix_view(store, contract_id, attempt=None) -> dict:
                 if key not in seen:
                     seen.add(key)
                     dissent.append(entry)
-        for row_name in observed_rows:
-            row_scores = [
-                (judge_id, cell["items"][row_name])
-                for judge_id, cell in cells.items()
-                if row_name in cell["items"]
-            ]
-            if len(row_scores) < 2:
-                continue
-            median = float(
-                statistics.median([s for _, s in row_scores])
-            )
-            for judge_id, score in row_scores:
-                deviation = abs(score - median)
-                if deviation > threshold and (row_name, judge_id) not in seen:
-                    seen.add((row_name, judge_id))
-                    dissent.append(
-                        _normalize_dissent(
-                            {
-                                "candidate_id": cid,
-                                "row": row_name,
-                                "judge_id": judge_id,
-                                "score": score,
-                                "median": median,
-                                "deviation": deviation,
-                                "rationale": (
-                                    f"score {score} deviates from row median "
-                                    f"{median} by {deviation:.2f} "
-                                    f"(> dissent_threshold {threshold})"
-                                ),
-                            },
-                            cid,
-                        )
-                    )
+        # Recorded dissent only (fix pass Wave 2.10, review 1C-15): the
+        # matrix flags dissent against its calibration-weighted medians and
+        # records it in the verdict; the report prints that record and
+        # derives none of its own, so it can never disagree with the verdict.
         view_candidates[cid] = {
             "expert_id": candidate.get("expert_id"),
             "family": candidate.get("family"),

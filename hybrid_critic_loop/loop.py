@@ -296,6 +296,9 @@ class _Run:
             tokens_out=gen.tokens_out,
             cost_usd=gen.cost_usd,
             status=gen.status,
+            # The adapter is the source of the provenance the gate checks
+            # (fix pass Wave 2.10, review 1D-18), not a literal per row.
+            provenance=getattr(gen, "provenance", None) or "generated",
         )
         # The ledger records what the seat did: a refusal, a missing binary
         # and an adapter error are different facts. Unknown -> error.
@@ -1080,8 +1083,14 @@ class _Run:
     # -- escalation / lesson ---------------------------------------------
     def _escalate(self, attempt, reason, gate_details, judged=None):
         store = self.store
+        # Nobody won: every candidate fielded in the deciding attempt is out,
+        # and the verdict row says so (fix pass Wave 2.10, review 1B-20).
+        eliminated = [
+            c["id"] for c in store.candidates_for(self.contract_id)
+            if c.get("attempt") == attempt and c.get("status") == "completed"
+        ]
         verdict_id = store.create_verdict(
-            contract_id=self.contract_id, attempt=attempt, winner=None, eliminated=[],
+            contract_id=self.contract_id, attempt=attempt, winner=None, eliminated=eliminated,
             hard="fail" if gate_details.get("hard_failures") else "pass",
             measured="fail" if any(not m["pass"] for m in gate_details.get("measurements", [])) else "pass",
             judged=judged, escalated=True, escalation_reason=reason, waiver=None,
@@ -1220,7 +1229,10 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
                 task=contract["task"], domain=contract["domain"], tags=contract["tags"],
                 acceptance=contract["acceptance"], depends_on=contract["depends_on"],
                 test_author_family=contract.get("test_author_family"),
-                repo_path=contract.get("repo_path"), attempt=verdict["attempt"] + 1,
+                # A fresh contract starts at attempt 1 with the full retry
+                # budget (fix pass Wave 2.10, review 1B-21); its lineage is
+                # the id suffix and the human_rejection observation.
+                repo_path=contract.get("repo_path"), attempt=1,
                 contract_id=new_id,
             )
         store.append_observation(

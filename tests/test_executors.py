@@ -638,6 +638,21 @@ class TestUsageParsing(unittest.TestCase):
                                "usage": {"input_tokens": 7, "output_tokens": 2}}, indent=2)
         self.assertEqual(_parse_jsonl_usage(envelope)[:2], (7, 2))
 
+    def test_cost_is_read_only_when_the_provider_reports_it(self):
+        # Fix pass Wave 2.10 (review 1D-16): claude's envelope carries
+        # total_cost_usd; it is read as reported. Nothing else invents one.
+        from hybrid_critic_loop.executors import _parse_jsonl_usage
+
+        envelope = json.dumps({"result": "done", "total_cost_usd": 0.0123,
+                               "usage": {"input_tokens": 900, "output_tokens": 40}})
+        tokens_in, tokens_out, _rids, cost = _parse_jsonl_usage(envelope)
+        self.assertEqual((tokens_in, tokens_out), (900, 40))
+        self.assertAlmostEqual(cost, 0.0123)
+        stream = json.dumps({"type": "turn.completed", "usage": {"input_tokens": 12, "output_tokens": 3}})
+        self.assertIsNone(_parse_jsonl_usage(stream)[3])
+        prose = 'the bill said {"total_cost_usd": 9.99} but who knows\n'
+        self.assertIsNone(_parse_jsonl_usage(prose)[3])
+
 
 class TestRunCommandArgumentLimit(unittest.TestCase):
     """Fix pass Wave 2.9 (review M8 / 1D-09): an argument above the kernel's

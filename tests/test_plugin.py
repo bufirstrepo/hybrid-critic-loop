@@ -8,6 +8,7 @@ is redirected to a temp dir via HCL_DATA_DIR so no real state is touched.
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -86,10 +87,14 @@ class TestRegistration(unittest.TestCase):
         self.assertIn("critic", ctx.cli_commands)
         self.assertTrue(callable(ctx.cli_commands["critic"]["setup_fn"]))
         self.assertTrue(callable(ctx.cli_commands["critic"]["handler_fn"]))
-        self.assertEqual(
-            set(ctx.hooks),
-            {"on_session_start", "pre_llm_call", "post_tool_call", "post_llm_call"},
-        )
+        # Two hooks (fix pass Wave 2.10, review 1C-17): the two observers
+        # that read fields Hermes never sends, against a contract no run
+        # leaves open, are gone from the registration and the manifest.
+        self.assertEqual(set(ctx.hooks), {"on_session_start", "pre_llm_call"})
+        manifest = (Path(__file__).resolve().parent.parent / "plugin.yaml").read_text(encoding="utf-8")
+        declared = re.findall(r"^\s*-\s*(on_session_start|pre_llm_call|post_tool_call|post_llm_call)\s*$",
+                              manifest, re.M)
+        self.assertEqual(sorted(declared), ["on_session_start", "pre_llm_call"])
 
     def test_register_without_cli_command_support(self):
         ctx = FakeCtxNoCli()
@@ -242,8 +247,8 @@ class TestRegistration(unittest.TestCase):
         ctx.hooks["on_session_start"](domain="code", session_id="s1")
         session_file = Path(self._tmp.name) / "session.json"
         self.assertTrue(session_file.exists())
-        ctx.hooks["post_tool_call"](tool_name="x")
-        ctx.hooks["post_llm_call"](tokens_in=1, tokens_out=2)
+        self.assertNotIn("post_tool_call", ctx.hooks)
+        self.assertNotIn("post_llm_call", ctx.hooks)
 
     def test_cli_setup_builds_parser(self):
         import argparse
@@ -454,6 +459,20 @@ class TestDocsMatchTheCode(unittest.TestCase):
         readme = self._read("README.md")
         self.assertIn("the exit code decides", readme)
         self.assertIn("declines a contract without a `target_file`", readme)
+
+    def test_hook_counts_cost_disclosure_and_package_version_are_true(self):
+        # Fix pass Wave 2.10 (review 1C-17, 1D-16, 1A-06): two hooks, who
+        # reports a cost, and the package's own version string.
+        import hybrid_critic_loop
+
+        readme = self._read("README.md")
+        submission = self._read("SUBMISSION.md")
+        self.assertIn("2 hooks", readme)
+        self.assertNotIn("4 hooks", readme)
+        self.assertIn("(5 tools, 2 hooks)", submission)
+        self.assertIn("report tokens only", self._section(readme, "## Cost per validity point"))
+        py = re.search(r'^version\s*=\s*"([^"]+)"', self._read("pyproject.toml"), re.M).group(1)
+        self.assertEqual(hybrid_critic_loop.__version__, py)
 
     def test_readme_slash_usage_matches_the_handler_help(self):
         readme = self._read("README.md")

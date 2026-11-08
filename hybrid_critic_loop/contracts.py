@@ -121,11 +121,19 @@ def validate_contract(raw: dict) -> dict:
                 raise ContractError(f"acceptance[{i}] judged item needs 'rubric'")
             if "min" not in item:
                 raise ContractError(f"acceptance[{i}] judged item needs 'min'")
+            # Validated at load like the thresholds (fix pass Wave 2.10,
+            # review 1B-18): a bad minimum must fail before any seat is paid.
+            min_score = _validated_threshold(item, "min", 0.0, i)
+            if min_score > 10:
+                raise ContractError(
+                    f"acceptance[{i}] judged item 'min' must be on the 0-10 scale, "
+                    f"got {min_score}"
+                )
             normalized.append(
                 {
                     "class": "judged",
                     "rubric": rubric,
-                    "min": item["min"],
+                    "min": min_score,
                     "judges": int(item.get("judges", 3)),
                     "spread_threshold": _validated_threshold(
                         item, "spread_threshold", 2.0, i

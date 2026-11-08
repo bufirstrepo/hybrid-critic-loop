@@ -303,17 +303,34 @@ class TestMatrixReport(unittest.TestCase):
                               {"correctness": 2.0, "evidence": 9.0}, 5.5),
             ],
         }
-        store = FakeMatrixStore(candidates, scores)
+        # The matrix recorded judge-3's correctness cell as a dissent in the
+        # verdict; the report prints that record (fix pass Wave 2.10, 1C-15:
+        # it used to derive its own dissent from the raw scores and could
+        # disagree with the verdict).
+        verdict = {
+            "winner": "cand-1", "eliminated": [], "hard": "pass", "measured": "pass",
+            "judged": {"cand-1": {"median_mean": 7.7, "pass": True, "dissent": [
+                {"candidate_id": "cand-1", "row": "correctness", "judge_id": "judge-3",
+                 "score": 2.0, "row_median": 9.0, "rationale": "misread the diff"}]},
+                       "panel_status": "full"},
+            "escalated": False, "human_gate": "approved",
+        }
+        store = FakeMatrixStore(candidates, scores, verdict=verdict)
         report = matrix_report(store, "ctr-1")
         self.assertIn("matrix for ctr-1", report)
         self.assertIn("panel_status:", report)
         self.assertIn("correctness:", report)
         self.assertIn("judge-1=9.0", report)
-        # judge-3's correctness score deviates from the row median (9.0)
-        # by 7.0, past the default dissent_threshold of 3.0.
         self.assertIn("judge-3=2.0 DISSENT", report)
         self.assertIn("dissent: candidate=cand-1 row=correctness "
                       "judge=judge-3", report)
+        self.assertIn("misread the diff", report)
+        # Without a recorded entry nothing is derived: the same raw scores
+        # print with no DISSENT flag and no dissent line.
+        plain = matrix_report(FakeMatrixStore(candidates, scores), "ctr-1")
+        self.assertIn("judge-3=2.0", plain)
+        self.assertNotIn("DISSENT", plain)
+        self.assertNotIn("dissent:", plain)
 
     def test_matrix_report_panel_status_from_verdict(self):
         candidates = [{

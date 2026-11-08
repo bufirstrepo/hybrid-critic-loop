@@ -22,6 +22,4 @@ capabilities:
   provides_hooks:
     - on_session_start
     - pre_llm_call
-    - post_tool_call
-    - post_llm_call
 requires_env: []
