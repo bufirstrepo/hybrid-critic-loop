@@ -13,38 +13,26 @@ number comes from a real run of the plugin's own machinery.
 ========================================================================
 PHASE A — live CLI attempt (codex vs grok) on contract 1
 ========================================================================
-executor codex: available=True (/home/dino/.local/bin/codex)
-executor grok: available=True (/home/dino/.grok/bin/grok)
+executor codex: available=True (/opt/hatch-image/bin/codex)
+executor grok: available=False (grok binary not found on PATH)
 {
   "contract_id": "ctr_demo_1",
-  "status": "completed",
-  "winner": "ctr_demo_1_a",
+  "status": "escalated",
+  "detail": "no seat produced a candidate: every seat refused or was unavailable",
   "verdict_id": "vrd_0001",
   "lesson_id": "lsn_0001",
-  "tie_break": "bracket_validity",
-  "events": [
-    {
-      "type": "human_gate",
-      "detail": "winner ctr_demo_1_a awaits the human gate"
-    }
-  ],
-  "human_gate": "approved",
-  "commit": "git:364fb03b249c1cab671469506b4966d0e0b7b64c",
-  "winner_commit": "git:c09d50d9ffaa7d4b437de94827733057ba4eb103",
-  "waiver": null
+  "events": []
 }
 
 ledger:
-codex: dispatches=1 completed=1 refused=0 timeout=0 unavailable=0 error=0 tokens_in=95711 tokens_out=1230 cost_usd=not reported win_rate=1W-0L (1.00) cpvp=not reported validity_points=9.25
-grok: dispatches=1 completed=1 refused=0 timeout=0 unavailable=0 error=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=0W-1L (0.00) cpvp=not reported validity_points=0.0
-queue: observed — matrix peers seated=['codex', 'grok']; skipped=[]
-queue: observed — bracket round 1: field 2 -> 1; passed=1; cut_line=9.25; eliminated=['ctr_demo_1_b']; panel_status=degraded
-events:
-id=1, type=human_gate, contract_id=ctr_demo_1, detail=winner ctr_demo_1_a awaits the human gate, created_at=2026-11-08T02:30:23.377825+00:00
+codex: dispatches=1 completed=0 refused=1 timeout=0 unavailable=0 error=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=not run cpvp=not reported
+grok: dispatches=1 completed=0 refused=0 timeout=0 unavailable=1 error=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=not run cpvp=not reported
+queue: escalated — no seat produced a candidate: every seat refused or was unavailable
+events: not run
 
-Phase A outcome (recorded): status=completed
-  codex: dispatches=1 completed=1 refused=0 timeout=0 unavailable=0 error=0
-  grok: dispatches=1 completed=1 refused=0 timeout=0 unavailable=0 error=0
+Phase A outcome (recorded): status=escalated — no seat produced a candidate: every seat refused or was unavailable
+  codex: dispatches=1 completed=0 refused=1 timeout=0 unavailable=0 error=0
+  grok: dispatches=1 completed=0 refused=0 timeout=0 unavailable=1 error=0
 A seat that completed produced a real candidate from its CLI; a refused or
 unavailable seat produced none and is recorded as such. On a machine with
 logged-in CLIs this call dispatches the real seats and spends their tokens.
@@ -69,9 +57,26 @@ Route before run 1: primary=solver-naive, compete_with=solver-balanced
       "detail": "winner ctr_demo_1_c awaits the human gate"
     }
   ],
+  "certificate": {
+    "stamp": "MM CERTIFIED \u00b7 TOKENS NOT REPORTED \u00b7 ONE ANSWER",
+    "cert": "mm1.eyJjaGFpbl9oZWFkIjoiNzQ0NzQzOGI0NmMxODEwOTFlM2NjZWJkY2JhOTA3YThmMzZmMzIxMTJjN2JhZWIxYmE5YjY4NWRhYzJjZjkwYSIsImNvbnRyYWN0X2lkIjoiY3RyX2RlbW9fMSIsImNvc3RfbWlzc2luZyI6NiwiY29zdF9yb3dzIjowLCJjb3N0X3VzZCI6bnVsbCwiaXNzdWVkX2F0IjoiMjAyNi0xMS0wOFQyMzoxNDo1NS4xMjk3MjMrMDA6MDAiLCJraWQiOiI3ODg4OGZhYThkMmQ4YTc4IiwibGVkZ2VyX3VwdG8iOjcsInRpZXIiOiJXSU5ET1cgU0hPUFBFUiIsInRva2VucyI6bnVsbCwidmVyZGljdF9pZCI6InZyZF8wMDAxIn0.JdyLA4CNJCUpeNmOH_BIY8Qzr8MoWUixBeetUHL7gvU",
+    "payload": {
+      "contract_id": "ctr_demo_1",
+      "verdict_id": "vrd_0001",
+      "tokens": null,
+      "cost_usd": null,
+      "tier": "WINDOW SHOPPER",
+      "chain_head": "7447438b46c181091e3ccebdcba907a8f36f32112c7baeb1ba9b685dac2cf90a",
+      "issued_at": "2026-11-08T23:14:55.129723+00:00",
+      "ledger_upto": 7,
+      "kid": "78888faa8d2d8a78",
+      "cost_rows": 0,
+      "cost_missing": 6
+    }
+  },
   "human_gate": "approved",
-  "commit": "git:f9c7618057fa95cca7772225c168ece540a5d820",
-  "winner_commit": "git:1980698238d4fc386e65ff8fd492e85b4f076c67",
+  "commit": "git:46357ab4f421d1763d181ff1300e7276893797a9",
+  "winner_commit": "git:b4f4184d0ccd10cfed39910c0181c44aee90a808",
   "waiver": null
 }
 measurement ctr_demo_1_a (solver-naive): ops_per_tick = 120.0 (required <= 8) pass=False
@@ -99,11 +104,12 @@ judge-naive: dispatches=1 completed=0 refused=0 timeout=0 unavailable=1 error=0 
 judge-ring: dispatches=1 completed=0 refused=0 timeout=0 unavailable=1 error=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=not run cpvp=not reported
 judge-balanced: dispatches=1 completed=0 refused=0 timeout=0 unavailable=1 error=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=not run cpvp=not reported
 events:
-id=1, type=human_gate, contract_id=ctr_demo_1, detail=winner ctr_demo_1_c awaits the human gate, created_at=2026-11-08T02:30:24.587511+00:00
+id=1, type=human_gate, contract_id=ctr_demo_1, detail=winner ctr_demo_1_c awaits the human gate, created_at=2026-11-08T23:14:55.452302+00:00
 
 ========================================================================
 PHASE B — fresh session: the lesson is already in context
 ========================================================================
+Millionaire Matrix standing: WINDOW SHOPPER — lifetime measured spend not reported (0 of 6 dispatches reported cost) · tokens not reported
 ## Lessons from prior Hybrid Critic Loop runs (domain: code.game)
 - [lsn lsn_0001] RULE: keep per-tick work O(1): pre-allocate the buffer and maintain a running total instead of recomputing (from: ctr_demo_1_a failed the measured gate: ops_per_tick 120.0, threshold <= 8; evidence: verdict:ctr_demo_1, measurement:ctr_demo_1_a:ops_per_tick)
 
@@ -124,9 +130,26 @@ Route for run 2: primary=solver-balanced, compete_with=solver-naive
       "detail": "winner ctr_demo_2_b awaits the human gate"
     }
   ],
+  "certificate": {
+    "stamp": "MM CERTIFIED \u00b7 TOKENS NOT REPORTED \u00b7 ONE ANSWER",
+    "cert": "mm1.eyJjaGFpbl9oZWFkIjoiNWUwODE2YzliMjgxMzBkY2M3YmI4N2Q1ZjM1YTE4NjQ5NjlkZjEyMDJiYWU2ZTRjMjZkZjYwNTc5ZmZmYTU2MSIsImNvbnRyYWN0X2lkIjoiY3RyX2RlbW9fMiIsImNvc3RfbWlzc2luZyI6NiwiY29zdF9yb3dzIjowLCJjb3N0X3VzZCI6bnVsbCwiaXNzdWVkX2F0IjoiMjAyNi0xMS0wOFQyMzoxNDo1Ny40ODI4MjArMDA6MDAiLCJraWQiOiI3ODg4OGZhYThkMmQ4YTc4IiwibGVkZ2VyX3VwdG8iOjE2LCJ0aWVyIjoiV0lORE9XIFNIT1BQRVIiLCJ0b2tlbnMiOm51bGwsInZlcmRpY3RfaWQiOiJ2cmRfMDAwMiJ9.MyoZLX8Wf-Y_8AJ33wY0cgY1ru9GuOejvTH4OdNJwnE",
+    "payload": {
+      "contract_id": "ctr_demo_2",
+      "verdict_id": "vrd_0002",
+      "tokens": null,
+      "cost_usd": null,
+      "tier": "WINDOW SHOPPER",
+      "chain_head": "5e0816c9b28130dcc7bb87d5f35a1864969df1202bae6e4c26df60579fffa561",
+      "issued_at": "2026-11-08T23:14:57.482820+00:00",
+      "ledger_upto": 16,
+      "kid": "78888faa8d2d8a78",
+      "cost_rows": 0,
+      "cost_missing": 6
+    }
+  },
   "human_gate": "approved",
-  "commit": "git:e65f28ee544925efeae3f07c8f01fe2bb042e457",
-  "winner_commit": "git:9ce331b23d55d25f67677b3fe5687565d210a56f",
+  "commit": "git:4521cbed6133cb0d35a8fef3ef149022bb8287cb",
+  "winner_commit": "git:673d7287570a2408b4fb13ed785f094f54a2084e",
   "waiver": null
 }
 measurement ctr_demo_2_a (solver-balanced): ops_per_tick = 1.0 (required <= 8) pass=True
@@ -136,21 +159,23 @@ measurement ctr_demo_2_c (solver-ring): ops_per_tick = 1.0 (required <= 8) pass=
 The validity matrix for contract 2:
 matrix for ctr_demo_2 (validity_matrix_v1):
 panel_status: full
+bracket round 1: field 3 -> 2; passed=3; cut_line=6.0; eliminated=['ctr_demo_2_a']
+bracket round 2: field 2 -> 1; passed=2; cut_line=6.375; eliminated=['ctr_demo_2_c']
 candidate ctr_demo_2_a (expert=solver-balanced, family=local-balanced):
-question_fidelity: judge-naive=6.0 (last of 2 rounds), judge-ring=7.0 (last of 2 rounds)
-completeness: judge-naive=6.0 (last of 2 rounds), judge-ring=7.0 (last of 2 rounds)
-evidence: judge-naive=2.5 (last of 2 rounds), judge-ring=2.0 (last of 2 rounds)
-test_agreement: judge-naive=9.5 (last of 2 rounds), judge-ring=9.5 (last of 2 rounds)
+question_fidelity: judge-naive=6.0, judge-ring=7.0
+completeness: judge-naive=6.0, judge-ring=7.0
+evidence: judge-naive=2.5, judge-ring=2.0
+test_agreement: judge-naive=9.5, judge-ring=9.5
 candidate ctr_demo_2_b (expert=solver-naive, family=local-naive):
 question_fidelity: judge-ring=7.0 (last of 2 rounds), judge-balanced=8.0 (last of 2 rounds)
 completeness: judge-ring=7.0 (last of 2 rounds), judge-balanced=8.0 (last of 2 rounds)
 evidence: judge-ring=2.0 (last of 2 rounds), judge-balanced=3.5 (last of 2 rounds)
 test_agreement: judge-ring=9.5 (last of 2 rounds), judge-balanced=9.5 (last of 2 rounds)
 candidate ctr_demo_2_c (expert=solver-ring, family=local-ring):
-question_fidelity: judge-naive=6.0, judge-balanced=8.0
-completeness: judge-naive=6.0, judge-balanced=8.0
-evidence: judge-naive=2.5, judge-balanced=3.5
-test_agreement: judge-naive=9.5, judge-balanced=9.5
+question_fidelity: judge-naive=6.0 (last of 2 rounds), judge-balanced=8.0 (last of 2 rounds)
+completeness: judge-naive=6.0 (last of 2 rounds), judge-balanced=8.0 (last of 2 rounds)
+evidence: judge-naive=2.5 (last of 2 rounds), judge-balanced=3.5 (last of 2 rounds)
+test_agreement: judge-naive=9.5 (last of 2 rounds), judge-balanced=9.5 (last of 2 rounds)
 candidate ctr_demo_2_d (expert=judge-naive, family=local-naive):
 question_fidelity: not reported
 completeness: not reported
@@ -166,8 +191,8 @@ question_fidelity: not reported
 completeness: not reported
 evidence: not reported
 test_agreement: not reported
-bracket round 1: field 3 -> 2, cut line 6.0, eliminated ['ctr_demo_2_c']
-bracket round 2: field 2 -> 1, cut line 6.375, eliminated ['ctr_demo_2_a']
+bracket round 1: field 3 -> 2, cut line 6.0, eliminated ['ctr_demo_2_a']
+bracket round 2: field 2 -> 1, cut line 6.375, eliminated ['ctr_demo_2_c']
 panel_status: full
 
 ledger:
@@ -178,11 +203,11 @@ judge-naive: dispatches=2 completed=0 refused=0 timeout=0 unavailable=2 error=0 
 judge-ring: dispatches=2 completed=0 refused=0 timeout=0 unavailable=2 error=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=not run cpvp=not reported
 judge-balanced: dispatches=2 completed=0 refused=0 timeout=0 unavailable=2 error=0 tokens_in=not reported tokens_out=not reported cost_usd=not reported win_rate=not run cpvp=not reported
 queue: observed — matrix peers seated=['judge-naive', 'judge-ring', 'judge-balanced']; skipped=[('solver-balanced', 'cannot judge'), ('solver-naive', 'cannot judge'), ('solver-ring', 'cannot judge')]
-queue: observed — bracket round 1: field 3 -> 2; passed=3; cut_line=6.0; eliminated=['ctr_demo_2_c']; panel_status=full
-queue: observed — bracket round 2: field 2 -> 1; passed=2; cut_line=6.375; eliminated=['ctr_demo_2_a']; panel_status=full
+queue: observed — bracket round 1: field 3 -> 2; passed=3; cut_line=6.0; eliminated=['ctr_demo_2_a']; panel_status=full
+queue: observed — bracket round 2: field 2 -> 1; passed=2; cut_line=6.375; eliminated=['ctr_demo_2_c']; panel_status=full
 events:
-id=2, type=human_gate, contract_id=ctr_demo_2, detail=winner ctr_demo_2_b awaits the human gate, created_at=2026-11-08T02:30:25.765417+00:00
-id=1, type=human_gate, contract_id=ctr_demo_1, detail=winner ctr_demo_1_c awaits the human gate, created_at=2026-11-08T02:30:24.587511+00:00
+id=2, type=human_gate, contract_id=ctr_demo_2, detail=winner ctr_demo_2_b awaits the human gate, created_at=2026-11-08T23:14:57.783929+00:00
+id=1, type=human_gate, contract_id=ctr_demo_1, detail=winner ctr_demo_1_c awaits the human gate, created_at=2026-11-08T23:14:55.452302+00:00
 
 Winner merged on main: True
 

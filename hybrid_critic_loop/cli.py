@@ -49,6 +49,32 @@ def _open(data_dir):
     return store, data_dir
 
 
+class _NoStoreError(Exception):
+    """The read-only command found no store to read (tightening spec T9)."""
+
+
+def _open_existing(data_dir):
+    """Open an existing store read-only — never create one.
+
+    Read-only commands (``standing``, ``verify-cert``, ``session-start``)
+    inspect a store; pointing one at a fresh directory must not conjure
+    the store it was asked to inspect (correctness F11), so when
+    ``<data dir>/data.db`` does not exist this raises
+    :class:`_NoStoreError` and creates nothing — not even the directory.
+    """
+    from .plugin import _open_store
+
+    data_dir = Path(data_dir)
+    if not (data_dir / "data.db").exists():
+        raise _NoStoreError(
+            f"no store found at {data_dir} (data.db does not exist); "
+            "run a contract first, or pass --data-dir for the store "
+            "you meant"
+        )
+    store = _open_store(data_dir)
+    return store, data_dir
+
+
 # ---------------------------------------------------------------------------
 # Subcommand implementations
 # ---------------------------------------------------------------------------
@@ -142,7 +168,7 @@ def _cmd_verify_cert(token, data_dir) -> int:
     """Verify an MM CERTIFIED certificate token against this store."""
     from .chain import verify_certificate
 
-    store, data_dir = _open(data_dir)
+    store, data_dir = _open_existing(data_dir)
     ok, payload_or_reason = verify_certificate(store, token)
     if ok:
         print("certificate: VALID")
@@ -155,16 +181,16 @@ def _cmd_verify_cert(token, data_dir) -> int:
 def _cmd_standing(data_dir) -> int:
     from .standing import standing_report
 
-    store, data_dir = _open(data_dir)
+    store, data_dir = _open_existing(data_dir)
     print(standing_report(store))
     return 0
 
 
 def _cmd_session_start(domain, data_dir) -> int:
     from . import hooks as hooks_mod
-    from .standing import standing_line
+    from .standing import has_standing, standing_line
 
-    store, data_dir = _open(data_dir)
+    store, data_dir = _open_existing(data_dir)
     hooks_mod.on_session_start(store, data_dir, domain=domain or "code")
     result = hooks_mod.pre_llm_call(store, data_dir, domain=domain)
     if result and result.get("context"):
@@ -172,10 +198,14 @@ def _cmd_session_start(domain, data_dir) -> int:
         # it is the session-start standing surface as well.
         print(result["context"])
     else:
-        # Nothing to inject — still show the standing line when the
-        # store has one on record.
+        # Nothing to inject — still show the standing line, but only
+        # when the store has standing on record: the fallback gates on
+        # has_standing exactly as the hook does (correctness F12,
+        # host F5), so an empty store prints nothing here either.
+        line = None
         try:
-            line = standing_line(store)
+            if has_standing(store):
+                line = standing_line(store)
         except Exception:
             line = None
         print(line or "")
@@ -244,7 +274,8 @@ def _add_subcommands(subparsers):
 def add_parser(subparsers):
     """Add the ``critic`` parser (with its subcommands) to ``subparsers``."""
     parser = subparsers.add_parser(
-        "critic", help="Hybrid Critic Loop: run contracts, lessons, ledger"
+        "critic",
+        help="Hybrid Critic Loop: run contracts, lessons, ledger, standing, verify-cert",
     )
     inner = parser.add_subparsers(dest="critic_command")
     _add_subcommands(inner)
@@ -291,7 +322,10 @@ def dispatch(args, data_dir=None) -> int:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        prog="critic", description="Hybrid Critic Loop command line"
+        prog="critic",
+        description="Hybrid Critic Loop command line: run contracts, show "
+                    "lessons, the ledger, lifetime standing, and verify "
+                    "MM CERTIFIED certificates",
     )
     subparsers = parser.add_subparsers(dest="command")
     _add_subcommands(subparsers)

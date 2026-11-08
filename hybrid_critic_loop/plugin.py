@@ -1,10 +1,10 @@
 """Hermes plugin registration for the Hybrid Critic Loop.
 
-``register(ctx)`` wires tools, a slash command, a CLI command, and the four
+``register(ctx)`` wires tools, a slash command, a CLI command, and the two
 lifecycle hooks onto the Hermes context.  Everything is built on ``ctx``
 plus the standard library — no other Hermes imports.  The loop, contracts,
-and executors modules are imported lazily inside handlers so registration
-itself never depends on them.
+executors and standing modules are imported lazily inside handlers so
+registration itself never depends on them.
 
 State lives in the plugin data dir, never in the plugin directory.
 """
@@ -18,7 +18,6 @@ from pathlib import Path
 
 from . import hooks as hooks_mod
 from .reports import build_matrix_view, ledger_report, lessons_report
-from .standing import standing_report
 from .router import ensure_routes
 
 REGISTRATION_NOTES = []
@@ -38,10 +37,13 @@ def resolve_data_dir(ctx=None) -> Path:
 
     Precedence, in order:
 
-    1. the Hermes ctx's own ``plugin_data_dir()`` — the host is
-       authoritative when it hands us a directory;
+    1. the Hermes ctx's own ``plugin_data_dir()`` — a forward-compat
+       probe only: the real host's PluginContext has no such attribute,
+       so this step is inert today and exists in case a future host
+       grows one;
     2. an explicit ``HCL_DATA_DIR`` override;
-    3. Hermes's ``plugins.plugin_storage`` helper, when importable;
+    3. Hermes's ``plugins.plugin_storage`` helper, when importable —
+       in practice the authoritative in-host source;
     4. ``<HERMES_HOME>/plugin-data/hybrid-critic-loop``.
 
     The explicit override sits above the importable helper on purpose:
@@ -607,6 +609,14 @@ def register(ctx):
         if sub == "ledger":
             return ledger_report(store)
         if sub == "standing":
+            # Lazy import (tightening spec T9; host F4): a missing or
+            # broken standing module must not take registration — or
+            # every other subcommand — down with it, mirroring the
+            # _certificate_lines pattern in reports.py.
+            try:
+                from .standing import standing_report
+            except ImportError:
+                return "standing unavailable (the standing module failed to load)"
             return standing_report(store)
         return f"unknown critic subcommand: {sub} (try: run, gate, lessons, ledger, standing)"
 

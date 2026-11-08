@@ -441,14 +441,23 @@ class Store:
           row, the legacy-writer append case — is sealed with
           ``sealed_via="repair"``.
         - Corruption: NULL hashes in the middle (a hashed row exists
-          after them), or a pre-existing hash that does not recompute.
-          Pre-existing hashes are recomputed during the pass, never
-          trusted as links (the old pass trusted them, so a tampered
-          row's stored hash became the seal for everything after it).
-          Corrupt rows and everything after them are left exactly as
-          found: ``verify_chain`` names the first bad row, and
-          ``add_ledger`` refuses to extend a book whose last row is
-          unsealed.
+          after them), or a pre-existing hash that recomputes under
+          neither canonical form. Pre-existing hashes are recomputed
+          during the pass, never trusted as links (the old pass trusted
+          them, so a tampered row's stored hash became the seal for
+          everything after it). Corrupt rows and everything after them
+          are left exactly as found: ``verify_chain`` names the first
+          bad row, and ``add_ledger`` refuses to extend a book whose
+          last row is unsealed.
+        - Canonical-form upgrade (tightening spec T12): a sealed row
+          whose stored hash fails the current form but matches the
+          pre-T12 form (``chain.row_hash_legacy`` — the canonical form
+          without ``provenance``) is re-sealed under the current form
+          with ``sealed_via="repair"``. Re-sealing changes that row's
+          hash, so the re-seal cascades over every later sealed row
+          (each still validated against its stored link first); a
+          store sealed before ``provenance`` joined the canonical form
+          thus survives the upgrade with its chain intact.
 
         ``self.chain_backfilled`` / ``self.chain_repairs`` record how
         many rows this open sealed by each route.
@@ -470,17 +479,51 @@ class Store:
                 first_unsealed = idx
                 break
         # Recompute the sealed prefix (every row before the first
-        # unsealed one); a stored hash that does not recompute, or does
-        # not link to its predecessor, is corruption — seal nothing.
+        # unsealed one), following the STORED links: a row's hash is
+        # always computed over its predecessor's stored hash. A stored
+        # hash that does not recompute under either canonical form, or
+        # does not link to its predecessor, is corruption — seal
+        # nothing. A row sealed under the pre-T12 form starts a
+        # re-seal cascade (T12): its new-form digest differs from its
+        # stored hash, so every later row's prev link changes and the
+        # rest of the prefix is re-sealed under the current form too,
+        # each row still validated against its stored link before it
+        # is rewritten — a tampered row aborts the whole pass.
         prefix = rows if first_unsealed is None else rows[:first_unsealed]
-        prev = _chain.GENESIS_HASH
+        prev = _chain.GENESIS_HASH        # stored link expected next
+        prev_new = _chain.GENESIS_HASH    # new-form chain value
+        resealing = False
         for row in prefix:
             entry = self._ledger_dict(row)
-            if _col(row, "prev_hash") != prev:
+            stored_prev = _col(row, "prev_hash")
+            stored = _col(row, "row_hash")
+            if stored_prev != prev:
+                self._conn.rollback()
                 return
-            if _chain.row_hash(prev, entry) != _col(row, "row_hash"):
+            if not resealing:
+                if _chain.row_hash(stored_prev, entry) == stored:
+                    prev = stored
+                    prev_new = stored
+                    continue
+                if _chain.row_hash_legacy(stored_prev, entry) != stored:
+                    self._conn.rollback()
+                    return
+                resealing = True
+            elif (_chain.row_hash(stored_prev, entry) != stored
+                    and _chain.row_hash_legacy(stored_prev, entry)
+                    != stored):
+                self._conn.rollback()
                 return
-            prev = _col(row, "row_hash")
+            digest = _chain.row_hash(prev_new, entry)
+            self._conn.execute(
+                "UPDATE ledger SET prev_hash=?, row_hash=?,"
+                " sealed_via=? WHERE id=?",
+                (prev_new, digest, "repair", row["id"]),
+            )
+            self.chain_repairs += 1
+            prev = stored
+            prev_new = digest
+        prev = prev_new
         if first_unsealed is None:
             if pre_chain:
                 self._conn.execute(
@@ -491,6 +534,7 @@ class Store:
         if any(_col(row, "row_hash") for row in suffix):
             # A hashed row exists after an unsealed one: middle-NULL
             # corruption. Leave the book exactly as found.
+            self._conn.rollback()
             return
         sealed_via = "backfill" if pre_chain else "repair"
         for row in suffix:

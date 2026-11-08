@@ -77,18 +77,18 @@ You want to prove you're rich? Show us you're running the Millionaire Matrix. A 
 
 Standing appears wherever the operator already looks:
 
-- **Session start.** The injected first-turn context opens with the standing line — `Millionaire Matrix standing: <TIER> — $<spend> lifetime measured spend · <tokens> tokens` (segments read "not reported" when unmeasured) — above the lessons, under the same 10,000-character cap. A store with dispatches but no lessons injects the line alone.
-- **`/critic standing`** (also `hermes critic standing`, `hcl standing`, and the `session-start` output) prints the full board: the standing line, the next tier and the exact additional measured spend required to reach it (nothing above MILLIONAIRE), and one row per expert — the ledger report's columns plus that expert's own tier, taken from the expert's measured validity cost where present.
-- **Every verdict report** closes with the store's current tier and the run's own recorded contribution (the tokens and cost on that contract's ledger rows, or "not reported").
+- **Session start.** The injected first-turn context opens with the standing line — `Millionaire Matrix standing: <TIER> — $<spend> lifetime measured spend · <tokens> tokens` (segments read "not reported" when unmeasured) — above the lessons, under the same 10,000-character cap. A store with dispatches but no lessons injects the line alone. (`session-start` on the CLI prints that same opening line, not the full board.)
+- **`/critic standing`** (also `hermes critic standing`, `hcl standing`) prints the full board: the standing line, the next tier and the exact additional measured spend required to reach it (nothing above MILLIONAIRE), and one row per expert — the ledger report's columns plus that expert's own tier, taken from the expert's measured validity cost where present.
+- **Every verdict report** carries the store's current tier and the run's own recorded contribution (the tokens and cost on that contract's ledger rows, or "not reported"), and closes with the run's certificate.
 
 ## Certificates and the chain
 
-A standing is only worth flexing if it cannot be rewritten after the fact, so the book seals itself. Every ledger row carries a hash chain: `row_hash = sha256(prev_hash + the row's canonical form)`, each row sealing the one before it back to a genesis hash. Rows written before the chain existed are backfilled in id order on first open (a store meta flag records that the backfill has run); every new row is hashed as it is appended, under the store's lock. Edit any stored row — inflate a token count, invent spend — and the chain no longer recomputes: `chain.verify_chain` names the first row that fails to seal.
+A standing is only worth flexing if it cannot be rewritten after the fact, so the book seals itself. Every ledger row carries a hash chain: `row_hash = sha256(prev_hash + the row's canonical form)`, each row sealing the one before it back to a genesis hash. Rows written before the chain existed are backfilled in id order on first open (a store meta flag records that the backfill has run); every new row is hashed as it is appended, under the store's lock. Edit any stored row — inflate a token count, invent spend — and the chain no longer recomputes: `chain.verify_chain` names the first row that fails to seal. The chain detects any edit *that does not also recompute the chain* — whoever holds the store's files can recompute it — so verification gains its meaning against a chain head or certificate exported earlier, not against the store alone. And pre-chain builds must not append to a chained store: their unhashed rows break the seal for every reader (an unsealed suffix is re-sealed on open and reported as a repair; an unsealed row in the middle is corruption).
 
-A run that reached a verdict is issued a **certificate**, printed in its run result and at the foot of its verdict report:
+A run that reached a verdict with a winner is issued a **certificate**, printed in its run result and at the foot of its verdict report. The demo's own stamp — the local solvers report tokens but no cost — is the honest shape of it:
 
 ```
-MM CERTIFIED · 1,204,311 TOKENS SPENT · $96.20 BURNED · ONE ANSWER
+MM CERTIFIED · TOKENS NOT REPORTED · ONE ANSWER
 cert: mm1.<base64url(payload)>.<base64url(signature)>
 ```
 
@@ -127,9 +127,9 @@ hcl run contract.json --repo /path/to/repo --approve --data-dir ./hcl-data
 
 In Hermes:
 
-- Slash command: `/critic run <contract.json> [repo_path]`, `/critic gate <contract_id> approve|reject|waive [reason]`, `/critic lessons [domain]`, `/critic ledger`
-- CLI: `hermes critic run|gate|lessons|ledger|session-start`
-- Tools (for the agent itself): `critic_run`, `critic_gate` (complete a pending human gate: approve, reject or waive), `critic_matrix` (the validity matrix for a contract: every peer's score per criterion, confidence, dissent flags), `critic_lessons`, `critic_ledger` (dispatches, tokens, cost, win rate, cost per validity point, and the events log)
+- Slash command: `/critic run <contract.json> [repo_path]`, `/critic gate <contract_id> approve|reject|waive [reason]`, `/critic lessons [domain]`, `/critic ledger`, `/critic standing`
+- CLI: `hermes critic run|gate|lessons|ledger|standing|verify-cert|session-start`
+- Tools (for the agent itself): `critic_run`, `critic_gate` (complete a pending human gate: approve, reject or waive), `critic_matrix` (the validity matrix for a contract: every peer's score per criterion, confidence, dissent flags), `critic_lessons`, `critic_ledger` (dispatches, tokens, cost, win rate, cost per validity point, and the events log). Standing and certificate verification are operator surfaces (slash/CLI), not agent tools.
 
 `hermes critic run` prints the run result and the verdict report; `critic_matrix` returns the matrix and the bracket block for a contract; the demo script prints all of it, round by round. Lessons are retrievable with `critic_lessons` and are injected automatically on a session's first turn for the session's domain family (Hermes passes no domain to the hook, so the default `code` family applies).
 
@@ -140,7 +140,7 @@ In Hermes:
 The demo panel is three deterministic local solver families (`local-naive`, `local-ring`, `local-balanced`) plus three deterministic local demo judges — packet-text scorers, labelled as such everywhere, **not models**. The script first attempts the live contest with the real `codex`/`grok` CLIs and prints whatever genuinely happens — refusals and unavailability are recorded in the ledger like any other outcome.
 
 - **Run 1 (contract `ctr_demo_1`, SpeedSampler):** baseline tests fail (the fixture ships as stubs) → the panel generates → the naive candidate *and* the balanced candidate (whose deque average still rescans the window) die on the measured gate (ops_per_tick 120.0 vs threshold <= 8; the ring candidate scores 1.0) → a single survivor stands, so the anchor alone decides: verdict, human approval, winner merged → a Lesson is written from the measurement row and the naive expert is demoted in the route table.
-- **Fresh session:** the session-start path injects the Lesson into context before any new work happens.
+- **Fresh session:** the session-start path injects the standing line and the Lesson into context before any new work happens.
 - **Run 2 (contract `ctr_demo_2`, SteeringSampler):** the route table already shows the demotion; the lesson-conditioned generators now all produce the O(1) implementation and pass the measured gate → the peer matrix fills in over the full field → the bracket steps it down 3 → 2 → 1 with the cut line printed per round → one answer walks out.
 
 A Godot C# version of the fixture (`fixture/godot-csharp/`, contracts `demo1-csharp.json` / `demo2-csharp.json`) carries the same design with the allocation sensor from the original design (alloc_bytes_per_tick, threshold 0). It requires the .NET SDK and was **not run** in the build environment (no `dotnet` there); on the operator's machine it compiles and its tests fail on the stub baseline as the contract requires (checked 2026-11-07) — no contest has been run against it yet. One honest limitation of the Python mirror: its sensor counts arithmetic on the values the sampler stores, so an implementation that converts inputs to plain floats at push time would under-report — the C# allocation sensor has no equivalent blind spot. The sensor's docstring states this.
@@ -172,12 +172,12 @@ One deviation from the original design document, stated plainly: the design call
 | Contest | `executors.py`, `executors_api.py`, `worktrees.py`, `shellrun.py` | Adapters for all eight panel families (CLI + ollama + API); one git worktree per candidate; every subprocess run without a shell and captured, the generation log hashed as evidence (`evidence.log_hash`) |
 | Gates | `contracts.py`, `gates.py`, `judges.py`, `rubrics.py` | Contract validation, the baseline rule, gate evaluation in rank order, the legacy blinded judge protocol (non-matrix rubrics) |
 | Matrix | `matrix.py`, `bracket.py` | The peer validity matrix (self-cells stripped in code, calibration × confidence weighting, dissent + gate re-run requests, calibration from history) and the step-down bracket (pure cuts over recorded scores) |
-| State | `state.py` | SQLite store with the twelve domain objects: targets, contracts, candidates, measurements, scores, verdicts, final_answers, experts, routes, ledger, lessons, events |
-| Memory | `lessons.py`, `router.py` | Evidence-derived Lesson writing and the capped lesson context block; route-table updates from verdicts (panel + scoring carried on the route). Lesson ranking lives in `state.py` (`lessons_for`), injection in `hooks.py` (`pre_llm_call`) |
+| State | `state.py`, `chain.py` | SQLite store with the twelve domain objects: targets, contracts, candidates, measurements, scores, verdicts, final_answers, experts, routes, ledger, lessons, events; the hash-chained ledger seal and the signed per-run certificates |
+| Memory | `lessons.py`, `router.py`, `standing.py` | Evidence-derived Lesson writing and the capped lesson context block; route-table updates from verdicts (panel + scoring carried on the route); lifetime standing and tiers — the one totals aggregation every spend surface reads. Lesson ranking lives in `state.py` (`lessons_for`), injection in `hooks.py` (`pre_llm_call`) |
 | Surface | `plugin.py`, `hooks.py`, `cli.py`, `loop.py`, `reports.py` | Hermes registration (5 tools, `/critic`, `hermes critic`, 2 hooks: `on_session_start`, `pre_llm_call`), the queue/orchestration loop, DB-only reporting |
 
 Reports print only database rows; anything absent prints as `not run` or `not reported` — token and cost totals are never estimated.
 
 ## Scope and roadmap
 
-Shipped in this entry (v0.3): the panel contest (adapters for eight family seats — in this build the agy and Beam seats decline every dispatch and say so), the peer validity matrix with dissent and calibration, the scored step-down bracket, cost per validity point, the durable events log, Lesson writeback with route-table demotion/promotion, and session-start lesson injection — the design's Phase 0 + Phase 1. Deliberately later (the design's Phase 2, not built): decomposition and stability matrix rows, a revision round, an attacker seat, the spec wave, and registry scoring beyond win rate + calibration.
+Shipped in this entry (v0.4): the panel contest (adapters for eight family seats — in this build the agy and Beam seats decline every dispatch and say so), the peer validity matrix with dissent and calibration, the scored step-down bracket, cost per validity point, the durable events log, Lesson writeback with route-table demotion/promotion, session-start lesson injection, lifetime standing and tiers (the client book), the hash-chained ledger, and signed per-run certificates — the design's Phase 0 + Phase 1. Deliberately later (the design's Phase 2, not built): decomposition and stability matrix rows, a revision round, an attacker seat, the spec wave, and registry scoring beyond win rate + calibration.

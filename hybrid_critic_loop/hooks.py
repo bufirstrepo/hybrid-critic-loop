@@ -15,7 +15,6 @@ import json
 from pathlib import Path
 
 from .lessons import lessons_context
-from .standing import has_standing, standing_line
 
 
 def _session_domain(data_dir):
@@ -66,6 +65,13 @@ def pre_llm_call(store, data_dir, **kw):
         tags = kw.get("tags")
         line = None
         try:
+            # Lazy import (tightening spec T9; host F4): the standing
+            # lookup runs inside this try, and the hook's outer
+            # never-raises guard, so a standing module that fails to
+            # import degrades to lessons-only injection instead of
+            # taking the hook down at module load.
+            from .standing import has_standing, standing_line
+
             if has_standing(store):
                 line = standing_line(store)
         except Exception:

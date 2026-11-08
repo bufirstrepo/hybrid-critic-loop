@@ -58,9 +58,12 @@ from .standing import tier_for
 __all__ = [
     "GENESIS_HASH",
     "LEDGER_FIELDS",
+    "LEDGER_FIELDS_LEGACY",
     "CertificateKeyError",
     "canonical_row",
+    "canonical_row_legacy",
     "row_hash",
+    "row_hash_legacy",
     "verify_chain",
     "cert_key",
     "key_id",
@@ -76,7 +79,9 @@ GENESIS_HASH = "0" * 64
 
 #: The ledger row's own fields, in canonical order. The two hash columns
 #: themselves are never part of the serialization (a row cannot seal
-#: its own seal).
+#: its own seal). ``provenance`` joined the form in the tightening pass
+#: (T12): a row's attribution is sealed like every other field, so
+#: flipping it breaks the chain at that row.
 LEDGER_FIELDS = (
     "id",
     "target_id",
@@ -90,6 +95,17 @@ LEDGER_FIELDS = (
     "outcome",
     "note",
     "created_at",
+    "provenance",
+)
+
+#: The pre-tightening canonical form — LEDGER_FIELDS without
+#: ``provenance``. Kept for exactly one purpose: the open-time sealing
+#: pass in state.py recognises a row sealed under this old form and
+#: re-seals it under the current form (marked ``sealed_via="repair"``),
+#: so a store sealed before T12 survives the upgrade with its chain and
+#: its certificates intact. New seals never use this form.
+LEDGER_FIELDS_LEGACY = tuple(
+    field for field in LEDGER_FIELDS if field != "provenance"
 )
 
 _TOKEN_PREFIX = "mm1"
@@ -126,9 +142,24 @@ def canonical_row(row) -> str:
     return json.dumps(body, sort_keys=True, separators=(",", ":"))
 
 
+def canonical_row_legacy(row) -> str:
+    """The pre-T12 canonical serialization (no ``provenance``).
+
+    Recognition only — see :data:`LEDGER_FIELDS_LEGACY`.
+    """
+    body = {field: row.get(field) for field in LEDGER_FIELDS_LEGACY}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+
 def row_hash(prev_hash, row) -> str:
     """``sha256(prev_hash + canonical(row))`` as a hex digest."""
     data = (str(prev_hash) + canonical_row(row)).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def row_hash_legacy(prev_hash, row) -> str:
+    """``row_hash`` under the pre-T12 canonical form (recognition only)."""
+    data = (str(prev_hash) + canonical_row_legacy(row)).encode("utf-8")
     return hashlib.sha256(data).hexdigest()
 
 

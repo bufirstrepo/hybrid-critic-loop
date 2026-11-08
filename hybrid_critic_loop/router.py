@@ -147,14 +147,18 @@ def apply_lesson_route_change(store, category, route_change, contract_id):
 
     note = f"route_change demote {demote} ({reason}) contract {contract_id}"
     try:
-        store.add_ledger(expert_id=demote, outcome="observed", note=note)
+        # Tightening spec T2: router bookkeeping is an internal writer.
+        store.add_ledger(expert_id=demote, outcome="observed", note=note,
+                         provenance="internal")
     except TypeError:
         # Real Store.add_ledger has a wide positional signature:
         # (target_id, contract_id, candidate_id, stage, expert_id,
-        #  tokens_in, tokens_out, cost_usd, outcome, note=None)
+        #  tokens_in, tokens_out, cost_usd, outcome, note=None,
+        #  provenance=None)
         try:
             store.add_ledger(None, contract_id, None, None, demote,
-                             None, None, None, "observed", note)
+                             None, None, None, "observed", note,
+                             provenance="internal")
         except Exception:
             pass
     except Exception:

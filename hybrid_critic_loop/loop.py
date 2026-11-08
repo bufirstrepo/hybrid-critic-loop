@@ -309,6 +309,12 @@ class _Run:
             stage=self.contract["stage"], expert_id=expert_id,
             tokens_in=gen.tokens_in, tokens_out=gen.tokens_out, cost_usd=gen.cost_usd,
             outcome=outcome, note=gen.detail or gen.status,
+            # Tightening spec T2: the dispatch path attributes the row
+            # to the candidate's recorded provenance — a candidate row
+            # always carries one (the adapter's, required by the gate),
+            # so the "executor-reported" fallback is belt and braces.
+            provenance=(store.get_candidate(cand_id) or {}).get("provenance")
+            or "executor-reported",
         )
         if gen.status == "completed":
             diff = self.mgr.diff(wt)
@@ -347,6 +353,7 @@ class _Run:
                     stage=self.contract["stage"], expert_id="queue", tokens_in=None,
                     tokens_out=None, cost_usd=None, outcome="escalated",
                     note="acceptance passed on baseline; contract refused as vacuous",
+                    provenance="internal",
                 )
                 return {
                     "contract_id": self.contract_id, "status": "refused_baseline",
@@ -361,6 +368,7 @@ class _Run:
                     tokens_out=None, cost_usd=None, outcome="observed",
                     note=("baseline re-verified on re-run: acceptance now fails on the "
                           "baseline; contract reopened"),
+                    provenance="internal",
                 )
 
         category = router_mod.category_of(self.contract["domain"])
@@ -565,6 +573,7 @@ class _Run:
             stage=self.contract["stage"], expert_id="queue",
             tokens_in=None, tokens_out=None, cost_usd=None, outcome="observed",
             note=f"matrix peers seated={peer_ids}; skipped={skipped}",
+            provenance="internal",
         )
         calibrations = None
         experts_arg = None
@@ -678,6 +687,7 @@ class _Run:
                             f"dissent gate re-run anchored out {anchored}; "
                             f"panel_status={outcome.panel_status}"
                         ),
+                        provenance="internal",
                     )
                 if not field:
                     last_gate_details["judged"] = self._matrix_judged_map(
@@ -746,6 +756,7 @@ class _Run:
                     f"eliminated={[c['id'] for c in cut_out]}; "
                     f"panel_status={outcome.panel_status}{silent_note}{no_pass}"
                 ),
+                provenance="internal",
             )
             eliminated_total.extend(c["id"] for c in cut_out)
             field = advanced
@@ -1113,6 +1124,7 @@ class _Run:
             target_id=self.target_id, contract_id=self.contract_id, candidate_id=None,
             stage=self.contract["stage"], expert_id="queue", tokens_in=None,
             tokens_out=None, cost_usd=None, outcome="escalated", note=reason,
+            provenance="internal",
         )
         self._record_validity(None, [], {}, judged)
         gate_details["escalation_reason"] = reason
@@ -1125,7 +1137,10 @@ class _Run:
         }
         if self.route_hold is not None:
             result["route_change_hold"] = self.route_hold
-        _attach_certificate(result, store, self.contract_id)
+        # No certificate here (tightening spec T6; claims #1): an
+        # escalation has no winner, and issue_certificate returns None
+        # for a winnerless verdict — the escalated result carries no
+        # stamp and no token.
         return result
 
     def _write_lesson(self, attempt, gate_details):
@@ -1185,7 +1200,7 @@ class _Run:
                 target_id=self.target_id, contract_id=self.contract_id,
                 candidate_id=None, stage=self.contract["stage"], expert_id=demote,
                 tokens_in=None, tokens_out=None, cost_usd=None,
-                outcome="observed", note=note,
+                outcome="observed", note=note, provenance="internal",
             )
         except Exception:  # noqa: BLE001 - bookkeeping must not break a verdict
             pass

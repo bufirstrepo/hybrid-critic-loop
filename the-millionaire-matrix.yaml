@@ -4,7 +4,7 @@
 # commit SHA of the public repository's release commit before opening
 # the PR (the catalog pins content by SHA; see SUBMISSION.md step 1).
 name: the-millionaire-matrix
-version: "0.3.0"
+version: "0.4.0"
 repo: https://github.com/dynoshippedit/hybrid-critic-loop
 sha: "REPLACE-WITH-FULL-40-CHAR-COMMIT-SHA"
 description: "Every model family you have a seat for generates a candidate; all of them blind-score each other on a peer validity matrix anchored by real tests (hard and measured gates outrank the matrix), the field steps down round by round to one answer behind a human gate, and verified lessons carry into your next session."

@@ -177,6 +177,23 @@ def ledger_report(store) -> str:
             lines.append(
                 f"queue: {row.get('outcome')} — {_value_or_not_reported(row.get('note'))}"
             )
+    # Chain sealing route (tightening spec T3): when any row was sealed
+    # other than at append time, say so — with per-route totals — so a
+    # backfilled or repaired book is visibly different from one that was
+    # chained all along. Rows with sealed_via NULL predate the column
+    # and are appends; they count as "append" and are never tallied
+    # separately (that would be a confusing fourth bucket).
+    sealed_counts = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        via = row.get("sealed_via") or "append"
+        sealed_counts[via] = sealed_counts.get(via, 0) + 1
+    if any(via != "append" for via in sealed_counts):
+        detail = ", ".join(
+            f"{via}={sealed_counts[via]}" for via in sorted(sealed_counts)
+        )
+        lines.append(f"chain: {detail}")
     if not summary and rows:
         # Rows exist but no summary implementation produced aggregates.
         for row in rows:
