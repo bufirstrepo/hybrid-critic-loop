@@ -124,7 +124,8 @@ def _round_scores(outcome) -> dict:
     scored in it (fix pass Wave 2.8, review M5)."""
     return {
         cid: {"median_mean": entry["median_mean"], "min_item": entry["min_row"],
-              "spread": entry["spread"], "pass": entry["pass"]}
+              "spread": entry["spread"], "pass": entry["pass"],
+              "scored": entry.get("scored", entry["median_mean"] is not None)}
         for cid, entry in outcome.per_candidate.items()
         if isinstance(entry, dict)
     }
@@ -608,6 +609,10 @@ class _Run:
                     self.matrix_validity[cid] = float(entry["median_mean"])
             for cid in outcome.per_candidate:
                 history[cid] = {"round": round_no, "outcome": outcome}
+            # Seated peers that produced no valid cell this round (Phase 3
+            # live-run finding): the record names them, so an unscored
+            # candidate's missing median has a visible cause.
+            silent_peers = [pid for pid in peer_ids if pid not in outcome.peers_used]
 
             if outcome.rerun_requests and not rerun_used:
                 # A dissent cites a gate the majority may have missed:
@@ -661,6 +666,7 @@ class _Run:
                         "anchored_by_gate_rerun": list(anchored),
                         "scores": _round_scores(outcome),
                         "dissent": list(outcome.dissent),
+                        "peers_without_cells": list(silent_peers),
                     })
                     store.add_ledger(
                         target_id=self.target_id, contract_id=self.contract_id,
@@ -725,8 +731,10 @@ class _Run:
                 # dissent raised in it (the verdict keeps all rounds).
                 "scores": _round_scores(outcome),
                 "dissent": list(outcome.dissent),
+                "peers_without_cells": list(silent_peers),
             })
             no_pass = "" if advanced else "; no candidate passed the matrix — nothing left to cut"
+            silent_note = f"; peers_without_cells={silent_peers}" if silent_peers else ""
             store.add_ledger(
                 target_id=self.target_id, contract_id=self.contract_id,
                 candidate_id=None, stage=self.contract["stage"], expert_id="queue",
@@ -736,7 +744,7 @@ class _Run:
                     f"bracket round {round_no}: field {field_in} -> {len(advanced)}; "
                     f"passed={len(passers)}; cut_line={cut['cut_line']}; "
                     f"eliminated={[c['id'] for c in cut_out]}; "
-                    f"panel_status={outcome.panel_status}{no_pass}"
+                    f"panel_status={outcome.panel_status}{silent_note}{no_pass}"
                 ),
             )
             eliminated_total.extend(c["id"] for c in cut_out)
@@ -835,6 +843,7 @@ class _Run:
                 "min_item": entry["min_row"],
                 "spread": entry["spread"],
                 "pass": entry["pass"],
+                "scored": entry.get("scored", entry["median_mean"] is not None),
                 "round": round_no,
                 "dissent": [d for d in out.dissent if d["candidate_id"] == cid],
                 "panel_status": entry["panel_status"],
@@ -949,6 +958,7 @@ class _Run:
                     judged_summary[cid] = {
                         "median_mean": v["median_mean"], "min_item": v["min_item"],
                         "spread": v["spread"], "pass": v["pass"],
+                        "scored": v.get("scored", v.get("median_mean") is not None),
                         "round": v.get("round"),
                         "dissent": v.get("dissent", []),
                         "panel_status": v.get("panel_status"),

@@ -602,6 +602,32 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
     for candidate in candidates:
         cid = _candidate_id(candidate)
         cells = collected.get(cid, [])
+        peer_families = []
+        for cell in cells:
+            if cell["judge_family"] not in peer_families:
+                peer_families.append(cell["judge_family"])
+        candidate_status = (
+            "degraded" if (len(peer_families) < 2 or len(cells) < 2) else "full"
+        )
+        if not cells:
+            # Nobody produced a valid cell for this candidate: it is
+            # UNSCORED — no median, no rows, no confidence, no spread —
+            # not a candidate that scored zero. It cannot pass, and the
+            # loop records no validity for it (Phase 3 live-run finding,
+            # 2026-11-07: the two-seat matrix wrote 0.0 everywhere and the
+            # ledger credited 0.0 points nobody measured).
+            per_candidate[cid] = {
+                "rows": {row: None for row in VALIDITY_ROWS},
+                "median_mean": None,
+                "min_row": None,
+                "spread": None,
+                "pass": False,
+                "scored": False,
+                "mean_confidence": None,
+                "panel_status": candidate_status,
+                "peers": peer_families,
+            }
+            continue
         rows: dict = {}
         for row in VALIDITY_ROWS:
             pairs = [
@@ -611,7 +637,7 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
                  * cell["confidences"][row])
                 for cell in cells
             ]
-            rows[row] = _weighted_or_plain(pairs) if pairs else 0.0
+            rows[row] = _weighted_or_plain(pairs)
         peer_mean_pairs = [
             (cell["mean"],
              effective.get(cell["judge_family"], {}).get(
@@ -619,30 +645,22 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
              * cell["mean_confidence"])
             for cell in cells
         ]
-        median_mean = _weighted_or_plain(peer_mean_pairs) if peer_mean_pairs else 0.0
+        median_mean = _weighted_or_plain(peer_mean_pairs)
         peer_means = [cell["mean"] for cell in cells]
         spread = (max(peer_means) - min(peer_means)) if len(peer_means) >= 2 else 0.0
         all_confidences = [
             conf for cell in cells for conf in cell["confidences"].values()
         ]
-        mean_confidence = (
-            sum(all_confidences) / len(all_confidences) if all_confidences else 0.0
-        )
-        peer_families = []
-        for cell in cells:
-            if cell["judge_family"] not in peer_families:
-                peer_families.append(cell["judge_family"])
-        candidate_status = (
-            "degraded" if (len(peer_families) < 2 or len(cells) < 2) else "full"
-        )
-        min_row = min(rows.values()) if rows else 0.0
-        passed = bool(cells) and median_mean >= min_score and min_row >= min_score - 2
+        mean_confidence = sum(all_confidences) / len(all_confidences)
+        min_row = min(rows.values())
+        passed = median_mean >= min_score and min_row >= min_score - 2
         per_candidate[cid] = {
             "rows": rows,
             "median_mean": float(median_mean),
             "min_row": float(min_row),
             "spread": float(spread),
             "pass": bool(passed),
+            "scored": True,
             "mean_confidence": float(mean_confidence),
             "panel_status": candidate_status,
             "peers": peer_families,
@@ -717,7 +735,9 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
         cid = _candidate_id(candidate)
         entry = per_candidate[cid]
         cells = collected.get(cid, [])
-        if cells and entry["mean_confidence"] < LOW_CONFIDENCE_THRESHOLD:
+        if not cells:
+            continue  # unscored: nothing to compare (see the aggregation above)
+        if entry["mean_confidence"] < LOW_CONFIDENCE_THRESHOLD:
             reasons.append(
                 f"candidate {cid} mean confidence {_fmt(entry['mean_confidence'])} "
                 f"below {LOW_CONFIDENCE_THRESHOLD}"

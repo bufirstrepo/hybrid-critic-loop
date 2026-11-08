@@ -353,6 +353,32 @@ class TestMatrixReport(unittest.TestCase):
         report = matrix_report(store, "ctr-1")
         self.assertIn("panel_status: quorum_met", report)
 
+    def test_matrix_view_carries_the_verdicts_bracket_block(self):
+        # Phase 3 claims sweep (R-01): critic_matrix returns the matrix AND
+        # the bracket block — the verdict row's judged.bracket, printed round
+        # by round.
+        candidates = [{
+            "id": "cand-1", "contract_id": "ctr-1", "attempt": 1,
+            "expert_id": "exp-a", "family": "fam-a",
+        }]
+        scores = {"cand-1": [_matrix_score("cand-1", "judge-1", {"question_fidelity": 9.0}, 9.0)]}
+        rounds = [{"round": 1, "field_in": 3, "field_out": 2, "passed": 3, "cut_line": 6.0,
+                   "eliminated": ["cand-3"], "scores": {}, "dissent": []},
+                  {"round": 2, "field_in": 2, "field_out": 1, "passed": 2, "cut_line": 6.375,
+                   "eliminated": ["cand-2"], "scores": {}, "dissent": []}]
+        verdict = {"winner": "cand-1", "eliminated": ["cand-2", "cand-3"], "hard": "pass",
+                   "measured": "pass",
+                   "judged": {"panel_status": "full",
+                              "bracket": {"config": {"cut_mode": "fixed", "cut_per_round": 2},
+                                          "rounds": rounds}},
+                   "escalated": False, "human_gate": "approved"}
+        view = build_matrix_view(FakeMatrixStore(candidates, scores, verdict=verdict), "ctr-1")
+        self.assertEqual(view["bracket"]["rounds"], rounds)
+        report = matrix_report(FakeMatrixStore(candidates, scores, verdict=verdict), "ctr-1")
+        self.assertIn("bracket round 1: field 3 -> 2; passed=3; cut_line=6.0; eliminated=['cand-3']", report)
+        self.assertIn("bracket round 2: field 2 -> 1", report)
+        self.assertIsNone(build_matrix_view(FakeMatrixStore(candidates, scores), "ctr-1")["bracket"])
+
 
 # ---------------------------------------------------------------------------
 # Verdict report

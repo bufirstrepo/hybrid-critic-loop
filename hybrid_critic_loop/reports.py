@@ -446,12 +446,16 @@ def build_matrix_view(store, contract_id, attempt=None) -> dict:
     if not rows:
         rows = list(MATRIX_ROWS)
 
+    # The bracket record is the verdict row's (judged.bracket): the tool
+    # serves it beside the grid, as the README says (Phase 3 claims sweep).
+    bracket = judged.get("bracket") if isinstance(judged, dict) else None
     return {
         "contract_id": contract_id,
         "rubric": MATRIX_RUBRIC_ID,
         "rows": rows,
         "candidates": view_candidates,
         "panel_status": panel_status,
+        "bracket": bracket if isinstance(bracket, dict) else None,
         "note": None if has_matrix_scores else "not run",
     }
 
@@ -466,6 +470,14 @@ def matrix_report(store, contract_id) -> str:
         f"matrix for {contract_id} ({view['rubric']}):",
         f"panel_status: {panel_status if panel_status is not None else 'not reported'}",
     ]
+    for rnd in ((view.get("bracket") or {}).get("rounds") or []):
+        if isinstance(rnd, dict):
+            lines.append(
+                f"bracket round {rnd.get('round')}: field {rnd.get('field_in')} -> "
+                f"{rnd.get('field_out')}; passed={_value_or_not_reported(rnd.get('passed'))}; "
+                f"cut_line={_value_or_not_reported(rnd.get('cut_line'))}; "
+                f"eliminated={rnd.get('eliminated')}"
+            )
     for cid, candidate in view["candidates"].items():
         lines.append(
             f"candidate {cid} "

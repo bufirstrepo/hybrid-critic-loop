@@ -449,7 +449,7 @@ class TestDocsMatchTheCode(unittest.TestCase):
         from hybrid_critic_loop import hooks as hooks_mod
 
         readme = self._read("README.md")
-        self.assertIn("unless the matrix fails every remaining candidate", readme)
+        self.assertIn("matrix failers are out before the cut", readme)
         self.assertIn("unavailable", self._section(readme, "## Cost per validity point"))
         self.assertIn("first turn", hooks_mod.__doc__)
 
@@ -473,6 +473,17 @@ class TestDocsMatchTheCode(unittest.TestCase):
         self.assertIn("report tokens only", self._section(readme, "## Cost per validity point"))
         py = re.search(r'^version\s*=\s*"([^"]+)"', self._read("pyproject.toml"), re.M).group(1)
         self.assertEqual(hybrid_critic_loop.__version__, py)
+
+    def test_dev_extra_does_not_cap_pytest_below_the_hermes_workspace(self):
+        # Phase 3 finding: `hermes plugins validate --install-deps` resolves
+        # the [dev] extra inside the Hermes uv workspace (pytest 9.x); a
+        # `<9.0` cap made the resolution unsatisfiable. The runtime needs
+        # nothing; the extra must not fight the host.
+        pyproject = self._read("pyproject.toml")
+        self.assertIn("dependencies = []", pyproject)
+        dev = re.search(r'^dev\s*=\s*\[(.*)\]', pyproject, re.M).group(1)
+        self.assertIn("pytest", dev)
+        self.assertNotRegex(dev, r"pytest[^\"']*<")
 
     def test_readme_slash_usage_matches_the_handler_help(self):
         readme = self._read("README.md")

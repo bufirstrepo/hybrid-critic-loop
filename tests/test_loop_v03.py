@@ -1047,6 +1047,49 @@ class TestProvenanceComesFromTheAdapter(LoopV03Base):
         self.assertFalse(gates_mod.check_provenance(rows["gen-b"]))  # the real gate would eliminate it
 
 
+class TestUnscoredCandidateEarnsNothing(LoopV03Base):
+    """Phase 3 live-run finding (2026-11-07, the two-seat Phase A matrix):
+    when a peer produces no valid cell for a candidate, that candidate is
+    recorded as unscored — no validity points (not 0.0), no invented rows —
+    and the bracket round names the peer that produced no cell."""
+
+    def test_two_seats_where_one_judge_is_silent(self):
+        class SilentJudge(FakeSeat):
+            def judge(self, packet, rubric):
+                self.calls += 1
+                return None
+
+        self.markers.update({"seat-a": "m-a", "seat-b": "m-b"})
+        executors = {
+            "seat-a": FakeSeat("seat-a", "fam-a", "m-a", {"m-a": 9.0, "m-b": 8.0}),
+            "seat-b": SilentJudge("seat-b", "fam-b", "m-b", {}),
+        }
+        self.panel("seat-a", "seat-b", [], ["seat-a", "seat-b"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        # seat-a judged seat-b's candidate (8.0 -> passes); seat-b judged
+        # nothing, so seat-a's own candidate has no cell from anyone.
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(self.store.get_candidate(result["winner"])["expert_id"], "seat-b")
+        verdict = self.store.latest_verdict("ctr_fake")
+        a_cand = next(c for c in self.store.candidates_for("ctr_fake") if c["expert_id"] == "seat-a")
+        entry = verdict["judged"][a_cand["id"]]
+        self.assertIsNone(entry["median_mean"])
+        self.assertFalse(entry["pass"])
+        self.assertFalse(entry["scored"])
+        rounds = verdict["judged"]["bracket"]["rounds"]
+        self.assertEqual(rounds[0]["peers_without_cells"], ["seat-b"])
+        note = next(n for n in (r["note"] or "" for r in self.store.ledger_rows())
+                    if n.startswith("bracket round 1"))
+        self.assertIn("peers_without_cells=['seat-b']", note)
+        summary = {r["expert_id"]: r for r in self.store.ledger_summary()}
+        self.assertIsNone(summary["seat-a"]["validity_points"])        # nothing invented
+        self.assertAlmostEqual(summary["seat-b"]["validity_points"], 8.0)  # the one recorded median
+        self.assertNotIn("validity_points=0.0", ledger_report(self.store))
+
+
 class TestLowConfidence(LoopV03Base):
     def test_uniform_low_confidence_escalates(self):
         self.markers.update({"gen-a": "m-a", "gen-b": "m-b", "gen-c": "m-c"})

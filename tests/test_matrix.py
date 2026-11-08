@@ -582,6 +582,71 @@ class TestComputeCalibration(unittest.TestCase):
                 store.close()
 
 
+class TestUnscoredCandidateIsRecordedAsUnscored(unittest.TestCase):
+    """Phase 3 live-run finding (2026-11-07): in the two-seat Phase A matrix
+    one peer produced no valid cell for the other's candidate, and the
+    verdict recorded that candidate with median 0.0, every row 0.0 and
+    confidence 0.0 — numbers nobody measured — while the ledger credited
+    0.0 validity points. An unscored candidate has no median, cannot pass,
+    and the round names the peer that produced no cell."""
+
+    def test_no_cells_means_none_not_zero(self):
+        import tempfile as _tempfile
+
+        from hybrid_critic_loop.matrix import run_matrix
+        from hybrid_critic_loop.state import Store
+
+        class Silent:
+            expert_id, family = "judge-silent", "fam-s"
+
+            def judge(self, packet, rubric):
+                return None  # no verdict at all
+
+        class Scores:
+            expert_id, family = "judge-ok", "fam-o"
+
+            def judge(self, packet, rubric):
+                # Scores only the first label it sees; the other candidate
+                # gets no cell from anyone.
+                import re as _re
+
+                labels = _re.findall(r"=== CANDIDATE ([A-Za-z]+) ===", packet or "")
+                if not labels:
+                    return None
+                first = labels[0]
+                return {first: {"items": {row: {"score": 8, "confidence": 0.9,
+                                                 "evidence": "packet", "rationale": "ok"}
+                                          for row in ["question_fidelity", "completeness",
+                                                      "evidence", "test_agreement"]}}}
+
+        cands = [{"id": "cand-a", "expert_id": "gen-a", "family": "fam-a"},
+                 {"id": "cand-b", "expert_id": "gen-b", "family": "fam-b"}]
+        diffs = {"cand-a": "+a\n", "cand-b": "+b\n"}
+        with _tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td) / "data.db")
+            try:
+                outcome = run_matrix(store, {"id": "ctr", "acceptance": []}, cands, {}, diffs,
+                                     {"judge-ok": Scores(), "judge-silent": Silent()},
+                                     min_score=6.0)
+            finally:
+                store.close()
+        scored = [cid for cid, e in outcome.per_candidate.items() if e["median_mean"] is not None]
+        unscored = [cid for cid, e in outcome.per_candidate.items() if e["median_mean"] is None]
+        self.assertEqual(len(scored), 1, outcome.per_candidate)
+        self.assertEqual(len(unscored), 1, outcome.per_candidate)
+        entry = outcome.per_candidate[unscored[0]]
+        self.assertFalse(entry["pass"])
+        self.assertFalse(entry["scored"])
+        self.assertIsNone(entry["min_row"])
+        self.assertIsNone(entry["spread"])
+        self.assertIsNone(entry["mean_confidence"])
+        self.assertTrue(all(v is None for v in entry["rows"].values()))
+        self.assertEqual(entry["peers"], [])
+        self.assertTrue(outcome.per_candidate[scored[0]]["scored"])
+        self.assertFalse(outcome.escalated)          # no spread/confidence invented for it
+        self.assertEqual(outcome.peers_used, ["judge-ok"])  # the silent peer is not a user
+
+
 class TestGateCitation(unittest.TestCase):
     """Fix pass Wave 2.10 (review 1B-17): a hard-gate citation needs the
     command itself or a path-like token of it — plain words such as 'tests'
