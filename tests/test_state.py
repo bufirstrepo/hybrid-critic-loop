@@ -885,5 +885,43 @@ class TestLessonsForDomainFamily(StoreTestCase):
         self.assertEqual(domain_match("code", None), 0)
 
 
+class TestStoreIsThreadSafe(StoreTestCase):
+    """Hermes runs hooks and tool handlers on worker threads against one Store
+    (fix pass Wave 2.6, review H8)."""
+
+    def test_writes_from_worker_threads_succeed_and_ids_stay_unique(self):
+        import threading
+
+        errors = []
+
+        def worker(i):
+            try:
+                for j in range(20):
+                    self.store.create_lesson(
+                        contract_id=f"c{i}-{j}", domain="code", tags=[], outcome="o",
+                        cause="c", rule=f"r{i}-{j}", route_change=None, evidence=[],
+                        written_to="plugin_store")
+            except Exception as exc:  # noqa: BLE001 - collected for the assertion
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        rows = self.store.lessons_for(domain="code", limit=None)
+        self.assertEqual(len(rows), 80)
+        self.assertEqual(len({r["id"] for r in rows}), 80)
+
+    def test_set_verdict_human_gate_records_the_decision(self):
+        cid = self._contract()
+        vid = self.store.create_verdict(
+            cid, 1, "w", [], "pass", "pass", None, False, None, None, "pending", None)
+        self.assertEqual(self.store.latest_verdict(cid)["human_gate"], "pending")
+        self.store.set_verdict_human_gate(vid, "rejected")
+        self.assertEqual(self.store.latest_verdict(cid)["human_gate"], "rejected")
+
+
 if __name__ == "__main__":
     unittest.main()

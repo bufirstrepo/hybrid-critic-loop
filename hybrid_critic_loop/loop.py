@@ -1014,7 +1014,18 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
     result = dict(_result or {"contract_id": contract_id})
     result["human_gate"] = decision
 
+    def _record_decision(value):
+        # The decision is a verdict-row fact (fix pass Wave 2.6, review H5):
+        # once recorded, the gate is no longer pending and cannot be replayed.
+        setter = getattr(store, "set_verdict_human_gate", None)
+        if callable(setter):
+            try:
+                setter(verdict["id"], value)
+            except Exception:  # noqa: BLE001 - bookkeeping must not undo a decision
+                pass
+
     if decision == "rejected":
+        _record_decision("rejected")
         new_id = f"{contract_id}_rej{verdict['attempt']}"
         if store.get_contract(new_id) is None:
             store.create_contract(
@@ -1058,6 +1069,7 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
         commit=f"git:{merged_sha}",
         intent_check=None, human_gate=decision,
     )
+    _record_decision(decision)
     store.set_contract_status(contract_id, "completed")
     result.update({"status": "completed", "commit": f"git:{merged_sha}",
                    "winner_commit": f"git:{commit}", "waiver": waiver_record})

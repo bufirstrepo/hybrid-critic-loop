@@ -148,6 +148,25 @@ class TestRunOne(LoopTestBase):
         self.assertEqual(done["status"], "completed")
         merged = (self.repo / "src" / "speed_sampler.py").read_text()
         self.assertNotIn("NotImplementedError", merged)
+        # The decision is a verdict-row fact and the gate cannot be replayed
+        # (fix pass Wave 2.6, review H5).
+        self.assertEqual(self.store.latest_verdict("ctr_demo_1")["human_gate"], "approved")
+        again = loop_mod.record_human_gate(self.store, "ctr_demo_1", "approved")
+        self.assertEqual(again["status"], "error")
+        self.assertIn("no pending human gate", again["detail"])
+
+    def test_rejection_is_recorded_and_cannot_be_overturned_by_a_later_approval(self):
+        contract = load_contract_file(ROOT / "contracts" / "demo1.json")
+        result = loop_mod.run_contract(
+            self.store, contract, self.repo, _local_executors(), human_decider=None
+        )
+        self.assertEqual(result["status"], "awaiting_human_gate")
+        rejected = loop_mod.record_human_gate(self.store, "ctr_demo_1", "rejected", "not this one")
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(self.store.latest_verdict("ctr_demo_1")["human_gate"], "rejected")
+        replay = loop_mod.record_human_gate(self.store, "ctr_demo_1", "approved")
+        self.assertEqual(replay["status"], "error")
+        self.assertIn("NotImplementedError", (self.repo / "src" / "speed_sampler.py").read_text())
 
 
 class TestRepositoryPathWithWhitespace(unittest.TestCase):

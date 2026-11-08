@@ -383,6 +383,42 @@ _CRITIC_LEDGER_SCHEMA = {
     "properties": {},
 }
 
+_CRITIC_GATE_SCHEMA = {
+    "description": (
+        "Complete the human gate of a contract whose run ended awaiting it: "
+        "approve merges the winner, reject opens a follow-up contract carrying "
+        "the rejection, waive accepts a measured-gate failure (never a hard one). "
+        "The decision is recorded on the verdict and cannot be replayed."
+    ),
+    "type": "object",
+    "properties": {
+        "contract_id": {"type": "string", "description": "Contract whose human gate is pending."},
+        "decision": {
+            "type": "string",
+            "enum": ["approved", "rejected", "waived"],
+            "description": "The human's decision.",
+        },
+        "reason": {"type": "string", "description": "Optional reason, recorded with a rejection."},
+    },
+    "required": ["contract_id", "decision"],
+}
+
+
+def _tool_schema(name: str, raw: dict) -> dict:
+    """The schema shape Hermes serialises into the provider request:
+    ``{"name", "description", "parameters": {JSON Schema object}}``.
+    Without the ``parameters`` block the model is shown an argument-less
+    tool (fix pass Wave 2.6, review H9)."""
+    return {
+        "name": name,
+        "description": raw.get("description", ""),
+        "parameters": {
+            "type": "object",
+            "properties": dict(raw.get("properties") or {}),
+            "required": list(raw.get("required") or []),
+        },
+    }
+
 
 def register(ctx):
     """Register tools, the /critic command, the `hermes critic` CLI, hooks."""
@@ -410,6 +446,21 @@ def register(ctx):
             from . import loop as loop_mod
         except Exception as exc:
             return json.dumps({"error": f"loop module not available: {exc}"})
+        # A decision for a contract whose run already ended awaiting the
+        # human gate completes that gate instead of re-dispatching the
+        # panel (fix pass Wave 2.6, review H11).
+        contract_id = contract.get("id") if isinstance(contract, dict) else None
+        if args.get("human_gate") and contract_id:
+            pending = None
+            try:
+                pending = store.latest_verdict(contract_id)
+            except Exception:  # noqa: BLE001
+                pending = None
+            if pending and pending.get("human_gate") == "pending":
+                result = loop_mod.record_human_gate(
+                    store, contract_id, args["human_gate"], args.get("reason")
+                )
+                return json.dumps(result, default=str)
         try:
             executors = _build_executors(args.get("executors", "live"))
         except Exception as exc:
@@ -457,22 +508,37 @@ def register(ctx):
                 payload["events"] = []
         return json.dumps(payload, default=str)
 
-    ctx.register_tool(
-        name="critic_run", toolset="hybrid_critic_loop",
-        schema=_CRITIC_RUN_SCHEMA, handler=critic_run_handler,
-    )
-    ctx.register_tool(
-        name="critic_matrix", toolset="hybrid_critic_loop",
-        schema=_CRITIC_MATRIX_SCHEMA, handler=critic_matrix_handler,
-    )
-    ctx.register_tool(
-        name="critic_lessons", toolset="hybrid_critic_loop",
-        schema=_CRITIC_LESSONS_SCHEMA, handler=critic_lessons_handler,
-    )
-    ctx.register_tool(
-        name="critic_ledger", toolset="hybrid_critic_loop",
-        schema=_CRITIC_LEDGER_SCHEMA, handler=critic_ledger_handler,
-    )
+    def critic_gate_handler(args):
+        args = args or {}
+        contract_id = args.get("contract_id")
+        decision = args.get("decision")
+        if not contract_id or not decision:
+            return json.dumps({"error": "contract_id and decision are required"})
+        try:
+            from . import loop as loop_mod
+        except Exception as exc:
+            return json.dumps({"error": f"loop module not available: {exc}"})
+        result = loop_mod.record_human_gate(store, contract_id, decision, args.get("reason"))
+        return json.dumps(result, default=str)
+
+    def _register(name, raw_schema, handler):
+        schema = _tool_schema(name, raw_schema)
+        try:
+            ctx.register_tool(
+                name=name, toolset="hybrid_critic_loop", schema=schema,
+                handler=handler, description=schema["description"],
+            )
+        except TypeError:
+            # Older ctx surfaces take no description keyword.
+            ctx.register_tool(
+                name=name, toolset="hybrid_critic_loop", schema=schema, handler=handler,
+            )
+
+    _register("critic_run", _CRITIC_RUN_SCHEMA, critic_run_handler)
+    _register("critic_matrix", _CRITIC_MATRIX_SCHEMA, critic_matrix_handler)
+    _register("critic_lessons", _CRITIC_LESSONS_SCHEMA, critic_lessons_handler)
+    _register("critic_ledger", _CRITIC_LEDGER_SCHEMA, critic_ledger_handler)
+    _register("critic_gate", _CRITIC_GATE_SCHEMA, critic_gate_handler)
 
     # -- slash command -------------------------------------------------------
     def critic_command(raw_args="", **kw):
@@ -485,6 +551,7 @@ def register(ctx):
             return (
                 "critic — Hybrid Critic Loop\n"
                 "  critic run <contract.json> [repo_path]\n"
+                "  critic gate <contract_id> approve|reject|waive [reason]\n"
                 "  critic lessons [domain]\n"
                 "  critic ledger"
             )
@@ -507,12 +574,28 @@ def register(ctx):
                     "tool with human_gate set, or the CLI."
                 )
             return rendered
+        if sub == "gate":
+            if len(parts) < 3:
+                return "usage: critic gate <contract_id> approve|reject|waive [reason]"
+            decision = {
+                "approve": "approved", "approved": "approved",
+                "reject": "rejected", "rejected": "rejected",
+                "waive": "waived", "waived": "waived",
+            }.get(parts[2].lower(), parts[2])
+            reason = " ".join(parts[3:]) or None
+            out = critic_gate_handler(
+                {"contract_id": parts[1], "decision": decision, "reason": reason}
+            )
+            try:
+                return json.dumps(json.loads(out), indent=2, default=str)
+            except Exception:
+                return out
         if sub == "lessons":
             domain = parts[1] if len(parts) > 1 else None
             return lessons_report(store, domain=domain)
         if sub == "ledger":
             return ledger_report(store)
-        return f"unknown critic subcommand: {sub} (try: run, lessons, ledger)"
+        return f"unknown critic subcommand: {sub} (try: run, gate, lessons, ledger)"
 
     ctx.register_command(
         "critic",
@@ -521,10 +604,16 @@ def register(ctx):
     )
 
     # -- CLI command -----------------------------------------------------------
-    def cli_setup(subparsers):
-        from .cli import add_parser
+    def cli_setup(target):
+        """Hermes hands the created ``hermes critic`` parser to ``setup_fn``
+        (hermes_cli/main.py: ``cmd_info["setup_fn"](plugin_parser)``); older
+        surfaces and the tests hand a subparsers action. Serve both (fix
+        pass Wave 2.6, review 1C-02)."""
+        from .cli import _add_subcommands, add_parser
 
-        return add_parser(subparsers)
+        if hasattr(target, "add_parser"):
+            return add_parser(target)
+        return _add_subcommands(target.add_subparsers(dest="critic_command"))
 
     def cli_handler(args):
         from .cli import dispatch

@@ -9,7 +9,9 @@ Timestamps are UTC ISO strings.
 """
 
 import json
+import functools
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -285,14 +287,22 @@ def _cost_per_validity_point(validity_points, validity_cost_usd):
 
 
 class Store:
-    """SQLite-backed store for Hybrid Critic Loop state."""
+    """SQLite-backed store for Hybrid Critic Loop state.
+
+    Thread-safe (fix pass Wave 2.6, review H8): Hermes runs hook callbacks
+    and tool handlers on worker threads while one Store serves a whole
+    registration, so the connection is opened with ``check_same_thread=False``
+    and every method runs under one reentrant lock (applied after the class
+    body) — the host's own convention for plugin databases.
+    """
 
     def __init__(self, db_path):
+        self._lock = threading.RLock()
         self.db_path = str(db_path)
         if self.db_path != ":memory:":
             parent = Path(self.db_path).expanduser().parent
             parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path)
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
@@ -661,6 +671,14 @@ class Store:
         if row is None:
             return None
         return self._verdict_dict(row)
+
+    def set_verdict_human_gate(self, verdict_id, decision):
+        """Record the human's decision on the verdict row (fix pass Wave 2.6,
+        review H5): after this the gate is no longer pending."""
+        self._conn.execute(
+            "UPDATE verdicts SET human_gate=? WHERE id=?", (decision, verdict_id),
+        )
+        self._conn.commit()
 
     def set_verdict_route_hold(self, verdict_id, hold):
         """Record a route change held on a degraded verdict (owner floor
@@ -1136,3 +1154,18 @@ class Store:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+
+def _synchronized(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+for _name, _member in list(vars(Store).items()):
+    if _name.startswith("__") or isinstance(_member, (staticmethod, classmethod, property)):
+        continue
+    if callable(_member):
+        setattr(Store, _name, _synchronized(_member))

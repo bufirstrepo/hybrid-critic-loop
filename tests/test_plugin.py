@@ -76,7 +76,7 @@ class TestRegistration(unittest.TestCase):
         plugin.register(ctx)
         self.assertEqual(
             set(ctx.tools),
-            {"critic_run", "critic_matrix", "critic_lessons", "critic_ledger"},
+            {"critic_run", "critic_matrix", "critic_lessons", "critic_ledger", "critic_gate"},
         )
         for entry in ctx.tools.values():
             self.assertTrue(entry["schema"].get("description"))
@@ -96,7 +96,7 @@ class TestRegistration(unittest.TestCase):
         plugin.register(ctx)  # must not raise
         self.assertEqual(
             set(ctx.tools),
-            {"critic_run", "critic_matrix", "critic_lessons", "critic_ledger"},
+            {"critic_run", "critic_matrix", "critic_lessons", "critic_ledger", "critic_gate"},
         )
         self.assertGreater(len(plugin.REGISTRATION_NOTES), before)
         self.assertTrue(
@@ -399,7 +399,7 @@ class TestDocsMatchTheCode(unittest.TestCase):
         self.assertEqual(items(catalog, "provides_hooks"), items(manifest, "provides_hooks"))
         self.assertEqual(
             items(manifest, "provides_tools"),
-            ["critic_run", "critic_matrix", "critic_lessons", "critic_ledger"],
+            ["critic_run", "critic_matrix", "critic_lessons", "critic_ledger", "critic_gate"],
         )
 
     def test_readme_hcl_example_parses_with_the_real_parser(self):
@@ -469,6 +469,93 @@ class TestDemoNarration(unittest.TestCase):
         self.assertNotIn("expected here", text)
         quiet = demo.phase_a_outcome_lines({"status": "completed"}, [])
         self.assertEqual(quiet[0], "Phase A outcome (recorded): status=completed")
+
+
+class TestHostSurface(unittest.TestCase):
+    """What Hermes actually does with our registrations (fix pass Wave 2.6):
+    schemas carry a parameters block, a pending human gate can be completed
+    through a tool, critic_run with a decision completes the gate instead
+    of re-dispatching, and setup_fn accepts the parser Hermes hands it."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"HCL_DATA_DIR": self._tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.ctx = FakeCtx()
+        self.store = plugin.register(self.ctx)
+
+    def test_tool_schemas_carry_a_parameters_block(self):
+        for name, entry in self.ctx.tools.items():
+            schema = entry["schema"]
+            self.assertEqual(schema["name"], name)
+            self.assertTrue(schema["description"])
+            params = schema["parameters"]
+            self.assertEqual(params["type"], "object")
+            self.assertIsInstance(params["properties"], dict)
+            self.assertIsInstance(params["required"], list)
+            self.assertNotIn("properties", schema)  # no stray top-level JSON-Schema keys
+        self.assertEqual(self.ctx.tools["critic_run"]["schema"]["parameters"]["required"], ["repo_path"])
+        self.assertIn("contract_id", self.ctx.tools["critic_gate"]["schema"]["parameters"]["properties"])
+        self.assertEqual(
+            self.ctx.tools["critic_gate"]["schema"]["parameters"]["properties"]["decision"]["enum"],
+            ["approved", "rejected", "waived"],
+        )
+
+    def test_critic_gate_without_a_pending_gate_is_an_error_not_a_crash(self):
+        handler = self.ctx.tools["critic_gate"]["handler"]
+        self.assertIn("required", json.loads(handler({"contract_id": "ctr-x"}))["error"])
+        out = json.loads(handler({"contract_id": "ctr-none", "decision": "approved"}))
+        self.assertEqual(out["status"], "error")
+        self.assertIn("no pending human gate", out["detail"])
+
+    def test_critic_gate_routes_to_record_human_gate(self):
+        with mock.patch("hybrid_critic_loop.loop.record_human_gate",
+                        return_value={"contract_id": "ctr_x", "status": "completed"}) as rec:
+            out = json.loads(self.ctx.tools["critic_gate"]["handler"](
+                {"contract_id": "ctr_x", "decision": "waived", "reason": "measured only"}))
+        self.assertEqual(out["status"], "completed")
+        rec.assert_called_once_with(self.store, "ctr_x", "waived", "measured only")
+
+    def test_critic_run_with_a_decision_completes_a_pending_gate_instead_of_rerunning(self):
+        self.store.create_verdict(
+            "ctr_demo_1", 1, "ctr_demo_1_c", [], "pass", "pass", None, False, None, None,
+            "pending", "single_passer")
+        with mock.patch("hybrid_critic_loop.loop.record_human_gate",
+                        return_value={"contract_id": "ctr_demo_1", "status": "completed"}) as rec, \
+                mock.patch("hybrid_critic_loop.loop.run_contract") as run:
+            out = json.loads(self.ctx.tools["critic_run"]["handler"]({
+                "contract_path": str(self.ROOT / "contracts" / "demo1.json"),
+                "repo_path": "/nonexistent/repo", "human_gate": "approved",
+            }))
+        self.assertEqual(out["status"], "completed")
+        rec.assert_called_once_with(self.store, "ctr_demo_1", "approved", None)
+        run.assert_not_called()
+
+    def test_slash_gate_subcommand_maps_the_verbs(self):
+        handler = self.ctx.commands["critic"]["handler"]
+        self.assertIn("usage: critic gate", handler("gate ctr_x"))
+        with mock.patch("hybrid_critic_loop.loop.record_human_gate",
+                        return_value={"contract_id": "ctr_x", "status": "rejected"}) as rec:
+            rendered = handler("gate ctr_x reject too slow for the hot loop")
+        self.assertIn('"status": "rejected"', rendered)
+        rec.assert_called_once_with(self.store, "ctr_x", "rejected", "too slow for the hot loop")
+        self.assertIn("critic gate <contract_id>", handler(""))
+
+    def test_cli_setup_accepts_the_parser_hermes_hands_it(self):
+        import argparse
+
+        setup_fn = self.ctx.cli_commands["critic"]["setup_fn"]
+        plugin_parser = argparse.ArgumentParser(prog="hermes critic")   # what hermes_cli/main.py passes
+        setup_fn(plugin_parser)
+        args = plugin_parser.parse_args(["gate", "ctr_x", "approved", "--reason", "fine"])
+        self.assertEqual(args.critic_command, "gate")
+        self.assertEqual((args.contract_id, args.decision, args.reason), ("ctr_x", "approved", "fine"))
+        args = plugin_parser.parse_args(["run", "c.json", "--repo", ".", "--approve"])
+        self.assertEqual(args.critic_command, "run")
 
 
 class TestCliModule(unittest.TestCase):

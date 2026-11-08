@@ -18,6 +18,7 @@ capabilities:
     - critic_matrix
     - critic_lessons
     - critic_ledger
+    - critic_gate
   provides_hooks:
     - on_session_start
     - pre_llm_call

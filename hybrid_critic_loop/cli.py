@@ -3,6 +3,7 @@
 Usage:
     python -m hybrid_critic_loop.cli run <contract.json> --repo PATH \
         [--executors live|local] [--approve|--reject|--waive] [--data-dir PATH]
+    python -m hybrid_critic_loop.cli gate <contract_id> approved|rejected|waived [--reason R] [--data-dir PATH]
     python -m hybrid_critic_loop.cli lessons [--domain D] [--tags a,b] [--data-dir PATH]
     python -m hybrid_critic_loop.cli ledger [--data-dir PATH]
     python -m hybrid_critic_loop.cli session-start [--domain D] [--data-dir PATH]
@@ -104,6 +105,18 @@ def _cmd_run(contract_path, repo, executors_spec, gate, data_dir) -> int:
     return 0
 
 
+def _cmd_gate(contract_id, decision, reason, data_dir) -> int:
+    """Complete a pending human gate (fix pass Wave 2.6, review H11)."""
+    from . import loop as loop_mod
+    from .reports import verdict_report
+
+    store, data_dir = _open(data_dir)
+    result = loop_mod.record_human_gate(store, contract_id, decision, reason)
+    print(json.dumps(result, indent=2, default=str))
+    print(verdict_report(store, contract_id))
+    return 1 if result.get("status") == "error" else 0
+
+
 def _cmd_lessons(domain, tags_value, limit, data_dir) -> int:
     from .reports import lessons_report
 
@@ -157,6 +170,14 @@ def _add_subcommands(subparsers):
                       const="waived", help="waive the human gate")
     run_p.add_argument("--data-dir", default=None)
 
+    gate_p = subparsers.add_parser(
+        "gate", help="complete a pending human gate: approve, reject or waive"
+    )
+    gate_p.add_argument("contract_id", help="contract whose human gate is pending")
+    gate_p.add_argument("decision", choices=["approved", "rejected", "waived"])
+    gate_p.add_argument("--reason", default=None, help="recorded with a rejection")
+    gate_p.add_argument("--data-dir", default=None)
+
     lessons_p = subparsers.add_parser("lessons", help="list stored lessons")
     lessons_p.add_argument("--domain", default=None)
     lessons_p.add_argument("--tags", default=None, help="comma-separated tags")
@@ -198,6 +219,10 @@ def dispatch(args, data_dir=None) -> int:
                 getattr(args, "executors", "live"), getattr(args, "gate", None),
                 effective_dir,
             )
+        if sub == "gate":
+            return _cmd_gate(
+                args.contract_id, args.decision, getattr(args, "reason", None), effective_dir,
+            )
         if sub == "lessons":
             return _cmd_lessons(
                 getattr(args, "domain", None), getattr(args, "tags", None),
@@ -210,7 +235,7 @@ def dispatch(args, data_dir=None) -> int:
     except Exception as exc:  # CLI boundary: errors are exit 1, not tracebacks
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    print("error: no critic subcommand given (run|lessons|ledger|session-start)",
+    print("error: no critic subcommand given (run|gate|lessons|ledger|session-start)",
           file=sys.stderr)
     return 1
 

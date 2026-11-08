@@ -69,7 +69,7 @@ A **validity point** is one point of final validity score from the matrix (the c
 3. **Panel generation.** One candidate per available panel family, each in its own git worktree (`wt/<contract>/<slot>`, branch `critic/<contract>/<slot>`), each carrying provenance (`generated`) and evidence (run-log hash, provider request ids where reported). A mock or human-supplied artifact can never pass a gate.
 4. **Gates, in rank order.** Hard, then measured, then the matrix. When the anchor leaves exactly one survivor there is no contest to score and the anchor's decision stands; fields of two or more go to the bracket. Hard/measured failure retries with the error log attached (attempt cap 3, then escalate). A seat that refuses or is unavailable is simply out of that contest — every seat is already dispatched, so there is nobody left to re-dispatch to — and the ledger records it.
 5. **Events.** Exactly four event types ever reach the operator: spread over threshold, budget exhaustion, retry cap, and the human gate. They are surfaced in the run result and the events log — a durable events table readable via `critic_ledger` — not via any phone or agent-room ping (no such plugin API exists).
-6. **Human gate.** The one surviving answer is presented for approval. Approval merges its worktree into the main tree and keeps the losers as branches for inspection. Rejection starts a new contract with the rejection recorded as a constraint. A human may waive a *measured* failure only — never a hard one.
+6. **Human gate.** The one surviving answer is presented for approval; a run that ends `awaiting_human_gate` is completed later through the `critic_gate` tool, `/critic gate <contract_id> approve|reject|waive`, or `hermes critic gate`. Approval merges its worktree into the main tree and keeps the losers as branches for inspection. Rejection starts a new contract with the rejection recorded as a constraint. A human may waive a *measured* failure only — never a hard one. The decision is recorded on the verdict row, so a gate cannot be decided twice.
 7. **Lesson writeback.** At the verdict, a Lesson is written from the deciding gate's own evidence — the failing measurement or hard-gate rows, never an invented cause — and its route change is applied (the losing expert is demoted for that task category) unless the verdict's panel is degraded, in which case the change is recorded and held for the operator (see Panel floor). On the next session's first turn, lessons for the session's domain family are injected into context under the real `pre_llm_call` cap (10,000 characters): ranked by domain match (the exact domain first, then sub-domains and ancestors along the dotted path — siblings are excluded), then tag overlap, then newest; the block is filled to the cap on lesson boundaries and states how many lessons the cap dropped. Hermes passes the hook no domain, so the default `code` family applies and every `code.*` lesson is eligible.
 
 ## Install
@@ -93,9 +93,9 @@ hcl run contract.json --repo /path/to/repo --approve --data-dir ./hcl-data
 
 In Hermes:
 
-- Slash command: `/critic run <contract.json> [repo_path]`, `/critic lessons [domain]`, `/critic ledger`
-- CLI: `hermes critic run|lessons|ledger|session-start`
-- Tools (for the agent itself): `critic_run`, `critic_matrix` (the validity matrix for a contract: every peer's score per criterion, confidence, dissent flags), `critic_lessons`, `critic_ledger` (dispatches, tokens, cost, win rate, cost per validity point, and the events log)
+- Slash command: `/critic run <contract.json> [repo_path]`, `/critic gate <contract_id> approve|reject|waive [reason]`, `/critic lessons [domain]`, `/critic ledger`
+- CLI: `hermes critic run|gate|lessons|ledger|session-start`
+- Tools (for the agent itself): `critic_run`, `critic_gate` (complete a pending human gate: approve, reject or waive), `critic_matrix` (the validity matrix for a contract: every peer's score per criterion, confidence, dissent flags), `critic_lessons`, `critic_ledger` (dispatches, tokens, cost, win rate, cost per validity point, and the events log)
 
 `hermes critic run` prints the run result and the verdict report; `critic_matrix` returns the matrix and the bracket block for a contract; the demo script prints all of it, round by round. Lessons are retrievable with `critic_lessons` and are injected automatically on a session's first turn for the session's domain family (Hermes passes no domain to the hook, so the default `code` family applies).
 
@@ -140,7 +140,7 @@ One deviation from the original design document, stated plainly: the design call
 | Matrix | `matrix.py`, `bracket.py` | The peer validity matrix (self-cells stripped in code, calibration × confidence weighting, dissent + gate re-run requests, calibration from history) and the step-down bracket (pure cuts over recorded scores) |
 | State | `state.py` | SQLite store with the twelve domain objects: targets, contracts, candidates, measurements, scores, verdicts, final_answers, experts, routes, ledger, lessons, events |
 | Memory | `lessons.py`, `router.py` | Evidence-derived Lesson writing, route-table updates from verdicts (panel + scoring carried on the route), session lesson ranking/injection |
-| Surface | `plugin.py`, `hooks.py`, `cli.py`, `loop.py`, `reports.py` | Hermes registration (4 tools, `/critic`, `hermes critic`, 4 hooks), the queue/orchestration loop, DB-only reporting |
+| Surface | `plugin.py`, `hooks.py`, `cli.py`, `loop.py`, `reports.py` | Hermes registration (5 tools, `/critic`, `hermes critic`, 4 hooks), the queue/orchestration loop, DB-only reporting |
 
 Reports print only database rows; anything absent prints as `not run` or `not reported` — token and cost totals are never estimated.
 
