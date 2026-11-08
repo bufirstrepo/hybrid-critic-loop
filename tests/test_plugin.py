@@ -225,6 +225,18 @@ class TestRegistration(unittest.TestCase):
         result = ctx.hooks["pre_llm_call"]()
         self.assertIsNotNone(result)
         self.assertIn("hook rule abc", result["context"])
+        # Hermes passes is_first_turn: later turns inject nothing (Wave 2.3).
+        self.assertIsNone(ctx.hooks["pre_llm_call"](is_first_turn=False))
+        self.assertIn("hook rule abc", ctx.hooks["pre_llm_call"](is_first_turn=True)["context"])
+        # The host passes no domain; the default 'code' family must still
+        # reach a lesson written under a dotted domain (H10).
+        store.create_lesson(
+            contract_id="seed-2", domain="code.game", tags=[],
+            outcome="o", cause="c", rule="dotted domain rule",
+            route_change=None, evidence=["verdict:seed-2"],
+            written_to="plugin_store", provenance="generated",
+        )
+        self.assertIn("dotted domain rule", ctx.hooks["pre_llm_call"]()["context"])
         # Observers accept kwargs and stay quiet with no open contract.
         ctx.hooks["on_session_start"](domain="code", session_id="s1")
         session_file = Path(self._tmp.name) / "session.json"
@@ -404,6 +416,13 @@ class TestDocsMatchTheCode(unittest.TestCase):
         self.assertEqual(args.contract, "contract.json")
         self.assertEqual(args.gate, "approved")
         self.assertEqual(args.data_dir, "./hcl-data")
+
+    def test_readme_describes_the_injection_rule_as_implemented(self):
+        readme = self._read("README.md")
+        self.assertIn("the exact domain first, then sub-domains and ancestors", readme)
+        self.assertIn("states how many lessons the cap dropped", readme)
+        self.assertIn("on a session's first turn", readme)
+        self.assertNotIn("injected automatically at session start for the session's domain.", readme)
 
     def test_readme_slash_usage_matches_the_handler_help(self):
         readme = self._read("README.md")

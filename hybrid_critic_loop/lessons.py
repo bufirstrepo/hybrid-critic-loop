@@ -215,11 +215,15 @@ def _lesson_line(lesson):
     return f"- [lsn {lesson_id}] RULE: {rule} (from: {outcome}; evidence: {evidence_text})"
 
 
-def lessons_context(store, domain, tags=None, limit=5, max_chars=10000):
+def lessons_context(store, domain, tags=None, limit=None, max_chars=10000):
     """Render prior lessons as injectable context, capped at ``max_chars``.
 
-    Returns "" when there are no lessons.  Truncation happens on a lesson
-    boundary; when lessons are dropped a note says how many were not shown.
+    The store ranks the lessons (domain match — exact first, then the same
+    family — then tag overlap, then newest); with the default ``limit=None``
+    every matching lesson is fetched and the block is filled to the cap on
+    lesson boundaries, so the closing note counts the lessons the cap really
+    dropped, not a fetch window (fix pass Wave 2.3, packet F4). Returns ""
+    when there are no lessons.
     """
     try:
         lessons = store.lessons_for(domain=domain, tags=tags, limit=limit)

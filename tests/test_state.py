@@ -825,5 +825,65 @@ class TestVerdictHoldMigration(unittest.TestCase):
             tmp.cleanup()
 
 
+class TestLessonsForDomainFamily(StoreTestCase):
+    """lessons_for ranks by domain match — exact first, then the same family
+    (sub-domains and ancestors along the dotted path), siblings excluded —
+    then tag overlap, then newest (fix pass Wave 2.3, H10 / F4)."""
+
+    def _lesson(self, domain, rule, tags=()):
+        return self.store.create_lesson(
+            contract_id=f"c-{rule}", domain=domain, tags=list(tags), outcome="o",
+            cause="c", rule=rule, route_change=None, evidence=["verdict:c"],
+            written_to="plugin_store")
+
+    def setUp(self):
+        super().setUp()
+        self._lesson("code", "parent-rule")
+        self._lesson("code.game", "game-rule-old")
+        self._lesson("code.game", "game-rule-tagged", tags=["hot-loop"])
+        self._lesson("code.web", "web-rule")
+        self._lesson("ops", "ops-rule")
+
+    def rules(self, **kw):
+        return [l["rule"] for l in self.store.lessons_for(**kw)]
+
+    def test_requested_parent_sees_its_subdomains_after_exact(self):
+        self.assertEqual(
+            self.rules(domain="code", limit=None),
+            ["parent-rule", "web-rule", "game-rule-tagged", "game-rule-old"],
+        )  # exact first; family newest-first (ids ascend with time)
+
+    def test_requested_subdomain_sees_exact_then_ancestor_never_siblings(self):
+        rules = self.rules(domain="code.game", limit=None)
+        self.assertEqual(rules[:2], ["game-rule-tagged", "game-rule-old"])
+        self.assertEqual(rules[2], "parent-rule")
+        self.assertNotIn("web-rule", rules)
+        self.assertNotIn("ops-rule", rules)
+
+    def test_tags_rank_within_the_same_domain_match(self):
+        self.assertEqual(
+            self.rules(domain="code.game", tags=["hot-loop"], limit=None)[0], "game-rule-tagged")
+        self.assertEqual(
+            self.rules(domain="code", tags=["hot-loop"], limit=None)[:2],
+            ["parent-rule", "game-rule-tagged"],  # exact beats tag overlap; then the tagged family lesson
+        )
+
+    def test_none_matches_everything_and_limit_applies_after_ranking(self):
+        self.assertEqual(len(self.rules(domain=None, limit=None)), 5)
+        self.assertEqual(self.rules(domain="code", limit=2), ["parent-rule", "web-rule"])
+        self.assertEqual(self.rules(domain="finance", limit=None), [])
+
+    def test_domain_match_ranks(self):
+        from hybrid_critic_loop.state import domain_match
+
+        self.assertEqual(domain_match("code", "code"), 2)
+        self.assertEqual(domain_match("code", "code.game"), 1)
+        self.assertEqual(domain_match("code.game", "code"), 1)
+        self.assertEqual(domain_match("code.game", "code.web"), 0)
+        self.assertEqual(domain_match("code", "coders"), 0)
+        self.assertEqual(domain_match(None, "anything"), 1)
+        self.assertEqual(domain_match("code", None), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

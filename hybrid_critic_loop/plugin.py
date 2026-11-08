@@ -123,12 +123,25 @@ class _FallbackStore:
         return None
 
     def lessons_for(self, domain=None, tags=None, limit=5):
-        rows = [l for l in self._lessons if domain is None or l["domain"] == domain]
+        # Same ranking rule as state.Store.lessons_for: exact domain first,
+        # then the same family (sub-domains and ancestors), then tag
+        # overlap, then newest; siblings excluded.
+        def rank(actual):
+            if domain is None:
+                return 1
+            if actual == domain:
+                return 2
+            if actual and (str(actual).startswith(f"{domain}.")
+                           or str(domain).startswith(f"{actual}.")):
+                return 1
+            return 0
+
+        rows = [l for l in self._lessons if rank(l["domain"])]
         wanted = set(tags or [])
 
         def key(lesson):
             overlap = len(wanted.intersection(lesson["tags"]))
-            return (overlap, lesson["id"])
+            return (rank(lesson["domain"]), overlap, lesson["id"])
 
         rows.sort(key=key, reverse=True)
         return rows[:limit] if limit is not None else rows
@@ -322,8 +335,9 @@ _CRITIC_RUN_SCHEMA = {
 _CRITIC_LESSONS_SCHEMA = {
     "description": (
         "Fetch verified lessons from prior Hybrid Critic Loop runs for a "
-        "domain, ranked by tag overlap, newest first. Use these to avoid "
-        "repeating measured failures from earlier contracts."
+        "domain family (the exact domain first, then its sub-domains and "
+        "ancestors), ranked by domain match, tag overlap, newest first. Use "
+        "these to avoid repeating measured failures from earlier contracts."
     ),
     "type": "object",
     "properties": {

@@ -258,6 +258,26 @@ def _col(row, name, default=None):
     return row[name]
 
 
+def domain_match(requested, actual):
+    """Rank a lesson's domain against the requested one.
+
+    2 = exact; 1 = same family (``actual`` is a sub-domain or an ancestor of
+    ``requested`` along the dotted path, e.g. ``code`` vs ``code.game``);
+    0 = no match (siblings such as ``code.web`` vs ``code.game``, or
+    unrelated). ``requested=None`` matches every domain at rank 1.
+    """
+    if requested is None:
+        return 1
+    if actual is None:
+        return 0
+    requested, actual = str(requested), str(actual)
+    if actual == requested:
+        return 2
+    if actual.startswith(requested + ".") or requested.startswith(actual + "."):
+        return 1
+    return 0
+
+
 def _cost_per_validity_point(validity_points, validity_cost_usd):
     if validity_cost_usd is not None and validity_points not in (None, 0):
         return validity_cost_usd / validity_points
@@ -1046,20 +1066,27 @@ class Store:
         }
 
     def lessons_for(self, domain=None, tags=None, limit=5):
-        if domain is None:
-            rows = self._all("SELECT * FROM lessons")
-        else:
-            rows = self._all(
-                "SELECT * FROM lessons WHERE domain=?", (domain,))
-        lessons = [self._lesson_dict(r) for r in rows]
+        """Lessons for ``domain``, ranked by domain match, tag overlap, newest.
+
+        Domain match (fix pass Wave 2.3): the exact domain ranks first; a
+        lesson in the same family — a sub-domain of the requested one
+        (``code`` sees ``code.game``) or an ancestor of it (``code.game``
+        sees ``code``) along the dotted path — ranks next; siblings
+        (``code.web`` for ``code.game``) and unrelated domains do not match.
+        ``domain=None`` matches everything. ``limit=None`` returns every
+        match; otherwise the top ``limit`` after ranking.
+        """
+        rows = self._all("SELECT * FROM lessons")
         wanted = set(tags or [])
-
-        def sort_key(lesson):
-            overlap = len(wanted.intersection(lesson["tags"]))
-            # sort desc by overlap, then newest first (created_at, id)
-            return (overlap, lesson["created_at"], lesson["id"])
-
-        lessons.sort(key=sort_key, reverse=True)
+        ranked = []
+        for row in rows:
+            lesson = self._lesson_dict(row)
+            rank = domain_match(domain, lesson.get("domain"))
+            if rank:
+                overlap = len(wanted.intersection(lesson["tags"]))
+                ranked.append(((rank, overlap, lesson["created_at"], lesson["id"]), lesson))
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+        lessons = [lesson for _key, lesson in ranked]
         if limit is not None:
             lessons = lessons[:limit]
         return lessons

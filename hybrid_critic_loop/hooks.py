@@ -47,8 +47,18 @@ def on_session_start(store, data_dir, **kw) -> None:
 
 
 def pre_llm_call(store, data_dir, **kw):
-    """Return {"context": lessons} for this turn, or None. Never raises."""
+    """Return {"context": lessons} for the session's first turn, or None.
+
+    Hermes passes ``is_first_turn``; when it is False nothing is injected
+    (the first turn already carried the lessons into the conversation).
+    Callers that pass no turn information (the CLI, the demo) get the
+    lessons. The domain is the host's ``domain`` kwarg, else the session's
+    recorded domain, else ``code`` — and the store matches the whole domain
+    family, so a ``code`` session sees ``code.game`` lessons. Never raises.
+    """
     try:
+        if kw.get("is_first_turn") is False:
+            return None
         domain = kw.get("domain") or _session_domain(data_dir) or "code"
         tags = kw.get("tags")
         ctx_text = lessons_context(store, domain, tags)

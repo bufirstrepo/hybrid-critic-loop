@@ -520,5 +520,69 @@ class TestHooks(unittest.TestCase):
             self.assertIn("domain: code.game", result["context"])
 
 
+class TestInjectionCapAndTurns(unittest.TestCase):
+    """The injected block is filled to the cap and its note counts the true
+    remainder; pre_llm_call injects on the first turn only when the host says
+    which turn it is; the default domain reaches dotted lessons through the
+    real store (fix pass Wave 2.3: F4, H10, 1C-12)."""
+
+    def _seed(self, store, n, domain="code", rule="short rule"):
+        for i in range(n):
+            store.create_lesson(
+                contract_id=f"c{i}", domain=domain, tags=[], outcome=f"o{i}",
+                cause="x", rule=f"{rule} {i}", route_change=None,
+                evidence=[f"verdict:c{i}"], written_to="plugin_store",
+            )
+
+    def test_all_matching_lessons_are_injected_when_they_fit(self):
+        store = FakeStore()
+        self._seed(store, 7)
+        ctx = lessons.lessons_context(store, "code")
+        self.assertEqual(sum(line.startswith("- [lsn ") for line in ctx.splitlines()), 7)
+        self.assertNotIn("not shown", ctx)
+
+    def test_the_not_shown_note_counts_the_true_remainder(self):
+        store = FakeStore()
+        self._seed(store, 9)
+        line_len = len(lessons._lesson_line(store.lessons_for("code", limit=None)[0]))
+        header = len("## Lessons from prior Hybrid Critic Loop runs (domain: code)")
+        cap = header + 1 + 3 * (line_len + 1) + 70  # room for three lessons and the note
+        ctx = lessons.lessons_context(store, "code", max_chars=cap)
+        shown = sum(line.startswith("- [lsn ") for line in ctx.splitlines())
+        self.assertGreaterEqual(shown, 2)
+        self.assertIn(f"({9 - shown} more lessons not shown", ctx)
+        self.assertLessEqual(len(ctx), cap)
+
+    def test_pre_llm_call_injects_on_the_first_turn_only_when_told(self):
+        store = FakeStore()
+        self._seed(store, 1, rule="first-turn rule")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(hooks.pre_llm_call(store, Path(tmp), is_first_turn=False))
+            self.assertIn("first-turn rule", hooks.pre_llm_call(store, Path(tmp), is_first_turn=True)["context"])
+            self.assertIn("first-turn rule", hooks.pre_llm_call(store, Path(tmp))["context"])
+
+    def test_default_domain_reaches_dotted_lessons_through_the_real_store(self):
+        from hybrid_critic_loop.state import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "data.db")
+            try:
+                store.create_lesson(
+                    contract_id="c1", domain="code.game", tags=["sampler"], outcome="o",
+                    cause="x", rule="ring buffer rule", route_change=None,
+                    evidence=["verdict:c1"], written_to="plugin_store")
+                store.create_lesson(
+                    contract_id="c2", domain="ops", tags=[], outcome="o",
+                    cause="x", rule="ops rule", route_change=None,
+                    evidence=["verdict:c2"], written_to="plugin_store")
+                result = hooks.pre_llm_call(store, Path(tmp))  # no domain: the host never passes one
+                self.assertIsNotNone(result)
+                self.assertIn("ring buffer rule", result["context"])
+                self.assertNotIn("ops rule", result["context"])
+                self.assertIn("(domain: code)", result["context"])
+            finally:
+                store.close()
+
+
 if __name__ == "__main__":
     unittest.main()
