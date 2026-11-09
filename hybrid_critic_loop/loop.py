@@ -2155,9 +2155,20 @@ class _Run:
             else:
                 # Owner ruling 2026-11-09 (Item 1 = A): the router may
                 # only promote a seat that passed the deciding gate.
-                # The passed set is the candidate→expert map minus the
-                # experts whose candidates hard-failed or failed a
-                # measurement on the deciding attempt.
+                # The passed set is scoped to the deciding attempt's
+                # evaluated candidates (round-9 fix spec M1): the
+                # candidate→expert map spans every attempt and also
+                # registers seats that never generated on this attempt
+                # (an unavailable seat's row, a seat that only produced
+                # in an earlier attempt), and none of those faced the
+                # deciding gate. The evaluated candidates are this
+                # attempt's rows whose generation completed — the same
+                # idiom the verdict builders use for the deciding
+                # attempt's scored candidates — mapped through the
+                # expert map, minus the experts whose candidates
+                # hard-failed or failed a measurement on the deciding
+                # attempt. Judged-eliminated candidates stay in the
+                # set: they passed the deciding gates.
                 cand_experts = gate_details.get("candidate_experts") or {}
                 failed_cids = {
                     f.get("candidate_id")
@@ -2168,9 +2179,19 @@ class _Run:
                     for m in gate_details.get("measurements") or []
                     if not m.get("pass", True)
                 }
+                deciding_attempt = attempt
+                if verdict and verdict.get("attempt") is not None:
+                    deciding_attempt = verdict["attempt"]
+                deciding_cids = {
+                    c["id"]
+                    for c in store.candidates_for(
+                        self.contract_id, attempt=deciding_attempt)
+                    if c.get("status") == "completed"
+                }
                 gate_passed = {
-                    exp for cid, exp in cand_experts.items()
-                    if cid not in failed_cids
+                    cand_experts[cid]
+                    for cid in deciding_cids
+                    if cid in cand_experts and cid not in failed_cids
                 }
                 router_mod.apply_lesson_route_change(
                     store, router_mod.category_of(self.contract["domain"]),
