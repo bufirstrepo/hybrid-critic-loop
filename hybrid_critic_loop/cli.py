@@ -37,6 +37,39 @@ def _resolve_data_dir(value=None) -> Path:
     return resolve_data_dir(None)
 
 
+def _open_sealed_count(store):
+    """Rows the open-time sealing pass sealed, when the store says so.
+
+    The store records the count as ``last_seal_count`` when it exposes
+    it; the sealing counters (``chain_backfilled`` / ``chain_repairs``
+    / ``chain_upgrades``) sum to the same total. Duck-typed stores
+    (the plugin's in-memory fallback) report nothing and get None.
+    """
+    direct = getattr(store, "last_seal_count", None)
+    if isinstance(direct, int) and not isinstance(direct, bool):
+        return direct
+    total = 0
+    seen = False
+    for name in ("chain_backfilled", "chain_repairs", "chain_upgrades"):
+        value = getattr(store, name, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            total += value
+            seen = True
+    return total if seen else None
+
+
+def _notice_open_upgrade(store):
+    """One stderr line when opening the store applied the one-time
+    ledger upgrade at scale (fix spec H3; round-5 performance): the
+    sealing pass is one-time, but on a large book it takes seconds,
+    and the operator hears that it happened — and that it will not
+    happen again — rather than wondering at the pause."""
+    count = _open_sealed_count(store)
+    if count is not None and count >= 1000:
+        print(f"one-time ledger upgrade: sealing {count} rows…",
+              file=sys.stderr)
+
+
 def _open_store_cli(data_dir):
     """``plugin._open_store`` with the lock courtesy (fix spec G2).
 
@@ -44,12 +77,13 @@ def _open_store_cli(data_dir):
     neither the holder nor the remedy; the CLI's error names both — the
     likely holder is another process (a Hermes session running this
     plugin holds its store for its whole lifetime), and the remedy is
-    to close it or wait for it to finish.
+    to close it or wait for it to finish. A successful open that
+    applied the one-time upgrade at scale says so once (H3).
     """
     from .plugin import _open_store
 
     try:
-        return _open_store(data_dir)
+        store = _open_store(data_dir)
     except Exception as exc:
         if "database is locked" in str(exc):
             raise RuntimeError(
@@ -60,6 +94,8 @@ def _open_store_cli(data_dir):
                 "or wait for it to finish, then retry"
             ) from exc
         raise
+    _notice_open_upgrade(store)
+    return store
 
 
 def _open(data_dir):
@@ -74,7 +110,8 @@ def _open(data_dir):
 
 
 class _NoStoreError(Exception):
-    """The read-only command found no store to read (tightening spec T9)."""
+    """A command that does not create a store found no store to read
+    (tightening spec T9; wording per round-5 fix spec H6)."""
 
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
@@ -94,11 +131,13 @@ def _is_sqlite_file(path) -> bool:
 
 
 def _open_existing(data_dir):
-    """Open an existing store read-only — never create one.
+    """Open an existing store — never create one.
 
-    Read-only commands (``standing``, ``verify-cert``, ``session-start``)
-    inspect a store; pointing one at a fresh directory must not conjure
-    the store it was asked to inspect (correctness F11), so when
+    The inspecting commands (``standing``, ``verify-cert``,
+    ``session-start``) open the existing store; a pending one-time
+    upgrade may be applied by that open, but they do not create a
+    store: pointing one at a fresh directory must not conjure the
+    store it was asked to inspect (correctness F11), so when
     ``<data dir>/data.db`` does not exist this raises
     :class:`_NoStoreError` and creates nothing — not even the directory.
 
@@ -222,7 +261,7 @@ def _cmd_ledger(data_dir) -> int:
 
 def _cmd_verify_cert(token, data_dir) -> int:
     """Verify an MM CERTIFIED certificate token against this store."""
-    from .chain import verify_certificate, verify_chain
+    from .chain import verify_certificate, verify_chain_cached
 
     store, data_dir = _open_existing(data_dir)
     ok, payload_or_reason = verify_certificate(store, token)
@@ -233,8 +272,12 @@ def _cmd_verify_cert(token, data_dir) -> int:
         # book's prefix as it stood at issuance. Say how the WHOLE
         # chain stands now — a break beyond the prefix does not
         # invalidate this certificate, but the operator hears about
-        # it, with the first bad row named.
-        chain_ok, first_bad = verify_chain(store)
+        # it, with the first bad row named. The scoping check runs
+        # through the chain-verified head cache (fix spec H3): on a
+        # book whose head still seals it re-verifies only the rows
+        # past the cached head instead of walking the whole book a
+        # second time; the wording is unchanged.
+        chain_ok, first_bad = verify_chain_cached(store)
         if chain_ok:
             print("chain: the whole ledger chain verifies")
         else:

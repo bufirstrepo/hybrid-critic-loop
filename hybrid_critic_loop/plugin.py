@@ -87,9 +87,17 @@ class _FallbackStore:
     """Minimal in-memory Store subset, used only if state.py is absent.
 
     Implements exactly the methods this plugin (and the reports/hooks)
-    call, so registration and the read-only tools still work in a partial
-    checkout.  The real SQLite Store from state.py is always preferred.
+    call, so registration and the store-inspecting tools still work in a
+    partial checkout.  The real SQLite Store from state.py is always
+    preferred.
     """
+
+    def close(self):
+        """No-op (fix spec H2; round-5 upgrade F2): the fallback holds
+        no file handle or connection, but callers close every store
+        uniformly — the real Store's ``close()`` must not become an
+        AttributeError just because a partial checkout fell back."""
+        return None
 
     def __init__(self, db_path=None):
         self.db_path = str(db_path) if db_path else None

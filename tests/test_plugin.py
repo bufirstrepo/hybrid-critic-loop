@@ -469,6 +469,12 @@ class TestDocsMatchTheCode(unittest.TestCase):
         self.assertIn("restored without its `cert_key`", readme)
         self.assertIn("starting with the baseline run", readme)
         self.assertIn("trusted to run code", readme)
+        # Round-5 fix spec H6 (round-5 security F3): the disclosure is
+        # honest about the env scrub's limit — gate commands run as
+        # the operator and can read the parent process's environment.
+        self.assertIn("can still read the parent process's environment",
+                      readme)
+        self.assertIn("hygiene, not a boundary", readme)
 
     def test_readme_states_the_adapter_rules(self):
         # Fix pass Wave 2.9 (review M8): the exit code decides a CLI seat's
@@ -700,7 +706,10 @@ class TestRound4CliSurfaces(unittest.TestCase):
     corrupt-store shape): the read-only open validates the store file
     instead of conjuring a schema into it, a locked store's error
     names the likely holder and the remedy, and verify-cert scopes
-    its claim with the whole-chain state after a successful verify."""
+    its claim with the whole-chain state after a successful verify.
+    (The class docstring's original "read-only open" wording is gone:
+    round-5 fix spec H6 — these commands do not create a store, but
+    their open may apply a pending one-time upgrade.)"""
 
     def _run(self, argv):
         import io
@@ -726,7 +735,7 @@ class TestRound4CliSurfaces(unittest.TestCase):
         data_dir = self._empty_store_dir()
         with mock.patch("hybrid_critic_loop.chain.verify_certificate",
                         return_value=(True, {"contract_id": "ctr_x"})), \
-                mock.patch("hybrid_critic_loop.chain.verify_chain",
+                mock.patch("hybrid_critic_loop.chain.verify_chain_cached",
                            return_value=(True, None)):
             code, out, _err = self._run(
                 ["verify-cert", "mm1.a.b", "--data-dir", data_dir])
@@ -738,7 +747,7 @@ class TestRound4CliSurfaces(unittest.TestCase):
         data_dir = self._empty_store_dir()
         with mock.patch("hybrid_critic_loop.chain.verify_certificate",
                         return_value=(True, {"contract_id": "ctr_x"})), \
-                mock.patch("hybrid_critic_loop.chain.verify_chain",
+                mock.patch("hybrid_critic_loop.chain.verify_chain_cached",
                            return_value=(False, 7)):
             code, out, _err = self._run(
                 ["verify-cert", "mm1.a.b", "--data-dir", data_dir])
@@ -775,6 +784,121 @@ class TestRound4CliSurfaces(unittest.TestCase):
         self.assertIn("database is locked", err)
         self.assertIn("Hermes session", err)
         self.assertIn("close that process", err)
+
+
+class TestRound5CliSurfaces(unittest.TestCase):
+    """Round-5 fix spec H3/H6 (round-5 performance HIGH, upgrade F4):
+    verify-cert's scoping print goes through the chain-verified head
+    cache instead of a second full walk (wording unchanged), opening
+    a store whose open sealed >= 1000 rows prints the one-time
+    upgrade line to stderr exactly once, and the CLI stops claiming
+    its inspecting commands are "read-only" — they do not create a
+    store, but their open may apply the pending one-time upgrade.
+    Plus H2: the fallback store has a close() (round-5 upgrade F2).
+    """
+
+    def _run(self, argv):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        from hybrid_critic_loop import cli
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def _empty_store_dir(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        from hybrid_critic_loop.state import Store
+
+        store = Store(Path(tmp.name) / "data.db")
+        store.close()
+        return tmp.name
+
+    def test_verify_cert_scoping_uses_the_cached_walk_not_the_full_one(self):
+        # The full walk is rigged to raise: if the CLI still consulted
+        # it for the scoping print, this command would fail outright.
+        data_dir = self._empty_store_dir()
+        with mock.patch("hybrid_critic_loop.chain.verify_certificate",
+                        return_value=(True, {"contract_id": "ctr_x"})), \
+                mock.patch("hybrid_critic_loop.chain.verify_chain_cached",
+                           return_value=(True, None)) as cached, \
+                mock.patch("hybrid_critic_loop.chain.verify_chain",
+                           side_effect=AssertionError(
+                               "full walk used for the scoping print")):
+            code, out, _err = self._run(
+                ["verify-cert", "mm1.a.b", "--data-dir", data_dir])
+        self.assertEqual(code, 0)
+        cached.assert_called_once()
+        self.assertIn("chain: the whole ledger chain verifies", out)
+
+    def test_open_upgrade_notice_prints_once_at_scale(self):
+        class Stub:
+            chain_backfilled = 400
+            chain_repairs = 300
+            chain_upgrades = 300
+
+        with mock.patch("hybrid_critic_loop.plugin._open_store",
+                        return_value=Stub()):
+            _code, _out, err = self._run(
+                ["standing", "--data-dir", self._empty_store_dir()])
+        self.assertEqual(
+            err.count("one-time ledger upgrade: sealing 1000 rows…"), 1,
+            err)
+
+    def test_open_upgrade_notice_prefers_the_recorded_count(self):
+        import io
+        from contextlib import redirect_stderr
+
+        from hybrid_critic_loop import cli
+
+        class Stub:
+            last_seal_count = 2500
+            chain_backfilled = 0
+            chain_repairs = 0
+            chain_upgrades = 0
+
+        err = io.StringIO()
+        with mock.patch("hybrid_critic_loop.plugin._open_store",
+                        return_value=Stub()):
+            with redirect_stderr(err):
+                store = cli._open_store_cli(Path(self._empty_store_dir()))
+        self.assertIsInstance(store, Stub)
+        self.assertEqual(
+            err.getvalue().count(
+                "one-time ledger upgrade: sealing 2500 rows…"), 1,
+            err.getvalue())
+
+    def test_open_upgrade_notice_silent_below_the_threshold(self):
+        class Stub:
+            chain_backfilled = 3
+            chain_repairs = 2
+            chain_upgrades = 0
+
+        with mock.patch("hybrid_critic_loop.plugin._open_store",
+                        return_value=Stub()):
+            _code, _out, err = self._run(
+                ["standing", "--data-dir", self._empty_store_dir()])
+        self.assertNotIn("one-time ledger upgrade", err)
+
+    def test_open_existing_wording_is_the_true_claim(self):
+        from hybrid_critic_loop import cli
+
+        doc = (cli._open_existing.__doc__ or "") + (
+            cli._NoStoreError.__doc__ or "")
+        self.assertNotIn("read-only", doc)
+        self.assertIn("never create one", doc)
+        self.assertIn("one-time", doc)
+        self.assertIn("may be applied", doc)
+
+    def test_fallback_store_close_is_a_noop(self):
+        from hybrid_critic_loop.plugin import _FallbackStore
+
+        store = _FallbackStore()
+        self.assertIsNone(store.close())
+        store.close()  # closing twice is equally fine
 
 
 class TestCliModule(unittest.TestCase):
