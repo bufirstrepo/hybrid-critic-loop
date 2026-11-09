@@ -36,15 +36,20 @@ class WorktreeManager:
 
         An ``O_CREAT | O_EXCL`` file under the contract's worktree
         directory: exactly one process creates it, every racing second
-        run gets False and answers ``already_run`` instead of fighting
-        over worktree and branch names. The claim is taken before any
-        worktree is created and held for the run's life; it is released
-        only when the run leaves the contract re-runnable (a baseline
-        refusal). A crashed run leaves the claim behind, which matches
-        the one-run doctrine: the contract id is spent either way, and
-        the store's status guard says so.
+        run gets False instead of fighting over worktree and branch
+        names. The claim is taken before any worktree is created and
+        records the claimant's pid and the time it was taken. The loop
+        releases it on EVERY run exit (round-5 fix spec H6; round-5
+        gate-core F4): the file guards a run that is actually live —
+        the contract row reads "running" — and nothing else. A claim
+        left behind by a run that died inside the claim window (before
+        the status flip, e.g. during baseline verification) is stale:
+        the loop breaks it with a named note on the result and takes
+        the claim for the new run, because that contract never
+        dispatched and its id was never spent.
         """
         import os
+        import time
 
         claim_dir = self.root / str(contract_id)
         try:
@@ -60,7 +65,11 @@ class WorktreeManager:
             # run: the store's status claim still guards sequentially.
             return True
         try:
-            os.write(fd, f"pid {os.getpid()} contract {contract_id}\n".encode())
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            os.write(
+                fd,
+                f"pid {os.getpid()} time {stamp} contract {contract_id}\n".encode(),
+            )
         finally:
             os.close(fd)
         return True
@@ -72,6 +81,42 @@ class WorktreeManager:
                 missing_ok=True)
         except OSError:
             pass
+
+    def snapshot_ref(self, contract_id, candidate_id) -> str:
+        """The dedicated ref pinning a candidate's verdict-time
+        snapshot commit (round-5 fix spec H6; round-5 gate-core F3).
+
+        The snapshot used to live only on the winner's branch —
+        deleting that one ref (plus a gc) silently demoted the human
+        gate to the legacy live-tree merge. The snapshot ref is a
+        second, purpose-named anchor: pinned at verdict time, resolved
+        first at gate time, deleted at terminal states."""
+        return f"refs/critic-snapshots/{contract_id}/{candidate_id}"
+
+    def pin_snapshot_ref(self, contract_id, candidate_id, commit) -> str:
+        """Pin ``commit`` under the candidate's snapshot ref."""
+        ref = self.snapshot_ref(contract_id, candidate_id)
+        result = _git(["-C", str(self.repo), "update-ref", ref, str(commit)])
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git update-ref {ref} failed: "
+                f"{result.stderr.strip() or result.stdout.strip()}")
+        return ref
+
+    def snapshot_ref_commit(self, contract_id, candidate_id):
+        """The commit the candidate's snapshot ref names, or None."""
+        ref = self.snapshot_ref(contract_id, candidate_id)
+        result = _git(
+            ["-C", str(self.repo), "rev-parse", "--verify", f"{ref}^{{commit}}"])
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+
+    def delete_snapshot_ref(self, contract_id, candidate_id) -> bool:
+        """Delete a candidate's snapshot ref (terminal cleanup)."""
+        ref = self.snapshot_ref(contract_id, candidate_id)
+        result = _git(["-C", str(self.repo), "update-ref", "-d", ref])
+        return result.returncode == 0
 
     def is_commit(self, ref) -> bool:
         """True iff ``ref`` names a commit object in this repo — the
