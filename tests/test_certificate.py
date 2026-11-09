@@ -56,6 +56,20 @@ class CertificateTestCase(unittest.TestCase):
         self.store.create_contract(
             tid, stage="solve", task="fix the bug", domain="code",
             tags=[], acceptance=[], contract_id=contract_id)
+        # Counted-row rule v2 (fix spec, pinned interfaces): an
+        # 'executor-reported' ledger row counts only when its
+        # candidate exists — the real loop creates the candidate
+        # before dispatching, so the fixture does too.
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO candidates (id, contract_id,"
+                " stage, slot, provenance, created_at) VALUES"
+                " ('cand_1', ?, 'solve', '0', 'executor-reported',"
+                " '2026-01-01T00:00:00+00:00')", (contract_id,))
+            conn.commit()
+        finally:
+            conn.close()
         return contract_id
 
     def _verdict(self, contract_id):

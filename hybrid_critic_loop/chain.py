@@ -17,8 +17,10 @@ a certificate: the ``MM CERTIFIED`` stamp plus a signed token
 ``mm1.<base64url(payload)>.<base64url(sig)>``. The payload names the
 contract, the verdict, the run's totals *as recorded in the ledger* at
 issuance, the operator's tier at issue time, the run's cost coverage
-(``cost_rows`` / ``cost_missing``), the id of the store key that signed
-it (``kid``), and the chain head at the run's high-water mark
+(``cost_rows`` / ``cost_missing``), the verdict's gate outcome
+(``measured``, and ``waived`` when the human gate waived a measured
+failure through), the id of the store key that signed it (``kid``),
+and the chain head at the run's high-water mark
 (``ledger_upto`` — the contract's last ledger row at issuance, so later
 bookkeeping rows never invalidate the seal). ``sig`` is HMAC-SHA256 over
 the payload with the store's LOCAL key. All totals come from the one
@@ -58,12 +60,16 @@ from .standing import tier_for
 __all__ = [
     "GENESIS_HASH",
     "LEDGER_FIELDS",
+    "LEDGER_FIELDS_PRE_SEALED_VIA",
     "LEDGER_FIELDS_LEGACY",
     "CertificateKeyError",
     "canonical_row",
+    "canonical_row_pre_sealed_via",
     "canonical_row_legacy",
     "row_hash",
+    "row_hash_pre_sealed_via",
     "row_hash_legacy",
+    "row_hash_variants",
     "verify_chain",
     "cert_key",
     "key_id",
@@ -81,7 +87,10 @@ GENESIS_HASH = "0" * 64
 #: themselves are never part of the serialization (a row cannot seal
 #: its own seal). ``provenance`` joined the form in the tightening pass
 #: (T12): a row's attribution is sealed like every other field, so
-#: flipping it breaks the chain at that row.
+#: flipping it breaks the chain at that row. ``sealed_via`` joined in
+#: the round-4 fix pass (G2; round-3 attack F3): the mark that says HOW
+#: a row was sealed is itself sealed, so relabelling a backfilled or
+#: repaired row as an ordinary append breaks the chain at that row.
 LEDGER_FIELDS = (
     "id",
     "target_id",
@@ -96,16 +105,31 @@ LEDGER_FIELDS = (
     "note",
     "created_at",
     "provenance",
+    "sealed_via",
 )
 
-#: The pre-tightening canonical form — LEDGER_FIELDS without
-#: ``provenance``. Kept for exactly one purpose: the open-time sealing
-#: pass in state.py recognises a row sealed under this old form and
-#: re-seals it under the current form (marked ``sealed_via="repair"``),
-#: so a store sealed before T12 survives the upgrade with its chain and
-#: its certificates intact. New seals never use this form.
+#: The tightening-era canonical form — LEDGER_FIELDS with
+#: ``provenance`` but without ``sealed_via``. Recognition only: the
+#: open-time sealing pass treats a stored hash matching this form as a
+#: recognised seal and re-seals the row under the current form (see
+#: :func:`row_hash_variants`). New seals never use this form.
+LEDGER_FIELDS_PRE_SEALED_VIA = tuple(
+    field for field in LEDGER_FIELDS if field != "sealed_via"
+)
+
+#: The pre-tightening canonical form — no ``provenance``, no
+#: ``sealed_via``. Kept for exactly one purpose: the open-time sealing
+#: pass in state.py recognises a row sealed under an old form and
+#: re-seals it under the current form (the canonical-form cascade,
+#: marked ``sealed_via="upgrade"``), so a store sealed before a form
+#: change keeps its chain. Its certificates do NOT survive the change:
+#: re-sealing rewrites the chain head a certificate seals, so a
+#: certificate issued before a canonical-form change stops verifying
+#: and is re-issued from the store (round-4 fix spec G10d). New seals
+#: never use an old form.
 LEDGER_FIELDS_LEGACY = tuple(
-    field for field in LEDGER_FIELDS if field != "provenance"
+    field for field in LEDGER_FIELDS
+    if field not in ("provenance", "sealed_via")
 )
 
 _TOKEN_PREFIX = "mm1"
@@ -131,6 +155,11 @@ class CertificateKeyError(Exception):
 # The chain
 # ---------------------------------------------------------------------------
 
+def _canonical(row, fields) -> str:
+    body = {field: row.get(field) for field in fields}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+
 def canonical_row(row) -> str:
     """Stable serialization of a ledger row's own fields.
 
@@ -138,8 +167,15 @@ def canonical_row(row) -> str:
     always serializes to the same string, so a hash computed at append
     time recomputes identically at verify time.
     """
-    body = {field: row.get(field) for field in LEDGER_FIELDS}
-    return json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return _canonical(row, LEDGER_FIELDS)
+
+
+def canonical_row_pre_sealed_via(row) -> str:
+    """The tightening-era serialization (no ``sealed_via``).
+
+    Recognition only — see :data:`LEDGER_FIELDS_PRE_SEALED_VIA`.
+    """
+    return _canonical(row, LEDGER_FIELDS_PRE_SEALED_VIA)
 
 
 def canonical_row_legacy(row) -> str:
@@ -147,20 +183,48 @@ def canonical_row_legacy(row) -> str:
 
     Recognition only — see :data:`LEDGER_FIELDS_LEGACY`.
     """
-    body = {field: row.get(field) for field in LEDGER_FIELDS_LEGACY}
-    return json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return _canonical(row, LEDGER_FIELDS_LEGACY)
+
+
+def _digest(prev_hash, canonical: str) -> str:
+    data = (str(prev_hash) + canonical).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
 
 
 def row_hash(prev_hash, row) -> str:
     """``sha256(prev_hash + canonical(row))`` as a hex digest."""
-    data = (str(prev_hash) + canonical_row(row)).encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
+    return _digest(prev_hash, canonical_row(row))
+
+
+def row_hash_pre_sealed_via(prev_hash, row) -> str:
+    """``row_hash`` under the tightening-era form (recognition only)."""
+    return _digest(prev_hash, canonical_row_pre_sealed_via(row))
 
 
 def row_hash_legacy(prev_hash, row) -> str:
     """``row_hash`` under the pre-T12 canonical form (recognition only)."""
-    data = (str(prev_hash) + canonical_row_legacy(row)).encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
+    return _digest(prev_hash, canonical_row_legacy(row))
+
+
+def row_hash_variants(row) -> dict:
+    """The row's digest under every recognised canonical form.
+
+    Computed over the row's OWN stored ``prev_hash`` link — the link
+    the open-time sealing pass validates. Keys: ``"current"`` (the
+    form new seals use), ``"pre_sealed_via"`` (the tightening-era
+    form), ``"legacy"`` (the pre-tightening form). A stored
+    ``row_hash`` matching ANY variant is a recognised seal; a match
+    under a non-current variant is re-sealed under the current form by
+    the pass's cascade (round-4 fix spec, pinned interfaces; G2).
+    Variants can coincide — a row whose ``sealed_via`` is None hashes
+    identically under the current and pre-sealed-via forms.
+    """
+    prev = row.get("prev_hash")
+    return {
+        "current": row_hash(prev, row),
+        "pre_sealed_via": row_hash_pre_sealed_via(prev, row),
+        "legacy": row_hash_legacy(prev, row),
+    }
 
 
 def verify_chain(store, upto_id=None):
@@ -173,14 +237,21 @@ def verify_chain(store, upto_id=None):
     no hashes at all. With ``upto_id``, only rows with
     ``id <= upto_id`` are in scope (prefix verification — a certificate
     verifies the book as it stood at issuance, tightening spec T4).
+
+    The walk stops AT the bound: rows arrive in id order, so the first
+    row past ``upto_id`` ends the scan instead of the whole book being
+    walked (round-4 fix spec G3). Seam: the store API
+    (``Store.ledger_rows``) still materializes every row before this
+    walk sees them — pushing the bound into that query is state.py's
+    side of G3; chain.py never consumes past the bound.
     """
     prev = GENESIS_HASH
     for row in store.ledger_rows():
         if upto_id is not None:
             rid = row.get("id")
-            if not isinstance(rid, int) or isinstance(rid, bool):
-                continue
-            if rid > upto_id:
+            if _is_int(rid) and rid > upto_id:
+                break
+            if not _is_int(rid):
                 continue
         stored_prev = row.get("prev_hash")
         stored_hash = row.get("row_hash")
@@ -239,6 +310,18 @@ def _read_key_file(key_path):
     return b""
 
 
+def _fsync_dir(parent):
+    """Best-effort fsync of a directory after a publish/replace in it."""
+    try:
+        dir_fd = os.open(str(parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass  # the directory fsync is best-effort durability
+
+
 def _write_key_file(key_path, key):
     """Persist ``key`` atomically at ``key_path``.
 
@@ -262,14 +345,63 @@ def _write_key_file(key_path, key):
         except OSError:
             pass
         raise
+    _fsync_dir(key_path.parent)
+
+
+def _publish_key_file(key_path, key):
+    """Publish ``key`` at ``key_path`` ONLY if no file is there (G5).
+
+    The temp file is fully written and fsynced first, then hard-linked
+    onto the path: ``os.link`` fails with :class:`FileExistsError`
+    when a racing creator won, and the loser discards its temp and
+    ADOPTS the key the file already holds. Two processes first-opening
+    a fresh store therefore converge on one key instead of each
+    keeping its own (round-3 regression F3 — the tightening pass's
+    unconditional ``os.replace`` had removed the pre-tightening code's
+    race convergence). Returns the key the file holds on return.
+    """
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(key_path.parent), prefix=".cert_key.")
     try:
-        dir_fd = os.open(str(key_path.parent), os.O_RDONLY)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(key)
+            handle.flush()
+            os.fsync(handle.fileno())
         try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass  # the directory fsync is best-effort durability
+            os.link(tmp_name, key_path)
+        except FileExistsError:
+            adopted = _read_key_file(key_path)
+            if adopted is not None and len(adopted) == _KEY_LEN:
+                return adopted
+            # The file that beat us is itself unusable; heal it via
+            # the replace path with our key.
+            return _replace_key_file(key_path, key)
+        _fsync_dir(key_path.parent)
+        return key
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+
+
+def _replace_key_file(key_path, key):
+    """Replace a corrupt key file, then adopt the file's final content.
+
+    The replace itself is the atomic ``os.replace`` write (the corrupt
+    path keeps it — G5). Re-reading afterwards and adopting whatever
+    the file then holds makes two processes racing to heal the same
+    corrupt file converge on one key: the last replace wins the file,
+    and every replacer ends up holding the file's content rather than
+    its own candidate key.
+    """
+    _write_key_file(key_path, key)
+    final = _read_key_file(key_path)
+    if final is not None and len(final) == _KEY_LEN:
+        return final
+    return key
 
 
 def cert_key(store) -> bytes:
@@ -277,15 +409,18 @@ def cert_key(store) -> bytes:
 
     File-backed stores keep it at ``<data dir>/cert_key`` beside the
     database; a ``:memory:`` store gets an ephemeral per-instance key.
-    A missing key file is created atomically; an existing file that is
-    not exactly 32 raw bytes — empty, truncated, overlong — or a
-    symlink at the path is corrupt and is replaced atomically with a
-    fresh key (certificates signed under a corrupt key were
-    unverifiable anyway). A file-backed store whose key cannot be
-    persisted raises :class:`CertificateKeyError` — there is NO
-    ephemeral fallback (tightening spec T5). This key is a
-    store-integrity seal only — see the module docstring for what it
-    does not prove.
+    A missing key file is published only-if-absent (temp + ``os.link``)
+    so two processes first-opening a fresh store converge on the one
+    key the file ends up holding (round-4 fix spec G5); an existing
+    file that is not exactly 32 raw bytes — empty, truncated,
+    overlong — or a symlink at the path is corrupt and is replaced
+    atomically with a fresh key, after which the file's final content
+    is adopted so racing healers converge too (certificates signed
+    under a corrupt key were unverifiable anyway). A file-backed store
+    whose key cannot be persisted raises
+    :class:`CertificateKeyError` — there is NO ephemeral fallback
+    (tightening spec T5). This key is a store-integrity seal only —
+    see the module docstring for what it does not prove.
     """
     cached = getattr(store, "_mm_cert_key", None)
     if cached is not None:
@@ -296,14 +431,21 @@ def cert_key(store) -> bytes:
     else:
         key_path = Path(db_path).expanduser().parent / "cert_key"
         try:
-            key = None
-            if not key_path.is_symlink():
+            if key_path.is_symlink():
+                # A symlink at the path is corrupt (security F9): the
+                # replace path swaps the link itself for a real file,
+                # never following it.
+                key = _replace_key_file(key_path, os.urandom(_KEY_LEN))
+            else:
                 data = _read_key_file(key_path)
                 if data is not None and len(data) == _KEY_LEN:
                     key = data
-            if key is None:
-                key = os.urandom(_KEY_LEN)
-                _write_key_file(key_path, key)
+                elif data is None:
+                    key = _publish_key_file(
+                        key_path, os.urandom(_KEY_LEN))
+                else:
+                    key = _replace_key_file(
+                        key_path, os.urandom(_KEY_LEN))
         except CertificateKeyError:
             raise
         except OSError as err:
@@ -333,8 +475,15 @@ def run_totals(store, contract_id, upto_id=None):
     ("not reported"), never an estimate.
     """
     totals = _ledger_totals(store, contract_id=contract_id, upto_id=upto_id)
+    tokens = totals["tokens"]
+    if isinstance(tokens, float) and tokens.is_integer():
+        # Integral totals surface as ints (round-4 fix spec G4): a
+        # pre-validation book can carry fractional per-row counts
+        # whose sum is whole, and the certificate payload's token
+        # field is an int by shape.
+        tokens = int(tokens)
     return {
-        "tokens": totals["tokens"],
+        "tokens": tokens,
         "cost_usd": totals["cost_usd"],
         "cost_rows": totals["cost_rows"],
         "cost_missing": totals["cost_missing"],
@@ -419,18 +568,46 @@ def _ledger_upto(store, contract_id) -> int:
     return upto
 
 
+def _book_max_ledger_id(store) -> int:
+    """The whole book's high-water mark: its max ledger id (0 if empty).
+
+    Used in verify failure reasons so an operator can see at a glance
+    whether their book is simply BEHIND the certificate's prefix or
+    genuinely diverges from it (round-4 upgrade F4).
+    """
+    top = 0
+    for row in store.ledger_rows():
+        if not isinstance(row, dict):
+            continue
+        rid = row.get("id")
+        if _is_int(rid) and rid > top:
+            top = rid
+    return top
+
+
 def issue_certificate(store, contract_id):
     """Issue the certificate block for a contract, or None.
 
     A certificate exists only for a run that reached a verdict with a
     winner — a contract with no verdict row, or an escalated verdict
     whose winner is None, gets None, and no stamp is printed for it
-    anywhere (tightening spec T6; claims #1). Also None when the
-    store's certificate key cannot be persisted
-    (:class:`CertificateKeyError`): no certificate beats one that can
-    never verify. Returns ``{"stamp", "cert", "payload"}``. The
-    payload's ``issued_at`` is the verdict row's own timestamp, so the
-    same run renders the same token every time.
+    anywhere (tightening spec T6; claims #1). Also None when the run
+    has no COUNTED ledger rows behind it (round-4 fix spec G4;
+    round-3 attack F8): the empty prefix trivially seals, so a
+    zero-row verdict would otherwise mint a certificate carrying the
+    whole book's tier on numbers that are all "not reported". Also
+    None when the run's token total is fractional — a pre-validation
+    book can hold fractional counts, and the payload shape requires an
+    int, so minting would produce a token verify calls malformed
+    (round-3 regression F5). Also None when the store's certificate
+    key cannot be persisted (:class:`CertificateKeyError`): no
+    certificate beats one that can never verify. Returns
+    ``{"stamp", "cert", "payload"}``. The payload's ``issued_at`` is
+    the verdict row's own timestamp, so the same run renders the same
+    token every time. The payload also seals the verdict's gate
+    outcome — ``measured`` and ``waived`` — so a winner that failed
+    the measured gate and merged only by human waiver is
+    distinguishable from a clean pass (round-4 regression F3).
     """
     verdict = store.latest_verdict(contract_id)
     if verdict is None or verdict.get("winner") is None:
@@ -441,6 +618,10 @@ def issue_certificate(store, contract_id):
         return None
     upto = _ledger_upto(store, contract_id)
     totals = run_totals(store, contract_id, upto_id=upto)
+    if totals["cost_rows"] + totals["cost_missing"] < 1:
+        return None
+    if totals["tokens"] is not None and not _is_int(totals["tokens"]):
+        return None
     payload = {
         "contract_id": contract_id,
         "verdict_id": verdict.get("id"),
@@ -453,6 +634,8 @@ def issue_certificate(store, contract_id):
         "kid": key_id(key),
         "cost_rows": totals["cost_rows"],
         "cost_missing": totals["cost_missing"],
+        "measured": verdict.get("measured"),
+        "waived": verdict.get("human_gate") == "waived",
     }
     payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload_b64 = _b64url_encode(payload_json.encode("utf-8"))
@@ -499,7 +682,7 @@ def _base_payload_ok(payload) -> bool:
 
 
 def _current_payload_ok(payload) -> bool:
-    """The tightening-era payload keys, present and sanely typed."""
+    """The current-format payload keys, present and sanely typed."""
     if not _is_int(payload.get("ledger_upto")) or payload["ledger_upto"] < 0:
         return False
     if not isinstance(payload.get("kid"), str) or not payload["kid"]:
@@ -507,7 +690,31 @@ def _current_payload_ok(payload) -> bool:
     for field in ("cost_rows", "cost_missing"):
         if not _is_int(payload.get(field)) or payload[field] < 0:
             return False
+    measured = payload.get("measured")
+    if measured is not None and not isinstance(measured, str):
+        return False
+    if not isinstance(payload.get("waived"), bool):
+        return False
     return True
+
+
+def _named_verdict(store, contract_id, verdict_id):
+    """The verdict a certificate NAMES (round-4 fix spec G4).
+
+    Uses ``store.verdict_for`` — the named verdict, never the
+    contract's latest: a re-run's attempt-2 verdict must not orphan
+    the attempt-1 certificate (round-3 regression F2). Duck-typed
+    stores predating the accessor fall back to ``latest_verdict``
+    plus id equality, which keeps the semantics identical (for such a
+    store the named verdict verifies only when it IS the latest).
+    """
+    verdict_for = getattr(store, "verdict_for", None)
+    if callable(verdict_for):
+        return verdict_for(contract_id, verdict_id)
+    latest = store.latest_verdict(contract_id)
+    if latest is not None and latest.get("id") == verdict_id:
+        return latest
+    return None
 
 
 def verify_certificate(store, token):
@@ -518,14 +725,22 @@ def verify_certificate(store, token):
     the full key set with sane types (else "malformed certificate
     payload" — an empty, mistyped or field-less payload never verifies,
     correctness F10); the legacy-format check (a token without
-    ``ledger_upto`` / ``kid`` predates the current format); the key id
-    (a mismatch means the certificate was issued by a different store,
-    named as such — host F2); the HMAC signature under the store's
-    local key; the named verdict — it must be the contract's verdict,
-    with matching id and ``created_at``, and a winner (a certificate
-    for a contract with no such verdict is a forgery, security F3);
-    the chain prefix up to ``ledger_upto``; the run totals and chain
-    head recomputed over that prefix; and the tier, recomputed from
+    ``ledger_upto`` / ``kid`` / ``measured`` / ``waived`` predates the
+    current format); the key id (a mismatch means this store's
+    ``cert_key`` is not the key that signed — the reason names the key
+    file and, for a book restored from backup, the remedy: restore its
+    ``cert_key`` beside it — host F2, round-4 upgrade F4); the HMAC
+    signature under the store's local key; the NAMED verdict — the
+    verdict row the payload's ``verdict_id`` identifies, with matching
+    id, ``created_at``, gate outcome (``measured`` / ``waived``) and a
+    winner, NOT the contract's latest verdict (a certificate for a
+    contract with no such verdict is a forgery, security F3; the
+    named-verdict rule is round-4 fix spec G4); the chain prefix up to
+    ``ledger_upto``; the run totals and chain head recomputed over
+    that prefix (totals failures name the sealed and recomputed
+    figures and the prefix bound against the book's own high-water
+    mark, so a book that is merely behind reads differently from one
+    that diverges — round-4 upgrade F4); and the tier, recomputed from
     the CURRENT lifetime spend under the one aggregation.
 
     The tier rule, stated plainly: the sealed tier is a point-in-time
@@ -551,7 +766,12 @@ def verify_certificate(store, token):
         return False, "payload does not decode"
     if not _base_payload_ok(payload):
         return False, "malformed certificate payload"
-    if "ledger_upto" not in payload or "kid" not in payload:
+    if (
+        "ledger_upto" not in payload
+        or "kid" not in payload
+        or "measured" not in payload
+        or "waived" not in payload
+    ):
         return False, (
             "certificate predates the current format; "
             "re-issue it from the store"
@@ -564,18 +784,22 @@ def verify_certificate(store, token):
         return False, "certificate key unavailable"
     if payload["kid"] != key_id(key):
         return False, (
-            "certificate was issued by a different store (key id mismatch)"
+            "the store's cert_key does not match the certificate's "
+            "key id; if this book was restored from backup, restore "
+            "its cert_key beside it"
         )
     expected = _sign(key, payload_b64)
     if not hmac.compare_digest(expected, sig_b64):
         return False, "signature mismatch"
     contract_id = payload["contract_id"]
-    verdict = store.latest_verdict(contract_id)
+    verdict = _named_verdict(store, contract_id, payload["verdict_id"])
     if (
         verdict is None
         or verdict.get("winner") is None
         or verdict.get("id") != payload["verdict_id"]
         or verdict.get("created_at") != payload["issued_at"]
+        or verdict.get("measured") != payload["measured"]
+        or (verdict.get("human_gate") == "waived") != payload["waived"]
     ):
         return False, "verdict does not match the certificate"
     upto = payload["ledger_upto"]
@@ -583,14 +807,25 @@ def verify_certificate(store, token):
     if not ok:
         return False, f"ledger chain broken at row {bad_id}"
     totals = run_totals(store, contract_id, upto_id=upto)
+    scope = (
+        f"certificate covers ledger rows up to {upto}; "
+        f"this book's ledger runs to row {_book_max_ledger_id(store)}"
+    )
     if payload["tokens"] != totals["tokens"]:
-        return False, "run totals do not match the ledger (tokens)"
+        return False, (
+            "run totals do not match the ledger (tokens): certificate "
+            f"seals {payload['tokens']}, this book counts "
+            f"{totals['tokens']} ({scope})"
+        )
     cost = payload["cost_usd"]
     actual_cost = totals["cost_usd"]
     if (cost is None) != (actual_cost is None) or (
         cost is not None and abs(float(cost) - float(actual_cost)) > 1e-9
     ):
-        return False, "run totals do not match the ledger (cost_usd)"
+        return False, (
+            "run totals do not match the ledger (cost_usd): certificate "
+            f"seals {cost}, this book counts {actual_cost} ({scope})"
+        )
     if payload["chain_head"] != _chain_head(store, contract_id, upto_id=upto):
         return False, "chain head does not match the ledger"
     current_tier = tier_for(lifetime_spend(store))

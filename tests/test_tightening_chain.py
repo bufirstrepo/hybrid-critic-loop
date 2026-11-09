@@ -11,16 +11,30 @@ each docstring naming its finding (source reports in
 - T5 key handling — security F6/F9, host F1, correctness F8
 - T6 no winner, no certificate — claims #1
 - T8 money exactness + partial coverage — correctness F3/F4/F13
+
+Round-4 fix pass additions (FIX-SPEC-ROUND4-2026-11-08, Unit 2):
+
+- Pinned canonical variants + sealed_via inside the seal — round-3
+  attack F3, fix spec G2
+- Named-verdict verify (verdict_for) — round-3 regression F2
+- Waiver/measured sealed into the payload — round-4 regression F3
+- Issue refusals: zero counted rows, fractional totals — round-3
+  attack F8, round-3 regression F5 (fix spec G4)
+- Verify reasons carry figures — round-4 upgrade F4
+- Key publish race convergence — round-3 regression F3 (fix spec G5)
 """
 
 import base64
 import inspect
 import json
+import multiprocessing
 import os
 import sqlite3
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from hybrid_critic_loop import chain, standing
 from hybrid_critic_loop.state import Store
@@ -62,11 +76,35 @@ class TighteningTestCase(unittest.TestCase):
         finally:
             self._tmp.cleanup()
 
+    def _candidate(self, contract_id, candidate_id="cand_1",
+                   provenance="executor-reported"):
+        """Insert the candidate row a dispatch's ledger rows name.
+
+        Counted-row rule v2 (fix spec, pinned interfaces) counts a
+        non-'legacy-import' row only when its candidate exists — and,
+        for adapter provenance strings, when the candidate's stored
+        provenance equals the row's. The real loop creates the
+        candidate before dispatching (loop.py), so the fixtures do
+        too; before rule v2 landed, the bare 'cand_1' string sufficed.
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO candidates (id, contract_id,"
+                " stage, slot, provenance, created_at) VALUES"
+                " (?, ?, 'solve', '0', ?,"
+                " '2026-01-01T00:00:00+00:00')",
+                (candidate_id, contract_id, provenance))
+            conn.commit()
+        finally:
+            conn.close()
+
     def _contract(self, contract_id="ctr_0001"):
         tid = self.store.create_target("do the thing", "code")
         self.store.create_contract(
             tid, stage="solve", task="fix the bug", domain="code",
             tags=[], acceptance=[], contract_id=contract_id)
+        self._candidate(contract_id)
         return contract_id
 
     def _verdict(self, contract_id, winner="cand_1"):
@@ -78,9 +116,10 @@ class TighteningTestCase(unittest.TestCase):
             waiver=None, human_gate="approved", tie_break=None)
 
     def _dispatch(self, contract_id, tokens_in=100, tokens_out=50,
-                  cost_usd=1.5, expert="exp-1", provenance="executor-reported"):
+                  cost_usd=1.5, expert="exp-1", provenance="executor-reported",
+                  candidate_id="cand_1"):
         return self.store.add_ledger(
-            "tgt_0001", contract_id, "cand_1", "solve", expert,
+            "tgt_0001", contract_id, candidate_id, "solve", expert,
             tokens_in, tokens_out, cost_usd, "completed", None,
             **_prov(provenance))
 
@@ -139,13 +178,17 @@ class TestUnifiedTotals(TighteningTestCase):
 
     @unittest.skipUnless(_HAS_PROVENANCE, "add_ledger provenance pending")
     def test_counted_provenances_all_count(self):
-        """Spec T2: executor-reported, candidate provenance strings and
-        legacy-import count; the excluded line stays out of the report
-        when nothing is excluded."""
+        """Spec T2, as tightened by counted-row rule v2 (fix spec,
+        pinned interfaces): executor-reported counts when its
+        candidate exists; an adapter provenance string counts when it
+        IS the candidate's stored provenance ('model-measured' is
+        cand_2's); legacy-import counts outright. The excluded line
+        stays out of the report when nothing is excluded."""
         cid = self._contract()
         self._dispatch(cid, cost_usd=10.0, provenance="executor-reported")
+        self._candidate(cid, "cand_2", "model-measured")
         self._dispatch(cid, cost_usd=10.0, provenance="model-measured",
-                       expert="exp-2")
+                       expert="exp-2", candidate_id="cand_2")
         self._dispatch(cid, cost_usd=10.0, provenance="legacy-import",
                        expert="exp-3")
         self.assertEqual(chain.lifetime_spend(self.store), 30.0)
@@ -202,6 +245,8 @@ class TestCertificateParity(TighteningTestCase):
             "kid": chain.key_id(key),
             "cost_rows": 0,
             "cost_missing": 0,
+            "measured": "pass",
+            "waived": False,
         }
         ok, reason = chain.verify_certificate(
             self.store, _sign_payload(self.store, payload))
@@ -216,6 +261,7 @@ class TestCertificateParity(TighteningTestCase):
         tier disappears. Verification now recomputes the tier."""
         rich = self._contract("ctr_rich")
         self._dispatch(rich, cost_usd=5.0)
+        self._candidate("ctr_other", "cand_9", "executor-reported")
         big = self.store.add_ledger(
             "tgt_0001", "ctr_other", "cand_9", "solve", "exp-9",
             None, None, 2_500_000.0, "completed", None,
@@ -265,8 +311,11 @@ class TestCertificateParity(TighteningTestCase):
 
     def test_other_store_reports_key_id_mismatch(self):
         """host F2: verifying against the WRONG store used to read as
-        forgery ('signature mismatch'); the kid names it as a
-        different store instead."""
+        forgery ('signature mismatch'); the kid names it as a key
+        mismatch instead — and since round-4 upgrade F4 the reason
+        names the cert_key file and the restore remedy, because the
+        common case is a book restored from backup WITHOUT its key,
+        which is not a different store at all."""
         cid, cert = self._issued()
         with tempfile.TemporaryDirectory() as tmp:
             other = Store(Path(tmp) / "data.db")
@@ -277,8 +326,9 @@ class TestCertificateParity(TighteningTestCase):
         self.assertFalse(ok)
         self.assertEqual(
             reason,
-            "certificate was issued by a different store "
-            "(key id mismatch)")
+            "the store's cert_key does not match the certificate's "
+            "key id; if this book was restored from backup, restore "
+            "its cert_key beside it")
 
     def test_malformed_payloads_never_verify(self):
         """correctness F10: signed empty / mistyped payloads verified
@@ -376,8 +426,9 @@ class TestKeyHandling(TighteningTestCase):
             self.assertFalse(ok)
             self.assertEqual(
                 reason,
-                "certificate was issued by a different store "
-                "(key id mismatch)")
+                "the store's cert_key does not match the certificate's "
+                "key id; if this book was restored from backup, restore "
+                "its cert_key beside it")
         finally:
             store2.close()
             self.store = Store(self.db_path)
@@ -423,6 +474,7 @@ class TestKeyHandling(TighteningTestCase):
             "chain_head": None, "issued_at": "2026-01-01T00:00:00+00:00",
             "ledger_upto": 0, "kid": "0" * 16,
             "cost_rows": 0, "cost_missing": 0,
+            "measured": None, "waived": False,
         }
         payload_b64 = _b64url_encode(
             json.dumps(payload, sort_keys=True,
@@ -434,20 +486,45 @@ class TestKeyHandling(TighteningTestCase):
 
     def test_memory_store_key_is_ephemeral_and_roundtrips(self):
         """Spec T5 carve-out: :memory: stores keep the per-instance
-        ephemeral key, and their certificates verify on that instance."""
+        ephemeral key, and their certificates verify on that instance.
+        (The fake carries the post-round-4 surface — verdict_for and
+        one counted, sealed ledger row — because G4's named-verdict
+        verify and counted-rows issue rule require both.)"""
 
         class MemoryStore:
             db_path = ":memory:"
 
             def __init__(self):
-                self._verdict = {"id": "vrd_1", "winner": "cand_1",
-                                 "created_at": "2026-01-01T00:00:00+00:00"}
+                self._verdict = {
+                    "id": "vrd_1", "winner": "cand_1",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "measured": "pass", "human_gate": "approved"}
+                row = {
+                    "id": 1, "target_id": "tgt_1",
+                    "contract_id": "ctr_1", "candidate_id": "cand_1",
+                    "stage": "solve", "expert_id": "exp-1",
+                    "tokens_in": 10, "tokens_out": 5, "cost_usd": 0.5,
+                    "outcome": "completed", "note": None,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "provenance": "legacy-import",
+                    "sealed_via": "append",
+                    "prev_hash": chain.GENESIS_HASH,
+                }
+                row["row_hash"] = chain.row_hash(
+                    chain.GENESIS_HASH, row)
+                self._rows = [row]
 
             def ledger_rows(self):
-                return []
+                return list(self._rows)
 
             def latest_verdict(self, contract_id):
                 return self._verdict
+
+            def verdict_for(self, contract_id, verdict_id):
+                if (contract_id == "ctr_1"
+                        and verdict_id == self._verdict["id"]):
+                    return self._verdict
+                return None
 
         store = MemoryStore()
         cert = chain.issue_certificate(store, "ctr_1")
@@ -505,6 +582,440 @@ class TestMoneyAndCoverage(TighteningTestCase):
         self.assertIn(
             "next tier: HIGH ROLLER — $100.00 more measured spend", text)
         self.assertNotIn("at least", text)
+
+
+# ---------------------------------------------------------------------------
+# Round-4 fix pass — pinned canonical variants (G2; round-3 attack F3)
+# ---------------------------------------------------------------------------
+
+class TestRowHashVariants(unittest.TestCase):
+    def _row(self, **overrides):
+        row = {
+            "id": 1, "target_id": "tgt_1", "contract_id": "ctr_1",
+            "candidate_id": "cand_1", "stage": "solve",
+            "expert_id": "exp-1", "tokens_in": 10, "tokens_out": 5,
+            "cost_usd": 0.5, "outcome": "completed", "note": None,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "provenance": "executor-reported", "sealed_via": "append",
+            "prev_hash": chain.GENESIS_HASH,
+        }
+        row.update(overrides)
+        return row
+
+    def test_field_sets_are_the_pinned_forms(self):
+        """Fix-spec pinned interfaces: ``sealed_via`` is appended LAST
+        to LEDGER_FIELDS; the legacy form excludes provenance AND
+        sealed_via; the pre-sealed-via form is exactly the
+        tightening-era field set Unit 1's sealing pass recognises."""
+        self.assertEqual(chain.LEDGER_FIELDS[-1], "sealed_via")
+        self.assertNotIn("sealed_via", chain.LEDGER_FIELDS_LEGACY)
+        self.assertNotIn("provenance", chain.LEDGER_FIELDS_LEGACY)
+        self.assertEqual(
+            chain.LEDGER_FIELDS_PRE_SEALED_VIA,
+            tuple(f for f in chain.LEDGER_FIELDS if f != "sealed_via"))
+        self.assertIn("provenance", chain.LEDGER_FIELDS_PRE_SEALED_VIA)
+
+    def test_variants_are_the_form_specific_hashes(self):
+        row = self._row()
+        variants = chain.row_hash_variants(row)
+        self.assertEqual(set(variants),
+                         {"current", "pre_sealed_via", "legacy"})
+        self.assertEqual(
+            variants["current"], chain.row_hash(chain.GENESIS_HASH, row))
+        self.assertEqual(
+            variants["pre_sealed_via"],
+            chain.row_hash_pre_sealed_via(chain.GENESIS_HASH, row))
+        self.assertEqual(
+            variants["legacy"],
+            chain.row_hash_legacy(chain.GENESIS_HASH, row))
+        # sealed_via="append" is inside the current seal, so the forms
+        # genuinely differ for this row (no degenerate coincidence).
+        self.assertNotEqual(variants["current"],
+                            variants["pre_sealed_via"])
+        self.assertNotEqual(variants["pre_sealed_via"],
+                            variants["legacy"])
+
+    def test_sealed_via_relabel_breaks_the_chain(self):
+        """round-3 attack F3: sealed_via sat OUTSIDE the canonical
+        form, so one UPDATE relabelled every backfilled/repaired row
+        as an append and erased the disclosure the round-2 fix rested
+        on. The mark is sealed now — relabelling breaks the chain at
+        that row."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "data.db"
+            store = Store(db_path)
+            try:
+                rid = store.add_ledger(
+                    "tgt_1", "ctr_1", "cand_1", "solve", "exp-1",
+                    10, 5, 0.5, "completed", None)
+                ok, bad = chain.verify_chain(store)
+                self.assertTrue(ok, f"chain broke at {bad}")
+                conn = sqlite3.connect(str(db_path))
+                try:
+                    conn.execute(
+                        "UPDATE ledger SET sealed_via='repair'"
+                        " WHERE id=?", (rid,))
+                    conn.commit()
+                finally:
+                    conn.close()
+                ok, bad = chain.verify_chain(store)
+                self.assertFalse(ok)
+                self.assertEqual(bad, rid)
+            finally:
+                store.close()
+
+
+# ---------------------------------------------------------------------------
+# Round-4 fix pass — named verdict (G4; round-3 regression F2)
+# ---------------------------------------------------------------------------
+
+class TestNamedVerdictCertificates(TighteningTestCase):
+    def _verdict_attempt(self, contract_id, attempt, winner="cand_1"):
+        return self.store.create_verdict(
+            contract_id=contract_id, attempt=attempt, winner=winner,
+            eliminated=[], hard="pass", measured="pass", judged=None,
+            escalated=False, escalation_reason=None, waiver=None,
+            human_gate="approved", tie_break=None)
+
+    def test_attempt1_certificate_survives_attempt2_verdict(self):
+        """round-3 regression F2 (also the round-4 test audit's
+        named-verdict probe): verify compared the payload against
+        latest_verdict, so recording an attempt-2 verdict orphaned
+        the attempt-1 certificate with 'verdict does not match'.
+        Verify now checks the NAMED verdict via verdict_for."""
+        cid = self._contract()
+        self._dispatch(cid, 100, 50, 1.5, provenance="legacy-import")
+        v1 = self._verdict_attempt(cid, 1)
+        cert1 = chain.issue_certificate(self.store, cid)
+        self.assertIsNotNone(cert1)
+        self.assertEqual(cert1["payload"]["verdict_id"], v1)
+        ok, payload = chain.verify_certificate(self.store, cert1["cert"])
+        self.assertTrue(ok, payload)
+        v2 = self._verdict_attempt(cid, 2, winner="cand_2")
+        self.assertNotEqual(v1, v2)
+        ok, payload = chain.verify_certificate(self.store, cert1["cert"])
+        self.assertTrue(ok, payload)
+        # A certificate issued now names attempt 2, and also verifies.
+        cert2 = chain.issue_certificate(self.store, cid)
+        self.assertEqual(cert2["payload"]["verdict_id"], v2)
+        self.assertNotEqual(cert2["cert"], cert1["cert"])
+        ok, payload = chain.verify_certificate(self.store, cert2["cert"])
+        self.assertTrue(ok, payload)
+
+    def test_named_verdict_fields_compared_not_latest(self):
+        """The comparison runs against the named row's own fields:
+        attempt 1's id paired with attempt 2's created_at fails even
+        though attempt 2 IS the contract's latest verdict."""
+        cid = self._contract()
+        self._dispatch(cid, 100, 50, 1.5, provenance="legacy-import")
+        v1 = self._verdict_attempt(cid, 1)
+        v2 = self._verdict_attempt(cid, 2, winner="cand_2")
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(
+                "UPDATE verdicts SET created_at=? WHERE id=?",
+                ("2026-02-02T00:00:00+00:00", v2))
+            conn.commit()
+        finally:
+            conn.close()
+        cert = chain.issue_certificate(self.store, cid)
+        self.assertEqual(cert["payload"]["verdict_id"], v2)
+        payload = dict(cert["payload"])
+        payload["verdict_id"] = v1  # attempt 1's id, attempt 2's stamp
+        ok, reason = chain.verify_certificate(
+            self.store, _sign_payload(self.store, payload))
+        self.assertFalse(ok)
+        self.assertEqual(reason, "verdict does not match the certificate")
+
+
+# ---------------------------------------------------------------------------
+# Round-4 fix pass — waiver in the payload (G4 pin; round-4 regression F3)
+# ---------------------------------------------------------------------------
+
+class TestWaiverPayload(TighteningTestCase):
+    def _waived_verdict(self, contract_id):
+        return self.store.create_verdict(
+            contract_id=contract_id, attempt=1, winner="cand_1",
+            eliminated=[], hard="pass", measured="fail", judged=None,
+            escalated=False, escalation_reason=None,
+            waiver={"offered": True, "granted": True},
+            human_gate="waived", tie_break=None)
+
+    def test_waived_verdict_seals_measured_and_waived(self):
+        """round-4 regression F3: a winner that failed the measured
+        gate and merged only by human waiver was certified
+        indistinguishably from a clean pass. The payload now seals
+        the gate outcome (fix-spec pin: ``measured`` + ``waived``)."""
+        cid = self._contract()
+        self._dispatch(cid, 100, 50, 1.5, provenance="legacy-import")
+        self._waived_verdict(cid)
+        cert = chain.issue_certificate(self.store, cid)
+        self.assertIsNotNone(cert)
+        self.assertEqual(cert["payload"]["measured"], "fail")
+        self.assertIs(cert["payload"]["waived"], True)
+        ok, payload = chain.verify_certificate(self.store, cert["cert"])
+        self.assertTrue(ok, payload)
+
+    def test_clean_pass_seals_waived_false(self):
+        cid = self._contract()
+        self._dispatch(cid, 100, 50, 1.5, provenance="legacy-import")
+        self._verdict(cid)  # measured "pass", human_gate "approved"
+        cert = chain.issue_certificate(self.store, cid)
+        self.assertEqual(cert["payload"]["measured"], "pass")
+        self.assertIs(cert["payload"]["waived"], False)
+
+    def test_gate_outcome_change_after_issue_invalidates(self):
+        """Verify compares measured/waived against the named verdict
+        row: rewriting the recorded decision after issuance
+        (waived → approved) breaks the certificate instead of letting
+        the waiver be laundered out of the record."""
+        cid = self._contract()
+        self._dispatch(cid, 100, 50, 1.5, provenance="legacy-import")
+        vid = self._waived_verdict(cid)
+        cert = chain.issue_certificate(self.store, cid)
+        self.store.set_verdict_human_gate(vid, "approved")
+        ok, reason = chain.verify_certificate(self.store, cert["cert"])
+        self.assertFalse(ok)
+        self.assertEqual(reason, "verdict does not match the certificate")
+
+
+# ---------------------------------------------------------------------------
+# Round-4 fix pass — issue refusals (G4; round-3 attack F8, regression F5)
+# ---------------------------------------------------------------------------
+
+class TestIssueRefusals(TighteningTestCase):
+    def _rewrite_tokens_and_reseal(self, row_id, tokens_in):
+        """Rewrite one row's tokens_in via raw SQL and re-seal the
+        whole chain — the pre-T7 book surgery round-3 regression F5
+        describes (fractional counts legitimately sealed before
+        add_ledger learned to validate them)."""
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(
+                "UPDATE ledger SET tokens_in=? WHERE id=?",
+                (tokens_in, row_id))
+            conn.commit()
+        finally:
+            conn.close()
+        prev = chain.GENESIS_HASH
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            for row in self.store.ledger_rows():
+                digest = chain.row_hash(prev, row)
+                conn.execute(
+                    "UPDATE ledger SET prev_hash=?, row_hash=?"
+                    " WHERE id=?", (prev, digest, row["id"]))
+                prev = digest
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_zero_row_verdict_mints_nothing(self):
+        """round-3 attack F8: contract B's $2M counted dispatch put
+        the book at MILLIONAIRE; a verdict with a winner for a
+        contract with NO ledger rows then minted a verifying
+        certificate — empty prefix trivially seals, totals all
+        'not reported', tier borrowed from B. Issue now requires
+        counted rows behind the run."""
+        rich = self._contract("ctr_rich")
+        self._dispatch(rich, cost_usd=2_000_000.0,
+                       provenance="legacy-import")
+        empty = self._contract("ctr_empty")
+        self._verdict(empty)
+        self.assertIsNone(chain.issue_certificate(self.store, empty))
+        # The rich contract's own certificate is unaffected.
+        self._verdict(rich)
+        self.assertIsNotNone(chain.issue_certificate(self.store, rich))
+
+    def test_bookkeeping_only_contract_mints_nothing(self):
+        """G4's counted-rows rule, second leg: the contract HAS rows
+        (ledger_upto ≥ 1) but none are counted — an internal
+        'observed' bookkeeping row is not a run."""
+        cid = self._contract()
+        self._bookkeeping(cid, cost_usd=5.0)
+        self._verdict(cid)
+        self.assertIsNone(chain.issue_certificate(self.store, cid))
+
+    def test_fractional_token_total_mints_nothing(self):
+        """round-3 regression F5: a counted row with tokens_in=100.5
+        summed to a total the payload shape forbids (int or None) —
+        issue minted a token verify then called 'malformed'. Issue
+        now refuses instead of minting an unverifiable token."""
+        cid = self._contract()
+        rid = self._dispatch(cid, 100, 50, 1.5,
+                             provenance="legacy-import")
+        self._rewrite_tokens_and_reseal(rid, 100.5)
+        self._verdict(cid)
+        self.assertEqual(chain.run_totals(self.store, cid)["tokens"],
+                         150.5)
+        self.assertIsNone(chain.issue_certificate(self.store, cid))
+
+    def test_integral_float_total_surfaces_as_int_and_issues(self):
+        """G4's other half: 100.5 + 49.5 is a whole 150 — run_totals
+        surfaces integral totals as ints and the certificate issues
+        with an int payload (the F5 refusal is only for totals that
+        are not integral)."""
+        cid = self._contract()
+        rid1 = self._dispatch(cid, 100, 0, 1.5,
+                              provenance="legacy-import")
+        rid2 = self._dispatch(cid, 0, 0, None, expert="exp-2",
+                              provenance="legacy-import")
+        self._rewrite_tokens_and_reseal(rid1, 100.5)
+        self._rewrite_tokens_and_reseal(rid2, 49.5)
+        totals = chain.run_totals(self.store, cid)
+        self.assertEqual(totals["tokens"], 150)
+        self.assertIsInstance(totals["tokens"], int)
+        self._verdict(cid)
+        cert = chain.issue_certificate(self.store, cid)
+        self.assertIsNotNone(cert)
+        self.assertEqual(cert["payload"]["tokens"], 150)
+        self.assertIsInstance(cert["payload"]["tokens"], int)
+        ok, payload = chain.verify_certificate(self.store, cert["cert"])
+        self.assertTrue(ok, payload)
+
+
+# ---------------------------------------------------------------------------
+# Round-4 fix pass — verify reasons with figures (G4; round-4 upgrade F4)
+# ---------------------------------------------------------------------------
+
+class TestVerifyReasonsWithFigures(TighteningTestCase):
+    def test_totals_mismatch_names_sealed_recomputed_and_bounds(self):
+        """round-4 upgrade F4: a twin book (same key, fewer/different
+        rows — the honest behind-book case) got the bare 'run totals
+        do not match', indistinguishable from tampering and with no
+        numbers to act on. The reason now carries the sealed figure,
+        this book's recomputed figure, the certificate's ledger_upto
+        and this book's own high-water mark."""
+        cid = self._contract()
+        self._dispatch(cid, 100, 50, 1.5, provenance="legacy-import")
+        vid = self._verdict(cid)
+        cert = chain.issue_certificate(self.store, cid)
+        created_at = self.store.verdict_for(cid, vid)["created_at"]
+        key_bytes = (self.data_dir / "cert_key").read_bytes()
+        with tempfile.TemporaryDirectory() as tmp:
+            twin_dir = Path(tmp)
+            (twin_dir / "cert_key").write_bytes(key_bytes)
+            twin = Store(twin_dir / "data.db")
+            try:
+                tid = twin.create_target("do the thing", "code")
+                twin.create_contract(
+                    tid, stage="solve", task="fix the bug", domain="code",
+                    tags=[], acceptance=[], contract_id=cid)
+                twin.add_ledger(
+                    "tgt_0001", cid, "cand_1", "solve", "exp-1",
+                    90, 10, 1.5, "completed", None,
+                    **_prov("legacy-import"))
+                twin_vid = twin.create_verdict(
+                    contract_id=cid, attempt=1, winner="cand_1",
+                    eliminated=[], hard="pass", measured="pass",
+                    judged=None, escalated=False, escalation_reason=None,
+                    waiver=None, human_gate="approved", tie_break=None)
+                self.assertEqual(twin_vid, vid)  # same sequential id
+                conn = sqlite3.connect(str(twin_dir / "data.db"))
+                try:
+                    conn.execute(
+                        "UPDATE verdicts SET created_at=? WHERE id=?",
+                        (created_at, twin_vid))
+                    conn.commit()
+                finally:
+                    conn.close()
+                ok, reason = chain.verify_certificate(twin, cert["cert"])
+            finally:
+                twin.close()
+        self.assertFalse(ok)
+        self.assertIn("seals 150", reason)
+        self.assertIn("counts 100", reason)
+        self.assertIn("up to 1", reason)        # certificate ledger_upto
+        self.assertIn("runs to row 1", reason)  # the twin's max row id
+
+
+# ---------------------------------------------------------------------------
+# Round-4 fix pass — key race (G5; round-3 regression F3)
+# ---------------------------------------------------------------------------
+
+def _key_race_child(db_path, barrier, queue):
+    """One racing first-opener: build a bare store handle and take the
+    key at the barrier release, so both children enter cert_key's
+    creation path together."""
+    store = types.SimpleNamespace(db_path=str(db_path))
+    barrier.wait(timeout=30)
+    queue.put(chain.cert_key(store).hex())
+
+
+class TestKeyRace(unittest.TestCase):
+    def test_publish_is_only_if_absent(self):
+        """G5, unit level: the second publisher adopts the first
+        key — its own candidate never lands in the file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cert_key"
+            first = chain._publish_key_file(path, b"a" * 32)
+            self.assertEqual(first, b"a" * 32)
+            second = chain._publish_key_file(path, b"b" * 32)
+            self.assertEqual(second, b"a" * 32)
+            self.assertEqual(path.read_bytes(), b"a" * 32)
+
+    def test_replace_adopts_the_files_final_content(self):
+        """G5, corrupt path: a healer whose replace is overtaken by a
+        racing healer's later replace adopts the file's final
+        content, not its own candidate — the two converge."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cert_key"
+            path.write_bytes(b"bad")
+            winner = b"w" * 32
+            real_write = chain._write_key_file
+
+            def racing_write(p, _key):
+                real_write(p, winner)  # the other healer lands last
+
+            with mock.patch.object(chain, "_write_key_file",
+                                   racing_write):
+                adopted = chain._replace_key_file(path, b"o" * 32)
+            self.assertEqual(adopted, winner)
+            self.assertEqual(path.read_bytes(), winner)
+
+    def test_two_processes_first_open_converge(self):
+        """round-3 regression F3, cross-process (acceptance asks for
+        a real race): two processes first-opening a fresh store at
+        the same moment must end up holding the SAME key — the one in
+        the file. The tightening pass's unconditional os.replace let
+        each process keep its own key for its lifetime, and its
+        certificates then failed on its OWN store as foreign (kid
+        mismatch)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "data.db"
+            ctx = multiprocessing.get_context("fork")
+            barrier = ctx.Barrier(2)
+            queue = ctx.Queue()
+            procs = [
+                ctx.Process(target=_key_race_child,
+                            args=(db_path, barrier, queue))
+                for _ in range(2)
+            ]
+            for proc in procs:
+                proc.start()
+            keys = sorted(queue.get(timeout=60) for _ in procs)
+            for proc in procs:
+                proc.join(timeout=60)
+                self.assertEqual(proc.exitcode, 0)
+            self.assertEqual(keys[0], keys[1])
+            self.assertEqual(
+                (Path(tmp) / "cert_key").read_bytes().hex(), keys[0])
+
+    def test_corrupt_key_heals_to_one_key_across_instances(self):
+        """After one instance heals a corrupt key file, a second
+        instance reads the healed key — no second replacement, no
+        divergence between instances."""
+        with tempfile.TemporaryDirectory() as tmp:
+            key_path = Path(tmp) / "cert_key"
+            key_path.write_bytes(b"short")
+            first = types.SimpleNamespace(
+                db_path=str(Path(tmp) / "data.db"))
+            healed = chain.cert_key(first)
+            self.assertEqual(len(healed), 32)
+            second = types.SimpleNamespace(
+                db_path=str(Path(tmp) / "data.db"))
+            self.assertEqual(chain.cert_key(second), healed)
+            self.assertEqual(key_path.read_bytes(), healed)
 
 
 if __name__ == "__main__":
