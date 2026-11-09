@@ -453,6 +453,23 @@ class TestDocsMatchTheCode(unittest.TestCase):
         self.assertIn("unavailable", self._section(readme, "## Cost per validity point"))
         self.assertIn("first turn", hooks_mod.__doc__)
 
+    def test_readme_states_the_upgrade_backup_and_contract_rules(self):
+        # Fix spec G10/G7 (round 3 upgrade F2/F3, round 4 upgrade
+        # F3/F4, security F1): pre-0.4 certificates stop verifying and
+        # are re-issued from the store, possibly with tightened totals;
+        # the book is four files that travel together; a contract's
+        # gate commands execute on the operator's machine from the
+        # baseline run.
+        readme = self._read("README.md")
+        self.assertIn("stop verifying under 0.4.0", readme)
+        self.assertIn("re-issued from the store", readme)
+        self.assertIn("bookkeeping rows no longer count", readme)
+        self.assertIn("data.db-wal", readme)
+        self.assertIn("data.db-shm", readme)
+        self.assertIn("restored without its `cert_key`", readme)
+        self.assertIn("starting with the baseline run", readme)
+        self.assertIn("trusted to run code", readme)
+
     def test_readme_states_the_adapter_rules(self):
         # Fix pass Wave 2.9 (review M8): the exit code decides a CLI seat's
         # outcome; an API seat needs a target_file and declines without one.
@@ -602,22 +619,54 @@ class TestHostSurface(unittest.TestCase):
             out = json.loads(self.ctx.tools["critic_gate"]["handler"](
                 {"contract_id": "ctr_x", "decision": "waived", "reason": "measured only"}))
         self.assertEqual(out["status"], "completed")
-        rec.assert_called_once_with(self.store, "ctr_x", "waived", "measured only")
+        # The decision is recorded with its real channel (fix spec G1,
+        # round 4 security F7): it arrived through the tool.
+        rec.assert_called_once_with(
+            self.store, "ctr_x", "waived", "measured only", channel="tool")
 
-    def test_critic_run_with_a_decision_completes_a_pending_gate_instead_of_rerunning(self):
-        self.store.create_verdict(
-            "ctr_demo_1", 1, "ctr_demo_1_c", [], "pass", "pass", None, False, None, None,
-            "pending", "single_passer")
-        with mock.patch("hybrid_critic_loop.loop.record_human_gate",
-                        return_value={"contract_id": "ctr_demo_1", "status": "completed"}) as rec, \
-                mock.patch("hybrid_critic_loop.loop.run_contract") as run:
+    def test_critic_run_cannot_decide_its_own_gate(self):
+        # Fix spec G1 (round 4 security F7): the run tool's schema has
+        # no human_gate parameter, and a stray human_gate argument is
+        # ignored — the run dispatches the panel and ends at the gate;
+        # record_human_gate is never reached from this handler.
+        schema = self.ctx.tools["critic_run"]["schema"]
+        self.assertNotIn("human_gate", schema["parameters"]["properties"])
+        with mock.patch("hybrid_critic_loop.loop.run_contract",
+                        return_value={"contract_id": "ctr_demo_1",
+                                      "status": "awaiting_human_gate"}) as run, \
+                mock.patch("hybrid_critic_loop.loop.record_human_gate") as rec:
             out = json.loads(self.ctx.tools["critic_run"]["handler"]({
                 "contract_path": str(self.ROOT / "contracts" / "demo1.json"),
                 "repo_path": "/nonexistent/repo", "human_gate": "approved",
+                "executors": "local",
             }))
-        self.assertEqual(out["status"], "completed")
-        rec.assert_called_once_with(self.store, "ctr_demo_1", "approved", None)
-        run.assert_not_called()
+        self.assertEqual(out["status"], "awaiting_human_gate")
+        run.assert_called_once()
+        self.assertIsNone(run.call_args.kwargs.get("human_decider"))
+        rec.assert_not_called()
+
+    def test_critic_run_handler_returns_error_json_when_the_loop_raises(self):
+        # Fix spec G10 (round 4 regression F2): a loop exception becomes
+        # the handler's {"error": …} JSON, never a raise into the host —
+        # the same containment the CLI's dispatch boundary gives.
+        with mock.patch("hybrid_critic_loop.loop.run_contract",
+                        side_effect=ValueError("usage blew up")):
+            out = json.loads(self.ctx.tools["critic_run"]["handler"]({
+                "contract_path": str(self.ROOT / "contracts" / "demo1.json"),
+                "repo_path": "/nonexistent/repo", "executors": "local",
+            }))
+        self.assertIn("error", out)
+        self.assertIn("usage blew up", out["error"])
+
+    def test_critic_gate_handler_returns_error_json_when_the_loop_raises(self):
+        # Fix spec G10 (round 4 regression F2): same boundary on the
+        # gate handler's record_human_gate call.
+        with mock.patch("hybrid_critic_loop.loop.record_human_gate",
+                        side_effect=RuntimeError("merge exploded")):
+            out = json.loads(self.ctx.tools["critic_gate"]["handler"](
+                {"contract_id": "ctr_x", "decision": "approved"}))
+        self.assertIn("error", out)
+        self.assertIn("merge exploded", out["error"])
 
     def test_slash_gate_subcommand_maps_the_verbs(self):
         handler = self.ctx.commands["critic"]["handler"]
@@ -626,7 +675,11 @@ class TestHostSurface(unittest.TestCase):
                         return_value={"contract_id": "ctr_x", "status": "rejected"}) as rec:
             rendered = handler("gate ctr_x reject too slow for the hot loop")
         self.assertIn('"status": "rejected"', rendered)
-        rec.assert_called_once_with(self.store, "ctr_x", "rejected", "too slow for the hot loop")
+        # The slash command routes through the gate tool handler, so the
+        # recorded channel is "tool" (fix spec G1).
+        rec.assert_called_once_with(
+            self.store, "ctr_x", "rejected", "too slow for the hot loop",
+            channel="tool")
         self.assertIn("critic gate <contract_id>", handler(""))
 
     def test_cli_setup_accepts_the_parser_hermes_hands_it(self):
@@ -640,6 +693,88 @@ class TestHostSurface(unittest.TestCase):
         self.assertEqual((args.contract_id, args.decision, args.reason), ("ctr_x", "approved", "fine"))
         args = plugin_parser.parse_args(["run", "c.json", "--repo", ".", "--approve"])
         self.assertEqual(args.critic_command, "run")
+
+
+class TestRound4CliSurfaces(unittest.TestCase):
+    """Fix spec G10/G4/G2 (round 4 upgrade F3/F4, round 3's
+    corrupt-store shape): the read-only open validates the store file
+    instead of conjuring a schema into it, a locked store's error
+    names the likely holder and the remedy, and verify-cert scopes
+    its claim with the whole-chain state after a successful verify."""
+
+    def _run(self, argv):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        from hybrid_critic_loop import cli
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def _empty_store_dir(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        from hybrid_critic_loop.state import Store
+
+        store = Store(Path(tmp.name) / "data.db")
+        store.close()
+        return tmp.name
+
+    def test_verify_cert_prints_the_whole_chain_state_on_success(self):
+        data_dir = self._empty_store_dir()
+        with mock.patch("hybrid_critic_loop.chain.verify_certificate",
+                        return_value=(True, {"contract_id": "ctr_x"})), \
+                mock.patch("hybrid_critic_loop.chain.verify_chain",
+                           return_value=(True, None)):
+            code, out, _err = self._run(
+                ["verify-cert", "mm1.a.b", "--data-dir", data_dir])
+        self.assertEqual(code, 0)
+        self.assertIn("certificate: VALID", out)
+        self.assertIn("chain: the whole ledger chain verifies", out)
+
+    def test_verify_cert_warns_when_the_chain_breaks_beyond_the_prefix(self):
+        data_dir = self._empty_store_dir()
+        with mock.patch("hybrid_critic_loop.chain.verify_certificate",
+                        return_value=(True, {"contract_id": "ctr_x"})), \
+                mock.patch("hybrid_critic_loop.chain.verify_chain",
+                           return_value=(False, 7)):
+            code, out, _err = self._run(
+                ["verify-cert", "mm1.a.b", "--data-dir", data_dir])
+        self.assertEqual(code, 0)
+        self.assertIn("certificate: VALID", out)
+        self.assertIn("warning", out)
+        self.assertIn("broken at row 7", out)
+
+    def test_open_existing_rejects_a_non_database_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "data.db").write_bytes(b"this is not a database")
+            code, _out, err = self._run(["standing", "--data-dir", tmp])
+        self.assertEqual(code, 1)
+        self.assertIn("store file exists but is not a database", err)
+
+    def test_open_existing_rejects_a_zero_byte_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "data.db").write_bytes(b"")
+            code, _out, err = self._run(
+                ["verify-cert", "mm1.a.b", "--data-dir", tmp])
+        self.assertEqual(code, 1)
+        self.assertIn("store file exists but is not a database", err)
+
+    def test_a_locked_store_error_names_the_holder_and_the_remedy(self):
+        data_dir = self._empty_store_dir()
+        with mock.patch(
+                "hybrid_critic_loop.plugin._open_store",
+                side_effect=RuntimeError(
+                    "hybrid-critic-loop: cannot open its database at "
+                    "/x/data.db: database is locked")):
+            code, _out, err = self._run(
+                ["verify-cert", "mm1.a.b", "--data-dir", data_dir])
+        self.assertEqual(code, 1)
+        self.assertIn("database is locked", err)
+        self.assertIn("Hermes session", err)
+        self.assertIn("close that process", err)
 
 
 class TestCliModule(unittest.TestCase):

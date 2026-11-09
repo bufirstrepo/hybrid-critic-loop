@@ -290,12 +290,6 @@ def _build_executors(spec):
     return default_executors()
 
 
-def _human_decider(human_gate):
-    if human_gate in ("approved", "rejected", "waived"):
-        return lambda *a, **kw: human_gate
-    return None
-
-
 def _is_awaiting(result):
     if not isinstance(result, dict):
         return False
@@ -313,8 +307,11 @@ _CRITIC_RUN_SCHEMA = {
     "description": (
         "Run one Hybrid Critic Loop contract: competing experts implement "
         "the task in isolated worktrees, hard/measured/judged gates pick a "
-        "winner, and the result ends at a human gate unless human_gate is "
-        "given. Returns the run result as JSON."
+        "winner, and the result ends at the human gate — this tool cannot "
+        "decide the gate; complete it with critic_gate or the CLI. A "
+        "contract's gate commands execute on the operator's machine, "
+        "starting with the baseline run: author contracts only from "
+        "parties trusted to run code. Returns the run result as JSON."
     ),
     "type": "object",
     "properties": {
@@ -334,11 +331,6 @@ _CRITIC_RUN_SCHEMA = {
             "type": "string",
             "enum": ["live", "local"],
             "description": "'live' uses the configured expert CLIs (default); 'local' uses the two built-in local solvers for demos/tests.",
-        },
-        "human_gate": {
-            "type": "string",
-            "enum": ["approved", "rejected", "waived"],
-            "description": "Pre-recorded human gate decision. Omit to end the run awaiting the human gate.",
         },
     },
     "required": ["repo_path"],
@@ -458,29 +450,22 @@ def register(ctx):
             from . import loop as loop_mod
         except Exception as exc:
             return json.dumps({"error": f"loop module not available: {exc}"})
-        # A decision for a contract whose run already ended awaiting the
-        # human gate completes that gate instead of re-dispatching the
-        # panel (fix pass Wave 2.6, review H11).
-        contract_id = contract.get("id") if isinstance(contract, dict) else None
-        if args.get("human_gate") and contract_id:
-            pending = None
-            try:
-                pending = store.latest_verdict(contract_id)
-            except Exception:  # noqa: BLE001
-                pending = None
-            if pending and pending.get("human_gate") == "pending":
-                result = loop_mod.record_human_gate(
-                    store, contract_id, args["human_gate"], args.get("reason")
-                )
-                return json.dumps(result, default=str)
+        # The run tool cannot decide its own gate (fix spec G1, round 4
+        # security F7): no human_gate argument is read here — a run ends
+        # awaiting the gate, and only critic_gate / the slash command /
+        # the CLI complete it. And the loop call sits behind the same
+        # exception boundary as every other fallible step in this handler
+        # (fix spec G10, round 4 regression F2): a loop failure returns
+        # the handler's {"error": …} JSON instead of raising into the
+        # host, exactly as the CLI's dispatch boundary contains it.
         try:
             executors = _build_executors(args.get("executors", "live"))
         except Exception as exc:
             return json.dumps({"error": f"executors not available: {exc}"})
-        decider = _human_decider(args.get("human_gate"))
-        result = loop_mod.run_contract(
-            store, contract, repo_path, executors, human_decider=decider
-        )
+        try:
+            result = loop_mod.run_contract(store, contract, repo_path, executors)
+        except Exception as exc:  # noqa: BLE001 - surface boundary
+            return json.dumps({"error": f"run failed: {exc}"})
         return json.dumps(result, default=str)
 
     def critic_lessons_handler(args):
@@ -530,7 +515,16 @@ def register(ctx):
             from . import loop as loop_mod
         except Exception as exc:
             return json.dumps({"error": f"loop module not available: {exc}"})
-        result = loop_mod.record_human_gate(store, contract_id, decision, args.get("reason"))
+        # The decision is recorded with its real channel (fix spec G1,
+        # round 4 security F7): a decision that arrived through this
+        # tool is "tool", not a blanket "human". The call is wrapped
+        # like the run handler's (fix spec G10, round 4 regression F2).
+        try:
+            result = loop_mod.record_human_gate(
+                store, contract_id, decision, args.get("reason"), channel="tool"
+            )
+        except Exception as exc:  # noqa: BLE001 - surface boundary
+            return json.dumps({"error": f"gate failed: {exc}"})
         return json.dumps(result, default=str)
 
     def _register(name, raw_schema, handler):
@@ -583,8 +577,9 @@ def register(ctx):
             rendered = json.dumps(result, indent=2, default=str)
             if _is_awaiting(result):
                 rendered += (
-                    "\nHuman gate pending — approve/reject via the critic_run "
-                    "tool with human_gate set, or the CLI."
+                    "\nHuman gate pending — approve/reject via the critic_gate "
+                    "tool, `critic gate <contract_id> approve|reject|waive`, "
+                    "or the CLI."
                 )
             return rendered
         if sub == "gate":

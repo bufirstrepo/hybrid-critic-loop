@@ -37,20 +37,60 @@ def _resolve_data_dir(value=None) -> Path:
     return resolve_data_dir(None)
 
 
+def _open_store_cli(data_dir):
+    """``plugin._open_store`` with the lock courtesy (fix spec G2).
+
+    When the store is locked, sqlite's bare "database is locked" names
+    neither the holder nor the remedy; the CLI's error names both — the
+    likely holder is another process (a Hermes session running this
+    plugin holds its store for its whole lifetime), and the remedy is
+    to close it or wait for it to finish.
+    """
+    from .plugin import _open_store
+
+    try:
+        return _open_store(data_dir)
+    except Exception as exc:
+        if "database is locked" in str(exc):
+            raise RuntimeError(
+                f"hybrid-critic-loop: cannot open its database at "
+                f"{Path(data_dir) / 'data.db'}: the database is locked — "
+                "another process (e.g. a Hermes session running this "
+                "plugin) is holding the store open; close that process, "
+                "or wait for it to finish, then retry"
+            ) from exc
+        raise
+
+
 def _open(data_dir):
     """Open the store for ``data_dir`` and seed routes. Returns (store, dir)."""
-    from .plugin import _open_store
     from .router import ensure_routes
 
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
-    store = _open_store(data_dir)
+    store = _open_store_cli(data_dir)
     ensure_routes(store)
     return store, data_dir
 
 
 class _NoStoreError(Exception):
     """The read-only command found no store to read (tightening spec T9)."""
+
+
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _is_sqlite_file(path) -> bool:
+    """True iff ``path`` starts with the SQLite database header.
+
+    A 0-byte file reads as empty and fails the check, as does any
+    non-database content (fix spec G10).
+    """
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
+    except OSError:
+        return False
 
 
 def _open_existing(data_dir):
@@ -61,17 +101,29 @@ def _open_existing(data_dir):
     the store it was asked to inspect (correctness F11), so when
     ``<data dir>/data.db`` does not exist this raises
     :class:`_NoStoreError` and creates nothing — not even the directory.
-    """
-    from .plugin import _open_store
 
+    A file that exists but is not a database — 0 bytes, or content
+    without the SQLite header — is an error in its own right (fix spec
+    G10): opening it as a store would conjure a schema into whatever
+    the file happens to be and report on an empty book.
+    """
     data_dir = Path(data_dir)
-    if not (data_dir / "data.db").exists():
+    db_file = data_dir / "data.db"
+    if not db_file.exists():
         raise _NoStoreError(
             f"no store found at {data_dir} (data.db does not exist); "
             "run a contract first, or pass --data-dir for the store "
             "you meant"
         )
-    store = _open_store(data_dir)
+    if not _is_sqlite_file(db_file):
+        raise _NoStoreError(
+            f"store file exists but is not a database at {db_file}; "
+            "the file is empty or does not carry the SQLite header — "
+            "restore the book from backup (data.db, data.db-wal, "
+            "data.db-shm and cert_key travel together), or remove the "
+            "file and run a contract to start a new book"
+        )
+    store = _open_store_cli(data_dir)
     return store, data_dir
 
 
@@ -139,7 +191,11 @@ def _cmd_gate(contract_id, decision, reason, data_dir) -> int:
     from .reports import verdict_report
 
     store, data_dir = _open(data_dir)
-    result = loop_mod.record_human_gate(store, contract_id, decision, reason)
+    # The decision is recorded with its real channel (fix spec G1,
+    # round 4 security F7): this surface is the operator's CLI.
+    result = loop_mod.record_human_gate(
+        store, contract_id, decision, reason, channel="cli"
+    )
     print(json.dumps(result, indent=2, default=str))
     print(verdict_report(store, contract_id))
     return 1 if result.get("status") == "error" else 0
@@ -166,13 +222,27 @@ def _cmd_ledger(data_dir) -> int:
 
 def _cmd_verify_cert(token, data_dir) -> int:
     """Verify an MM CERTIFIED certificate token against this store."""
-    from .chain import verify_certificate
+    from .chain import verify_certificate, verify_chain
 
     store, data_dir = _open_existing(data_dir)
     ok, payload_or_reason = verify_certificate(store, token)
     if ok:
         print("certificate: VALID")
         print(json.dumps(payload_or_reason, indent=2, default=str))
+        # Scope the claim (fix spec G4): the certificate seals the
+        # book's prefix as it stood at issuance. Say how the WHOLE
+        # chain stands now — a break beyond the prefix does not
+        # invalidate this certificate, but the operator hears about
+        # it, with the first bad row named.
+        chain_ok, first_bad = verify_chain(store)
+        if chain_ok:
+            print("chain: the whole ledger chain verifies")
+        else:
+            print(
+                f"warning: the certificate's prefix verifies, but the "
+                f"ledger chain is broken at row {first_bad} — the book "
+                f"beyond this certificate does not seal"
+            )
         return 0
     print(f"certificate: INVALID — {payload_or_reason}")
     return 1
