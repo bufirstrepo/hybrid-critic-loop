@@ -149,6 +149,28 @@ _ELIMINATED_KINDS = {
     "gate_error": "gate_error",
 }
 
+# The persisted elimination kinds that are GATE failures: exactly the
+# values _mark_eliminated persists for the gate stack's own
+# elimination classes (round-11 fix spec Unit A). "judged" and
+# "bracket_cut" are deliberately absent — those candidates passed the
+# decidable gates. Deriving the set from _ELIMINATED_KINDS (rather
+# than enumerating classes at each read site) means a future gate
+# elimination class is a gate failure everywhere by construction.
+_GATE_FAILED_KINDS = frozenset(_ELIMINATED_KINDS.values())
+
+
+def _measurement_failed(row) -> bool:
+    """True when a measurement row records a failure, in either shape
+    the rows arrive in (round-11 fix spec Unit A): store rows carry
+    "pass"; raw gate rows carry "passed". Mirrors the predicate in
+    lessons.derive_outcome_cause exactly — a row fails when pass is
+    False, OR when "pass" is absent AND passed is False."""
+    if not isinstance(row, dict):
+        return False
+    return row.get("pass") is False or (
+        "pass" not in row and row.get("passed") is False
+    )
+
 
 def _claim_gate(store, verdict, decision, retry=False) -> bool:
     """Claim a verdict's pending human gate (fix spec G1; round-4
@@ -1545,7 +1567,13 @@ class _Run:
                         # A dissent re-run elimination is a gate
                         # elimination with a kind, even when it
                         # anchors the candidate out of the bracket
-                        # (round-5 gate-core F5).
+                        # (round-5 gate-core F5). The mark on the
+                        # candidate row is also what _write_lesson's
+                        # gate_passed derivation reads, so a re-run
+                        # gate_error/provenance elimination — which
+                        # refreshes neither hard_failures nor any
+                        # measurement row below — still counts as a
+                        # deciding-gate failure there (round-11 Unit A).
                         self._mark_eliminated(
                             cand,
                             _ELIMINATED_KINDS.get(new_gr.eliminated_at,
@@ -2166,9 +2194,16 @@ class _Run:
                 # idiom the verdict builders use for the deciding
                 # attempt's scored candidates — mapped through the
                 # expert map, minus the experts whose candidates
-                # hard-failed or failed a measurement on the deciding
-                # attempt. Judged-eliminated candidates stay in the
-                # set: they passed the deciding gates.
+                # failed the deciding gate in ANY class the gate
+                # stack produces (round-11 fix spec Unit A, HIGH-1 /
+                # HIGH-2): hard-failure rows, failing measurement
+                # rows in either shape (store "pass" / raw "passed"),
+                # and the candidate rows' own elimination records —
+                # gate_error and provenance eliminations append no
+                # hard-failure entry and store no measurement rows,
+                # so only the rows see them. Judged-eliminated
+                # candidates stay in the set: they passed the
+                # deciding gates.
                 cand_experts = gate_details.get("candidate_experts") or {}
                 failed_cids = {
                     f.get("candidate_id")
@@ -2177,17 +2212,31 @@ class _Run:
                 failed_cids |= {
                     m.get("candidate_id")
                     for m in gate_details.get("measurements") or []
-                    if not m.get("pass", True)
+                    if _measurement_failed(m)
                 }
                 deciding_attempt = attempt
                 if verdict and verdict.get("attempt") is not None:
                     deciding_attempt = verdict["attempt"]
-                deciding_cids = {
-                    c["id"]
-                    for c in store.candidates_for(
+                deciding_rows = [
+                    c for c in store.candidates_for(
                         self.contract_id, attempt=deciding_attempt)
                     if c.get("status") == "completed"
+                ]
+                # The rows' elimination records are the source of
+                # truth for the remaining gate classes (and for any
+                # future one — _GATE_FAILED_KINDS derives from
+                # _ELIMINATED_KINDS, not from an enumeration here).
+                # This also covers dissent re-run eliminations: the
+                # re-run refresh path marks the same rows via
+                # _mark_eliminated, so the complete derivation applies
+                # after a re-run elimination with no second code path.
+                failed_cids |= {
+                    c["id"]
+                    for c in deciding_rows
+                    if (c.get("evidence") or {}).get("eliminated_kind")
+                    in _GATE_FAILED_KINDS
                 }
+                deciding_cids = {c["id"] for c in deciding_rows}
                 gate_passed = {
                     cand_experts[cid]
                     for cid in deciding_cids
