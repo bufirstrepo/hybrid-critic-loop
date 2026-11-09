@@ -178,14 +178,29 @@ def ledger_report(store) -> str:
     # prints and the figures stand — surfaces never gate on
     # uncertainty.
     try:
-        from .standing import _unavailable_line, chain_state
+        from .standing import (
+            _bad_row_older_form,
+            _unavailable_line,
+            chain_state,
+        )
 
         _status, _bad = chain_state(store)
+        _older_form = _bad_row_older_form(store, _bad)
     except Exception:
         _status, _bad = "unknown", None
+        _older_form = False
     if _status == "broken":
         if _bad is None:
             lines.append("chain state: unavailable")
+        elif _older_form:
+            # The header carries the same form-aware discrimination
+            # as the unavailable line below it (round-8 fix spec L7;
+            # round-8 upgrade-walk observation): a first bad row
+            # sealed under a historical canonical form is an
+            # older-form book, not a broken one — the two lines must
+            # never contradict each other.
+            lines.append(
+                f"chain state: sealed under an older form at row {_bad}")
         else:
             lines.append(f"chain state: broken at row {_bad}")
         lines.append(_unavailable_line(_bad, store))
