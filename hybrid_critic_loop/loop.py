@@ -234,6 +234,24 @@ _GATE_TERMINAL_STATUSES = frozenset({
 })
 
 
+class _FinalAnswerMismatch(Exception):
+    """The final answer on record failed convergence validation
+    (round-7 fix spec K1): raised out of completion so the gate
+    presentation can refuse WITHOUT recording a failure state or
+    writing anything further — the row is the operator's to
+    resolve, and the gate stays unconsumed."""
+
+
+#: The two interruption windows the detector names (round-7 fix spec
+#: K2; round-7 security F1, gate-core F1): death after the claim with
+#: the answer still owed, and death after the answer with the
+#: terminal status still owed.
+_INTERRUPTED_AFTER_CLAIM = (
+    "interrupted completion (process death after claim)")
+_INTERRUPTED_AFTER_ANSWER = (
+    "interrupted completion (process death after the final answer)")
+
+
 def _final_answer_row(store, contract_id):
     """The contract's final_answers row as a dict, or None (round-6
     fix spec J1; round-6 gate-core F3, security F1).
@@ -263,36 +281,331 @@ def _final_answer_row(store, contract_id):
 
 def _recorded_gate_decision(store, contract_id, verdict):
     """The decision a retry must present (round-6 fix spec J1;
-    round-6 security F2): the latest gate_failure observation's
-    decision when one exists, else the verdict's recorded human_gate
-    value if it is itself a decision. None when no decision is on
-    record (a first presentation, not a retry)."""
+    round-6 security F2; round-7 fix spec K6; round-7 gate-core F4):
+    the VERDICT's claimed value is the authority — the claim IS the
+    decision record — and a gate_failure observation is consulted
+    only when the verdict carries no decided value (the recorded
+    failure state, where the verdict reads "failed" and the
+    observation is the surviving record of what was claimed). The
+    round-6 order let the failure LOG outrank the claim; where the
+    two ever disagree, a retry could be refused into the opposite
+    decision. None when no decision is on record (a first
+    presentation, not a retry)."""
+    gate = (verdict or {}).get("human_gate")
+    if gate in _GATE_DECISION_VALUES:
+        return gate
     contract = store.get_contract(contract_id) or {}
     for obs in reversed(contract.get("observations") or []):
         if isinstance(obs, dict) and obs.get("kind") == "gate_failure" \
                 and obs.get("decision") in _GATE_DECISION_VALUES:
             return obs["decision"]
-    gate = (verdict or {}).get("human_gate")
-    if gate in _GATE_DECISION_VALUES:
-        return gate
     return None
 
 
 def _interrupted_completion(store, contract_id, verdict, contract):
-    """True when the gate's claim landed but its completion never
-    finished (round-6 fix spec J1; round-6 gate-core F1): the verdict
-    reads decided, the contract has no final answer and no terminal
-    status. A process that died after the claim — host kill, OOM,
-    power loss — leaves exactly this durable state, and the H1
-    failure record was only ever written by the process that had to
-    survive to write it. Never fires on a pending gate (no claim), an
-    escalated verdict (escalated, and winnerless gates read pending),
-    or a completed contract (final answer / terminal status)."""
+    """The interruption reason when the gate's claim landed but its
+    completion never finished, else None (round-6 fix spec J1;
+    round-6 gate-core F1; round-7 fix spec K2; round-7 security F1,
+    gate-core F1).
+
+    Two durable windows, one detector. Before the answer: the
+    verdict reads decided, the contract has no final answer and no
+    terminal status — a process that died after the claim (host
+    kill, OOM, power loss) leaves exactly this, and the H1 failure
+    record was only ever written by the process that had to survive
+    to write it. After the answer: the verdict reads decided and a
+    final answer exists, but the contract still has no terminal
+    status — death between the answer's commit and the status
+    write, the one window J1's predicate originally excluded; the
+    presentation converges it through the validated convergence
+    instead of refusing forever on a gate issuance happily mints
+    over. Never fires on a pending gate (no claim), an escalated
+    verdict (escalated, and winnerless gates read pending), or a
+    settled contract (terminal status)."""
     if (verdict or {}).get("human_gate") not in _GATE_DECISION_VALUES:
-        return False
+        return None
     if (contract or {}).get("status") in _GATE_TERMINAL_STATUSES:
-        return False
-    return _final_answer_row(store, contract_id) is None
+        return None
+    if _final_answer_row(store, contract_id) is None:
+        return _INTERRUPTED_AFTER_CLAIM
+    return _INTERRUPTED_AFTER_ANSWER
+
+
+def _validate_final_answer(mgr, answer, decision):
+    """Why the final answer on record must not be converged on, or
+    None when it checks out (round-7 fix spec K1; round-7 attack F1,
+    security F3).
+
+    Two checks, mirroring what the normal completion path guarantees
+    about the row IT writes: the row's recorded decision is the
+    decision being completed, and a commit claiming the "git:" form
+    names a real commit in the contract's repository — the is_commit
+    check the merge path applies to the winner's snapshot. A non-git
+    commit string claims no repository form and is accepted as
+    recorded. A manager that cannot answer is_commit (older doubles)
+    skips the second check; the real WorktreeManager always can."""
+    recorded = answer.get("human_gate")
+    if recorded != decision:
+        return (f"its recorded decision is {recorded!r}, not the "
+                f"decision being completed ({decision!r})")
+    raw = str(answer.get("commit") or "")
+    if raw.startswith("git:"):
+        is_commit = getattr(mgr, "is_commit", None)
+        if callable(is_commit) and not is_commit(raw[len("git:"):]):
+            return (f"its commit {raw!r} is not a commit in this "
+                    f"contract's repository")
+    return None
+
+
+def _append_gate_failure_once(store, contract_id, decision, channel,
+                              reason):
+    """Append the gate_failure observation unless an identical one
+    (same decision, same reason) is already on the contract
+    (round-7 fix spec K6; round-7 gate-core F5): a death inside the
+    failure recording itself — the observation landed, the verdict
+    and status writes never did — presents as the same interruption
+    again, and one death must not become two records."""
+    contract = store.get_contract(contract_id) or {}
+    for obs in contract.get("observations") or []:
+        if isinstance(obs, dict) and obs.get("kind") == "gate_failure" \
+                and obs.get("decision") == decision \
+                and obs.get("reason") == reason:
+            return
+    try:
+        store.append_observation(contract_id, {
+            "kind": "gate_failure", "decision": decision,
+            "reason": reason, "channel": channel,
+        })
+    except Exception:  # noqa: BLE001 - recording must not mask the gate
+        pass
+
+
+def _record_interruption(store, contract_id, verdict, decision,
+                         channel, reason) -> bool:
+    """Record a detected interrupted completion and flip the verdict
+    to the failure state — conditionally (round-7 fix spec K3;
+    round-7 gate-core F2, security F2).
+
+    The observation lands first (deduped, spec K6), so the decision
+    it names survives even if this process dies before the flip.
+    The flip itself goes through the store's conditional setter
+    when one exists: it lands only while the verdict still reads
+    the decided value the detector observed. A False return means
+    the flip lost — the gate moved under this presentation (a
+    concurrent presenter claimed, recovered, or completed it) —
+    and the caller re-reads the gate and answers per the fresh
+    state instead of proceeding on a stale one. Stores without the
+    conditional setter (older doubles) keep the round-6 behavior:
+    the unconditional flip, and always True."""
+    _append_gate_failure_once(store, contract_id, decision, channel,
+                              reason)
+    flip = getattr(store, "set_human_gate_if", None)
+    if callable(flip):
+        try:
+            landed = bool(flip(verdict["id"],
+                               verdict.get("human_gate"), "failed"))
+        except Exception:  # noqa: BLE001 - a store that cannot answer leaves the legacy path in charge
+            landed = True
+        if not landed:
+            return False
+    else:
+        setter = getattr(store, "set_verdict_human_gate", None)
+        if callable(setter):
+            try:
+                setter(verdict["id"], "failed")
+            except Exception:  # noqa: BLE001
+                pass
+    set_status = getattr(store, "set_contract_status", None)
+    if callable(set_status):
+        try:
+            set_status(contract_id, "gate_failed")
+        except Exception:  # noqa: BLE001
+            pass
+    return True
+
+
+def _answer_for_moved_gate(store, contract_id, decision, _result):
+    """Answer a presentation whose recovery flip lost the race
+    (round-7 fix spec K3): re-read the gate and answer per its
+    fresh state — a gate a concurrent presenter completed answers
+    as completed, with its certificate; anything else is the
+    standing no-pending-gate refusal. Never a fabricated failure:
+    this presentation proceeds on nothing the winner's book
+    contradicts."""
+    try:
+        verdict = store.latest_verdict(contract_id) or {}
+        contract = store.get_contract(contract_id) or {}
+    except Exception:  # noqa: BLE001 - unreadable is unanswerable
+        verdict, contract = {}, {}
+    if contract.get("status") == "completed" \
+            and verdict.get("human_gate") == decision:
+        result = dict(_result or {"contract_id": contract_id})
+        result.update({
+            "status": "completed", "human_gate": decision,
+            "merge_source": "already_completed",
+            "detail": ("the gate was completed by a concurrent "
+                       "presenter while this presentation was being "
+                       "decided; converged on its result"),
+        })
+        _attach_certificate(result, store, contract_id)
+        return result
+    return {"contract_id": contract_id, "status": "error",
+            "detail": "no pending human gate for this contract"}
+
+
+def _mismatch_result(store, contract_id, gate_state, _result,
+                     mismatch):
+    """The refusal for a final answer that failed validation
+    (round-7 fix spec K1): an error naming the failed check, no
+    failure state recorded, no certificate — the gate is not
+    consumed and the row is left for the operator, named in the
+    detail."""
+    result = dict(_result or {"contract_id": contract_id})
+    try:
+        current = store.latest_verdict(contract_id) or {}
+    except Exception:  # noqa: BLE001 - the entry state is the fallback
+        current = {}
+    result.update({
+        "status": "error",
+        "human_gate": current.get("human_gate", gate_state),
+        "detail": (
+            f"a final answer exists for this contract but does not "
+            f"check out: {mismatch}; refusing to converge on it — "
+            f"the completion was refused and the gate is not "
+            f"consumed; resolve the row and present the decision "
+            f"again"),
+    })
+    return result
+
+
+def _granted_waiver_record(store, contract_id, verdict):
+    """The verdict's waiver dict when it already reads granted, else
+    None (round-7 fix spec K6). The passed verdict is a
+    presentation-time snapshot; a fresh read backs it up, because a
+    grant written by the attempt that died — or earlier in this
+    call sequence — is the one a retry must preserve."""
+    waiver = (verdict or {}).get("waiver") or {}
+    if waiver.get("status") == "granted":
+        return dict(waiver)
+    try:
+        fresh = store.latest_verdict(contract_id) or {}
+    except Exception:  # noqa: BLE001 - the snapshot remains the fallback
+        fresh = {}
+    waiver = fresh.get("waiver") or {}
+    if waiver.get("status") == "granted":
+        return dict(waiver)
+    return None
+
+
+def _grant_waiver(store, contract_id, verdict, waiver, winner,
+                  reason, channel):
+    """The verdict's granted waiver record, written if not already
+    granted (fix pass Wave 2.7, review H6; round-7 fix spec K6;
+    round-7 gate-core F3).
+
+    A retry — or a convergence — that finds the grant already on
+    the verdict PRESERVES it: the record names the original grant's
+    reason and granting channel, not the retry's defaults or its
+    channel. Only a gate whose waiver is still merely offered gets
+    the record built from this call and written."""
+    granted = _granted_waiver_record(store, contract_id, verdict)
+    if granted is not None:
+        return granted
+    record = dict(waiver)
+    record.update({
+        "gate": "measured", "status": "granted", "by": channel,
+        "provenance": channel, "candidate": winner["id"],
+        "reason": reason or "waived at the human gate",
+    })
+    setter = getattr(store, "set_verdict_waiver", None)
+    if callable(setter):
+        setter(verdict["id"], record)
+    return record
+
+
+def _is_duplicate_answer_signal(exc) -> bool:
+    """True when a create_final_answer failure is the store's
+    duplicate signal (round-7 fix spec K3): the store's atomic
+    check-and-insert raises FinalAnswerExistsError; a uniqueness
+    violation from any other store shape names itself in its type
+    or message. Anything else is a real write failure and must take
+    the failure path, not convergence."""
+    if type(exc).__name__ == "FinalAnswerExistsError":
+        return True
+    message = str(exc).lower()
+    return ("unique" in message or "duplicate" in message
+            or "already exists" in message)
+
+
+def _finish_from_existing_answer(store, contract_id, decision, reason,
+                                 mgr, verdict, winner, waiver, result,
+                                 channel):
+    """Converge a completion on the final answer already on the book
+    (round-6 fix spec J1; round-6 gate-core F3, security F1; round-7
+    fix spec K1/K2/K3).
+
+    The row is VALIDATED before it is trusted (round-7 attack F1,
+    security F3): its recorded decision must equal the decision
+    being completed, and a "git:" commit must name a real commit in
+    the contract's repository — the checks the normal merge path
+    applies to its own work. A row failing either raises
+    :class:`_FinalAnswerMismatch` before anything is written: a
+    planted row (one raw INSERT, a free-text commit, a merge that
+    never happened) completes nothing. A row passing them IS the
+    completion's durable record: the merge is not repeated, no
+    second answer is written, and the remaining steps (the waiver
+    grant, the merge record, the terminal status, ref cleanup, the
+    certificate) converge idempotently."""
+    answer = _final_answer_row(store, contract_id)
+    if answer is None:
+        # Callers check first; the row vanishing between the check
+        # and here is not a convergence — surface a plain error for
+        # the caller's failure handling.
+        raise RuntimeError(
+            "final answer vanished before convergence could read it")
+    problem = _validate_final_answer(mgr, answer, decision)
+    if problem is not None:
+        raise _FinalAnswerMismatch(problem)
+    waiver_record = None
+    if decision == "waived":
+        waiver_record = _grant_waiver(
+            store, contract_id, verdict, waiver, winner, reason,
+            channel)
+    merged_sha = str(answer.get("commit") or "")
+    if merged_sha.startswith("git:"):
+        merged_sha = merged_sha[len("git:"):]
+    commit = (winner or {}).get("payload_hash") or merged_sha
+    result["merge_source"] = "already_completed"
+    note = ("a final answer already exists for this contract; "
+            "completion converged without re-merging or writing "
+            "a second answer")
+    result["detail"] = (
+        f"{result['detail']}; {note}" if result.get("detail") else note
+    )
+    # The gate_completion observation is the durable merge record —
+    # append it only if the first attempt died before writing it,
+    # so a converged book carries exactly one.
+    prior = store.get_contract(contract_id) or {}
+    already_noted = any(
+        isinstance(obs, dict) and obs.get("kind") == "gate_completion"
+        for obs in prior.get("observations") or [])
+    if not already_noted:
+        try:
+            store.append_observation(contract_id, {
+                "kind": "gate_completion", "decision": decision,
+                "merge_source": "already_completed",
+                "commit": merged_sha, "channel": channel,
+            })
+        except Exception:  # noqa: BLE001 - bookkeeping must not undo a merge
+            pass
+    store.set_contract_status(contract_id, "completed")
+    if winner is not None:
+        _delete_snapshot_ref(mgr, contract_id, winner["id"])
+    result.update({"status": "completed", "commit": f"git:{merged_sha}",
+                   "winner_commit": f"git:{commit}",
+                   "waiver": waiver_record})
+    _attach_certificate(result, store, contract_id)
+    return result
 
 
 def _delete_snapshot_ref(mgr, contract_id, candidate_id):
@@ -1821,6 +2134,21 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
     step converges to the completed result instead of flipping the
     gate to "failed", and no second answer is ever written (round-6
     gate-core F3, security F1).
+
+    Round 7 hardens the recovery (fix spec K1/K2/K3/K6): the
+    detector also owns the post-answer window — a decided verdict
+    whose final answer landed but whose terminal status never did
+    is an interrupted completion too, and the presentation converges
+    it instead of refusing forever. Convergence VALIDATES the
+    answer it trusts: a row whose recorded decision differs, or
+    whose "git:" commit names no commit in the contract's
+    repository, completes nothing — the presentation refuses with
+    the failed check named, records no failure state, and leaves
+    the gate unconsumed for the operator. The detector's recording
+    flip is conditional on the state it observed, so a presenter
+    racing a live recovery loses cleanly and answers per the fresh
+    state; and the verdict's claim — never the failure log — is the
+    authority a retry is bound to.
     """
     if decision not in ("approved", "rejected", "waived"):
         return {"contract_id": contract_id, "status": "error",
@@ -1840,8 +2168,8 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
     # the process died after the claim and the failure state was
     # never written (round-6 fix spec J1; round-6 gate-core F1).
     interrupted = _interrupted_completion(store, contract_id, verdict, contract)
-    is_retry = gate_state == "failed" or interrupted
-    claimable = gate_state in ("pending", "failed") or interrupted
+    is_retry = gate_state == "failed" or interrupted is not None
+    claimable = gate_state in ("pending", "failed") or interrupted is not None
 
     if is_retry:
         # A retry re-attempts the completion of the decision that
@@ -1858,14 +2186,20 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
                         f"{recorded!r}; a retry must present the recorded "
                         f"decision — a different decision needs an explicit "
                         f"operator reset, not the retry path")}
-        if interrupted:
+        if interrupted is not None:
             # The interruption enters the audit trail exactly as the
             # exception path would have written it, so a reader of
-            # the book cannot tell the two apart afterwards.
-            _record_gate_failure(
-                store, contract_id, verdict, decision, channel,
-                RuntimeError(
-                    "interrupted completion (process death after claim)"))
+            # the book cannot tell the two apart afterwards. The
+            # recording's flip is conditional on the state observed
+            # (round-7 fix spec K3): if it loses, the gate moved
+            # under this presentation — a concurrent presenter owns
+            # it now — and the answer comes from the fresh state,
+            # never from a fabricated failure.
+            if not _record_interruption(
+                    store, contract_id, verdict, decision, channel,
+                    interrupted):
+                return _answer_for_moved_gate(
+                    store, contract_id, decision, _result)
 
     # Refusals that leave the gate undecided are decided BEFORE the
     # claim: they record nothing, consume nothing, and carry no
@@ -1897,7 +2231,7 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
     # by now: its interruption was recorded above in exactly the
     # failure state's shape, so it re-claims with retry like any
     # other retry, and the claim restores the verdict's decided value.
-    if interrupted:
+    if interrupted is not None:
         claimed = _claim_gate(
             store, {**verdict, "human_gate": "failed"}, decision,
             retry=True)
@@ -1912,20 +2246,36 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
         return _complete_human_gate(
             store, contract_id, decision, reason, contract, mgr,
             verdict, winner, waiver, result, channel)
+    except _FinalAnswerMismatch as mismatch:
+        # The answer on record failed convergence validation
+        # (round-7 fix spec K1): refuse WITHOUT the failure state —
+        # nothing further is written, no certificate, and the gate
+        # is not consumed; the row is the operator's to resolve.
+        return _mismatch_result(
+            store, contract_id, gate_state, _result, mismatch)
     except Exception as exc:  # noqa: BLE001 - completion failures land in the failure state
+        mismatch = None
         if decision != "rejected" \
                 and _final_answer_row(store, contract_id) is not None:
             # The completion's durable record already exists: whatever
             # failed came after it, so the gate is completed, not
             # failed (round-6 fix spec J1; round-6 gate-core F3,
             # security F1). Converge instead of recording a failure
-            # state the book would contradict.
+            # state the book would contradict. The convergence
+            # validates the row like any other (round-7 fix spec
+            # K1): a mismatch on re-entry is the refusal above, not
+            # a failure state.
             try:
                 return _complete_human_gate(
                     store, contract_id, decision, reason, contract, mgr,
                     verdict, winner, waiver, result, channel)
+            except _FinalAnswerMismatch as caught:
+                mismatch = caught
             except Exception:  # noqa: BLE001 - fall through to the failure state
                 pass
+        if mismatch is not None:
+            return _mismatch_result(
+                store, contract_id, gate_state, _result, mismatch)
         failure = _record_gate_failure(
             store, contract_id, verdict, decision, channel, exc)
         result = dict(_result or {"contract_id": contract_id})
@@ -1956,7 +2306,15 @@ def _complete_human_gate(store, contract_id, decision, reason, contract,
     answer means the merge already landed, so the merge is skipped
     outright and the remaining steps (status, ref cleanup,
     certificate) simply converge; an existing rejection observation
-    on the child contract is reused instead of appended twice."""
+    on the child contract is reused instead of appended twice.
+
+    Round 7 (fix spec K1/K3/K6): the existing answer is validated
+    before it is trusted (:func:`_finish_from_existing_answer`) — a
+    planted row completes nothing; the waiver grant is preserved
+    when a previous attempt already wrote it; and the answer write
+    itself tolerates the store's duplicate signal: a concurrent
+    presenter who won the atomic insert leaves this completion to
+    converge on their row instead of duplicating it."""
     if decision == "rejected":
         new_id = f"{contract_id}_rej{verdict['attempt']}"
         if store.get_contract(new_id) is None:
@@ -1993,69 +2351,37 @@ def _complete_human_gate(store, contract_id, decision, reason, contract,
         result.update({"status": "rejected", "new_contract_id": new_id})
         return result
 
+    # A final answer already on the book means a previous attempt
+    # completed the merge and wrote the completion's durable record:
+    # converge — never re-merge, never write a second answer
+    # (round-6 fix spec J1; round-6 gate-core F3, security F1). The
+    # row is validated before it is trusted (round-7 fix spec K1;
+    # round-7 attack F1, security F3): convergence is the first
+    # thing this completion does, so a row that fails validation
+    # aborts before the waiver grant or anything else is written.
+    existing_answer = _final_answer_row(store, contract_id)
+    if existing_answer is not None:
+        return _finish_from_existing_answer(
+            store, contract_id, decision, reason, mgr, verdict,
+            winner, waiver, result, channel)
+
     # The waiver-grant record is written BEFORE the merge attempt
     # (round-5 fix spec H1; round-5 gate-core F7): the decision and
     # its reason are known at claim time and the merge does not
     # change them. A failed write aborts here — into the caller's
     # failure wrap — instead of being swallowed after a merge the
-    # book would then misdescribe as merely "offered".
+    # book would then misdescribe as merely "offered". A grant a
+    # previous attempt already wrote is preserved, not rewritten
+    # with this call's defaults (round-7 fix spec K6).
     waiver_record = None
     if decision == "waived":
         # The waiver is granted, by the deciding channel, for a reason
         # — on the verdict row, not only in the run result (fix pass
         # Wave 2.7, review H6; the channel replaces the old hardcoded
         # "human", round-4 security F7).
-        waiver_record = dict(waiver)
-        waiver_record.update({
-            "gate": "measured", "status": "granted", "by": channel,
-            "provenance": channel, "candidate": winner["id"],
-            "reason": reason or "waived at the human gate",
-        })
-        setter = getattr(store, "set_verdict_waiver", None)
-        if callable(setter):
-            setter(verdict["id"], waiver_record)
-
-    # A final answer already on the book means a previous attempt
-    # completed the merge and wrote the completion's durable record:
-    # converge — never re-merge, never write a second answer
-    # (round-6 fix spec J1; round-6 gate-core F3, security F1).
-    existing_answer = _final_answer_row(store, contract_id)
-    if existing_answer is not None:
-        merged_sha = str(existing_answer.get("commit") or "")
-        if merged_sha.startswith("git:"):
-            merged_sha = merged_sha[len("git:"):]
-        commit = (winner or {}).get("payload_hash") or merged_sha
-        result["merge_source"] = "already_completed"
-        note = ("a final answer already exists for this contract; "
-                "completion converged without re-merging or writing "
-                "a second answer")
-        result["detail"] = (
-            f"{result['detail']}; {note}" if result.get("detail") else note
-        )
-        # The gate_completion observation is the durable merge
-        # record — append it only if the first attempt died before
-        # writing it, so a converged book carries exactly one.
-        prior = store.get_contract(contract_id) or {}
-        already_noted = any(
-            isinstance(obs, dict) and obs.get("kind") == "gate_completion"
-            for obs in prior.get("observations") or [])
-        if not already_noted:
-            try:
-                store.append_observation(contract_id, {
-                    "kind": "gate_completion", "decision": decision,
-                    "merge_source": "already_completed",
-                    "commit": merged_sha, "channel": channel,
-                })
-            except Exception:  # noqa: BLE001 - bookkeeping must not undo a merge
-                pass
-        store.set_contract_status(contract_id, "completed")
-        if winner is not None:
-            _delete_snapshot_ref(mgr, contract_id, winner["id"])
-        result.update({"status": "completed", "commit": f"git:{merged_sha}",
-                       "winner_commit": f"git:{commit}",
-                       "waiver": waiver_record})
-        _attach_certificate(result, store, contract_id)
-        return result
+        waiver_record = _grant_waiver(
+            store, contract_id, verdict, waiver, winner, reason,
+            channel)
 
     # approved (or a valid measured waiver): merge the winner's
     # verdict-time snapshot — what was gated — never the live tree.
@@ -2112,11 +2438,24 @@ def _complete_human_gate(store, contract_id, decision, reason, contract,
             deleter(f"critic/{contract_id}/baseline")
         except Exception:  # noqa: BLE001
             pass
-    store.create_final_answer(
-        target_id=contract["target_id"], contract_id=contract_id,
-        commit=f"git:{merged_sha}",
-        intent_check=None, human_gate=decision,
-    )
+    try:
+        store.create_final_answer(
+            target_id=contract["target_id"], contract_id=contract_id,
+            commit=f"git:{merged_sha}",
+            intent_check=None, human_gate=decision,
+        )
+    except Exception as exc:  # noqa: BLE001 - the duplicate signal converges; anything else takes the failure path
+        if _final_answer_row(store, contract_id) is None \
+                or not _is_duplicate_answer_signal(exc):
+            raise
+        # A concurrent presenter won the store's atomic insert
+        # (round-7 fix spec K3): converge on their row — validated
+        # like any existing answer — instead of duplicating it.
+        # This merge landed the same snapshot, so the book agrees
+        # either way.
+        return _finish_from_existing_answer(
+            store, contract_id, decision, reason, mgr, verdict,
+            winner, waiver, result, channel)
     # The merge source is durable, not only in the result dict
     # (round-5 fix spec H1; round-5 gate-core F3): a gate_completion
     # observation on the contract names which path merged — the
