@@ -160,6 +160,28 @@ def _contract_id(contract, verdict):
     )
 
 
+def _verdict_waived(verdict, gate_details):
+    """True when this verdict is a waiver verdict.
+
+    Owner ruling 2026-11-09 (Item 1 = A; FIX-SPEC-DECISIONS D1): "a
+    waiver demotes nobody — the human accepted the measured failure."
+    The waiver reaches derivation through whichever surface recorded
+    it: the verdict row's ``waiver`` record (offered/granted for the
+    measured gate), a ``waiver_candidate`` on the verdict, or the
+    gate details' ``waiver_candidate`` (the candidate the measured
+    gate failed but the verdict proposes to waive through).
+    """
+    verdict = verdict or {}
+    gate_details = gate_details or {}
+    if verdict.get("waiver"):
+        return True
+    if verdict.get("waiver_candidate"):
+        return True
+    if gate_details.get("waiver_candidate"):
+        return True
+    return False
+
+
 def derive_outcome_cause(contract, verdict, gate_details):
     """Derive (outcome, cause, rule, route_change, evidence) from gate evidence."""
     contract = contract or {}
@@ -176,6 +198,13 @@ def derive_outcome_cause(contract, verdict, gate_details):
     # collapsed to single capped lines.  write_lesson re-sanitizes the
     # composed fields before storing, as a second net.
     declared = _declared_metrics(contract)
+    # Owner ruling 2026-11-09 (Item 1 = A): a waived verdict demotes
+    # nobody — where the old derivation attached a route_change to
+    # any measured/hard failure regardless of the waiver (the
+    # decisions doc's defect 4: the proposed winner's own expert was
+    # demoted while its win was recorded), a waiver verdict's lesson
+    # carries NO route_change at all (suppression, not a held row).
+    waived = _verdict_waived(verdict, gate_details)
 
     # 1. Measured gate failure — first failing measurement row wins.
     for row in gate_details.get("measurements") or []:
@@ -208,7 +237,7 @@ def derive_outcome_cause(contract, verdict, gate_details):
         expert = candidate_experts.get(candidate_id)
         route_change = (
             {"category": category, "demote": expert, "reason": "lost on measured gate"}
-            if expert
+            if expert and not waived
             else None
         )
         evidence = [
@@ -233,7 +262,7 @@ def derive_outcome_cause(contract, verdict, gate_details):
         expert = candidate_experts.get(candidate_id)
         route_change = (
             {"category": category, "demote": expert, "reason": "lost on hard gate"}
-            if expert
+            if expert and not waived
             else None
         )
         evidence = [

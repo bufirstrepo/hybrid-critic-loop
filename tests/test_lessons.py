@@ -367,7 +367,13 @@ class TestRouter(unittest.TestCase):
         # Route actually updated in the store.
         self.assertEqual(store.get_route("code")["primary"], "grok")
 
-    def test_demotion_of_non_primary_keeps_primary_as_promote(self):
+    def test_demotion_of_non_primary_names_no_promote(self):
+        # Owner ruling 2026-11-09 (Item 1 = A; FIX-SPEC-DECISIONS
+        # D1): the primary is never named as the promote for another
+        # seat's demotion — the old default did exactly that, and the
+        # store seated the primary as its own compete_with (the
+        # decisions doc's defect 2). A non-primary demotion now
+        # passes promote=None.
         store = FakeStore()
         router.ensure_routes(store)
         router.apply_lesson_route_change(
@@ -376,7 +382,7 @@ class TestRouter(unittest.TestCase):
         )
         self.assertEqual(
             store.route_demotion_calls,
-            [("code", "claude", "codex", "lost on hard gate")],
+            [("code", "claude", None, "lost on hard gate")],
         )
 
     def test_demotion_of_a_seat_with_no_route_position_reports_no_change(self):

@@ -127,13 +127,56 @@ def _route_positions(route):
     )
 
 
-def apply_lesson_route_change(store, category, route_change, contract_id):
+def _gate_checked_promote(route_change, demote, current, passed):
+    """The promotion candidate under the owner's route rule.
+
+    Owner ruling 2026-11-09 (Item 1 = A): never promote a seat that
+    failed the deciding gate. An explicitly named promote is honoured
+    only when it passed; otherwise the first gate-passing seat in
+    route order after the demoted seat's slot is chosen. Returns None
+    when no gate-passing seat can take a top slot.
+    """
+    explicit = route_change.get("promote")
+    if explicit and explicit != demote and explicit in passed:
+        return explicit
+    primary = current.get("primary")
+    compete_with = current.get("compete_with")
+    fallback = list(current.get("fallback") or [])
+    if demote == primary:
+        pool = [compete_with, *fallback]
+    elif demote == compete_with:
+        pool = list(fallback)
+    else:
+        pool = []
+    for seat in pool:
+        if seat is not None and seat != demote and seat in passed:
+            return seat
+    return None
+
+
+def apply_lesson_route_change(store, category, route_change, contract_id,
+                              gate_passed=None):
     """Apply a lesson's route change. Returns a human line, or None.
 
     If ``route_change`` names an expert to demote, demote it via the store,
     promoting ``route_change['promote']`` or — when the demoted expert is
-    the current primary — the ``compete_with`` expert, otherwise keeping
-    the current primary in place.  A ledger row records the change.
+    the current primary — the ``compete_with`` expert.  A ledger row
+    records the change.
+
+    Owner ruling 2026-11-09 (Item 1 = A; FIX-SPEC-DECISIONS D1):
+    "Demote = move the loser behind every seat that passed the
+    deciding gate; never promote a seat that failed it." When the
+    caller supplies ``gate_passed`` (the experts whose candidates
+    passed the deciding gate), the promotion is gate-checked — an
+    explicitly named promote that failed the gate is ignored, and
+    the store is asked to rebuild the route order around the passed
+    set so the loser lands behind every gate-passing seat. If no
+    gate-passing seat exists to promote, the route cannot move: the
+    demotion is still recorded — a ledger row and a line that say
+    plainly that no gate-passing seat was available — instead of an
+    unqualified promotion. Callers that supply no gate results keep
+    the pre-ruling promotion default (the store's own
+    ``primary == compete_with`` guard still applies).
 
     The line reports what the demotion call's RETURN says actually
     changed (fix spec G8; round-3 contest-core F5): the store's
@@ -154,37 +197,85 @@ def apply_lesson_route_change(store, category, route_change, contract_id):
     current = route_for(store, category) or {}
     primary = current.get("primary")
     compete_with = current.get("compete_with")
-    promote = route_change.get("promote") or (
-        primary if demote != primary else compete_with
-    )
+    passed = set(gate_passed) if gate_passed is not None else None
+    if passed is not None:
+        promote = _gate_checked_promote(route_change, demote, current, passed)
+    else:
+        # Pre-ruling default, minus the defect-2 trap: the primary is
+        # never named as the promote for another seat's demotion (the
+        # store used to seat it as compete_with alongside itself).
+        promote = route_change.get("promote") or (
+            compete_with if demote == primary else None
+        )
     before = _route_positions(current)
 
     result = None
-    try:
-        result = store.apply_route_demotion(category, demote, promote, reason)
-    except TypeError:
-        result = store.apply_route_demotion(
-            category, demote=demote, promote=promote, reason=reason
-        )
+    if passed is not None:
+        try:
+            result = store.apply_route_demotion(
+                category, demote, promote, reason, passed_experts=passed
+            )
+        except TypeError:
+            result = None
+    if result is None:
+        try:
+            result = store.apply_route_demotion(category, demote, promote, reason)
+        except TypeError:
+            result = store.apply_route_demotion(
+                category, demote=demote, promote=promote, reason=reason
+            )
 
     if isinstance(result, dict) and "changed" in result:
         # The store reported the change itself: speak from it exactly.
         changed = bool(result["changed"])
         promoted_actual = result.get("promoted")
+        branch = result.get("branch")
         new_route = result
     else:
         new_route = result if isinstance(result, dict) and result else route_for(store, category)
         changed = _route_positions(new_route) != before
         promoted_actual = promote if changed else None
+        branch = None
     new_primary = (new_route or {}).get("primary", primary)
 
     if not changed:
+        if passed is not None and branch in ("primary", "compete_with"):
+            # The demoted seat holds a position, but no gate-passing
+            # seat exists to move it behind (owner ruling, Item 1 =
+            # A): record the demotion honestly — no unqualified
+            # promotion, no claimed reshuffle.
+            note = (
+                f"route_change demote {demote} ({reason}) contract "
+                f"{contract_id}: no seat that passed the deciding gate "
+                f"to promote; route unchanged"
+            )
+            _record_route_ledger(store, demote, contract_id, note)
+            return (
+                f"Route for {category}: demoted {demote} — no seat that "
+                f"passed the deciding gate to promote; route unchanged "
+                f"— {reason} (contract {contract_id})"
+            )
         return (
             f"Route for {category}: no route change — {demote} holds no "
             f"route position to demote from — {reason} (contract {contract_id})"
         )
 
     note = f"route_change demote {demote} ({reason}) contract {contract_id}"
+    _record_route_ledger(store, demote, contract_id, note)
+
+    if promoted_actual:
+        return (
+            f"Route for {category}: demoted {demote}, promoted {promoted_actual} "
+            f"(primary is now {new_primary}) — {reason} (contract {contract_id})"
+        )
+    return (
+        f"Route for {category}: demoted {demote} within the fallback order "
+        f"(primary is now {new_primary}) — {reason} (contract {contract_id})"
+    )
+
+
+def _record_route_ledger(store, demote, contract_id, note):
+    """Write the router's internal ledger row for a route change."""
     try:
         # Tightening spec T2: router bookkeeping is an internal writer.
         store.add_ledger(expert_id=demote, outcome="observed", note=note,
@@ -202,13 +293,3 @@ def apply_lesson_route_change(store, category, route_change, contract_id):
             pass
     except Exception:
         pass
-
-    if promoted_actual:
-        return (
-            f"Route for {category}: demoted {demote}, promoted {promoted_actual} "
-            f"(primary is now {new_primary}) — {reason} (contract {contract_id})"
-        )
-    return (
-        f"Route for {category}: demoted {demote} within the fallback order "
-        f"(primary is now {new_primary}) — {reason} (contract {contract_id})"
-    )

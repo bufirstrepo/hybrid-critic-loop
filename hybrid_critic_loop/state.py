@@ -1663,7 +1663,7 @@ class Store:
         }
 
     def apply_route_demotion(self, category, demote_expert, promote_expert,
-                             reason):
+                             reason, passed_experts=None):
         """Apply a route demotion and report what actually changed
         (fix spec G8; round-3 contest-core F5).
 
@@ -1677,6 +1677,27 @@ class Store:
         route position changes nothing — the old code had no fallback
         or absent branch at all, so most demotions were silent no-ops
         that callers nevertheless reported as done.
+
+        Owner ruling 2026-11-09 (Item 1 = A; FIX-SPEC-DECISIONS D1,
+        Claude's suggestion verbatim): "Demote = move the loser
+        behind every seat that passed the deciding gate; never
+        promote a seat that failed it." Two consequences live here:
+
+        * The lineup can NEVER end with ``primary == compete_with``
+          (the decisions doc's defect 2: demoting the compete seat
+          with the primary named as its replacement used to seat the
+          primary in both slots). A replacement that would duplicate
+          the primary is refused — the compete seat is vacated
+          instead, and no promotion is reported.
+        * When ``passed_experts`` (the seats that passed the deciding
+          gate) is supplied, the route order is rebuilt around it:
+          gate-passing seats first (route order preserved), then the
+          demoted loser, then the remaining seats. The loser ends
+          behind every gate-passing seat, and the top slots are only
+          ever filled from the passed set — a seat that failed the
+          gate cannot be promoted, explicitly or by backfill. With no
+          gate-passing seat in the route the order cannot move, and
+          the report says so (``changed`` False, ``promoted`` None).
 
         Returns the resulting route dict (the ``get_route`` shape)
         plus the change report callers must speak from: ``changed``
@@ -1695,7 +1716,52 @@ class Store:
         before = (primary, compete_with, list(fallback))
         branch = "none"
         promoted = None
-        if demote_expert == primary:
+        if promote_expert == demote_expert:
+            promote_expert = None
+        if passed_experts is not None:
+            passed = set(passed_experts)
+            order = []
+            for seat in (primary, compete_with, *fallback):
+                if seat is not None and seat not in order:
+                    order.append(seat)
+            if demote_expert in order:
+                if demote_expert == primary:
+                    branch = "primary"
+                elif demote_expert == compete_with:
+                    branch = "compete_with"
+                else:
+                    branch = "fallback"
+                slot = order.index(demote_expert)
+                passed_order = [
+                    s for s in order if s != demote_expert and s in passed
+                ]
+                rest = [
+                    s for s in order
+                    if s != demote_expert and s not in passed
+                ]
+                if passed_order:
+                    # Passed seats first, then the loser, then the
+                    # rest: the loser lands behind every gate-passing
+                    # seat and no failed seat gains a top slot. With
+                    # NO gate-passing seat in the route there is
+                    # nothing lawful to move the loser behind — the
+                    # order stands and the report says so.
+                    new_order = passed_order + [demote_expert] + rest
+                    primary = new_order[0]
+                    compete_with = (
+                        new_order[1] if len(new_order) > 1 else None
+                    )
+                    fallback = new_order[2:]
+                    if branch in ("primary", "compete_with"):
+                        holder = (
+                            new_order[slot]
+                            if slot < len(new_order) else None
+                        )
+                        if holder is not None \
+                                and holder != demote_expert \
+                                and holder in passed:
+                            promoted = holder
+        elif demote_expert == primary:
             branch = "primary"
             if promote_expert:
                 primary = promote_expert
@@ -1712,6 +1778,14 @@ class Store:
             branch = "fallback"
             fallback.remove(demote_expert)
             fallback.append(demote_expert)
+        if compete_with is not None and compete_with == primary:
+            # Defect 2 guard (owner ruling 2026-11-09, Item 1 = A):
+            # one expert can never hold both top slots. Vacate the
+            # compete seat rather than duplicate the primary, and
+            # report no promotion.
+            compete_with = None
+            if branch == "compete_with":
+                promoted = None
         changed = (primary, compete_with, fallback) != before
         if changed:
             self._conn.execute(
