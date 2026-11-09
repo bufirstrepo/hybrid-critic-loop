@@ -8,6 +8,7 @@ from those rows (never on invented totals).
 import contextlib
 import inspect
 import io
+import itertools
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,11 +28,19 @@ _DISPATCH_PROVENANCE = (
     else {}
 )
 
+_SLOTS = itertools.count(1)
+
 
 def _dispatch(store, expert="exp-1", contract="ctr-1", tin=100, tout=50,
               cost=12.5):
+    # Counted-row rule v2 (round-4 fix spec G8): an "executor-reported"
+    # row counts only when its candidate exists, so the helper records
+    # the candidate first — exactly as the real dispatch path does.
+    cand_id = store.create_candidate(
+        contract, 1, "implement", expert, "fam",
+        f"cand{next(_SLOTS)}", None, None)
     return store.add_ledger(
-        "tgt-1", contract, f"cand-{expert}-{id(object())}", "implement",
+        "tgt-1", contract, cand_id, "implement",
         expert, tin, tout, cost, "completed", None,
         **_DISPATCH_PROVENANCE,
     )
@@ -227,6 +236,30 @@ class TestHookInjection(_StoreCase):
         self.assertLessEqual(len(result["context"]), 10000)
         self.assertTrue(
             result["context"].startswith("Millionaire Matrix standing:"))
+
+    def test_cap_fine_grained_lessons_block_respects_the_line_budget(self):
+        # Round-4 test audit, mutation M7: the test above survived
+        # deleting the standing line from the lessons budget
+        # (budget = 10000 instead of 10000 - len(line) - 1) because
+        # its ~340-char lessons absorb the line's whole ~80 chars in
+        # fill slack. These lessons render in ~55-char steps — finer
+        # than the budget error — and the assertion is on the lessons
+        # block itself, not just the total.
+        _dispatch(self.store)
+        for i in range(300):
+            self._lesson(rule="", contract=f"c{i}")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = hooks.pre_llm_call(self.store, Path(tmp))
+        context = result["context"]
+        line = standing.standing_line(self.store)
+        self.assertTrue(context.startswith(line + "\n"))
+        lessons_block = context[len(line) + 1:]
+        self.assertLessEqual(len(lessons_block), 10000 - len(line) - 1)
+        self.assertLessEqual(len(context), 10000)
+        # The cap region is genuinely exercised: with the line's
+        # budget wrongly restored, the block would fill past the
+        # bound asserted above.
+        self.assertGreater(len(context), 9000)
 
 
 class TestCli(_StoreCase):

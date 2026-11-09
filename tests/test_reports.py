@@ -110,12 +110,21 @@ class TestLedgerReport(unittest.TestCase):
     def test_ledger_report_prints_unavailability_errors_and_the_queues_rows(self):
         # Fix pass Wave 2.8 (review M3): what each seat did, by name; the
         # queue's notes are printed as notes, never counted as dispatches.
+        # The dispatch rows are seeded as the real dispatch path writes
+        # them (candidate recorded, provenance "executor-reported") so
+        # they count under counted-row rule v2 (round-4 fix spec G8).
         with tempfile.TemporaryDirectory() as tmp:
             store = self._real_store(tmp)
-            store.add_ledger("tgt-1", "ctr-1", "cand-1", "implement", "exp-1",
-                             10, 5, None, "completed", None)
-            store.add_ledger("tgt-1", "ctr-1", "cand-2", "implement", "exp-1",
-                             None, None, None, "unavailable", "binary not found on PATH")
+            cand1 = store.create_candidate(
+                "ctr-1", 1, "implement", "exp-1", "fam", "cand-1", None, None)
+            cand2 = store.create_candidate(
+                "ctr-1", 1, "implement", "exp-1", "fam", "cand-2", None, None)
+            store.add_ledger("tgt-1", "ctr-1", cand1, "implement", "exp-1",
+                             10, 5, None, "completed", None,
+                             provenance="executor-reported")
+            store.add_ledger("tgt-1", "ctr-1", cand2, "implement", "exp-1",
+                             None, None, None, "unavailable", "binary not found on PATH",
+                             provenance="executor-reported")
             store.add_ledger("tgt-1", "ctr-1", None, "implement", "queue",
                              None, None, None, "observed", "bracket round 1: field 2 -> 1")
             store.add_ledger("tgt-1", "ctr-1", None, "implement", "queue",

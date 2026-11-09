@@ -70,6 +70,13 @@ def pre_llm_call(store, data_dir, **kw):
             # never-raises guard, so a standing module that fails to
             # import degrades to lessons-only injection instead of
             # taking the hook down at module load.
+            #
+            # has_standing is an existence probe (round-4 fix spec
+            # G3): it does not compute standing. standing_line then
+            # computes the standing at most once and reuses it for the
+            # line — and it is chain-gated (fix spec G8), so on a
+            # broken chain the line degrades to the unavailable
+            # notice while the lessons below still inject.
             from .standing import has_standing, standing_line
 
             if has_standing(store):

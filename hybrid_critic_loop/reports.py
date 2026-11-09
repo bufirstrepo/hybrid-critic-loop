@@ -12,6 +12,12 @@ the plugin's JSON view (:func:`build_matrix_view`, consumed by the
 reports surface dissent entries and panel status when the judged block
 recorded them.  All v0.3 keys are read defensively (``.get`` / hasattr)
 so these reports work against stores that predate them.
+
+CPVP states its own definition wherever it prints
+(:data:`CPVP_DEFINITION`; round-4 fix spec G8, contest F10): the
+figure is the generation cost of scored candidates over their
+validity points.  Judging cost is never written to the ledger, so it
+is not in the figure — excluded, and stated as excluded.
 """
 
 from __future__ import annotations
@@ -62,7 +68,18 @@ def _format_number(value):
 # Ledger
 # --------------------------------------------------------------------------
 
+#: What the cpvp figure counts, printed wherever cpvp figures print
+#: (round-4 fix spec G8; contest F10): generation cost of scored
+#: candidates over their validity points. Judging cost is not
+#: recorded by the system, so it is excluded — stated, not hidden.
+CPVP_DEFINITION = (
+    "cpvp: generation cost of scored candidates per validity point; "
+    "judging cost is not recorded by the system and is excluded"
+)
+
+
 def _cpvp_text(row):
+    """The row's cpvp, or "not reported" (see :data:`CPVP_DEFINITION`)."""
     value = row.get("cost_per_validity_point")
     if value is None:
         return "not reported"
@@ -148,7 +165,20 @@ def ledger_report(store) -> str:
         events = _events_lines(store)
         return "\n".join([text] + events) if events else text
     lines = ["ledger:"]
-    for row in summary or []:
+    # Per-expert dispatch counts/costs come from the unified totals
+    # (standing.expert_rows — counted-row rule v2), not from the
+    # provenance-blind summary figures, so this report and the
+    # standing agree about the same book (round-4 fix spec G8,
+    # contest F8). The summary still owns the experts table's fields
+    # (wins, validity, calibration). A store that cannot support the
+    # unified figures gets its summary rows unchanged.
+    try:
+        from .standing import expert_rows as _expert_rows
+
+        expert_lines = _expert_rows(store, summary)
+    except Exception:
+        expert_lines = summary
+    for row in expert_lines or []:
         expert = row.get("expert_id", row.get("expert", "?"))
         line = (
             f"{expert}: dispatches={row.get('dispatches', 0)} "
@@ -169,6 +199,8 @@ def ledger_report(store) -> str:
         if cal_text is not None:
             line += f" {cal_text}"
         lines.append(line)
+    if expert_lines:
+        lines.append(CPVP_DEFINITION)
     # The queue's own rows — escalations and observations (bracket rounds,
     # seated peers, held route changes) — are notes, not dispatches (fix
     # pass Wave 2.8, review M3): printed as recorded.
@@ -546,6 +578,30 @@ def _judged_summary(judged):
     return str(judged)
 
 
+def _winner_commit(store, winner):
+    """The winning candidate's recorded commit, or None.
+
+    The candidate's ``payload_hash`` is the verdict-time snapshot the
+    human gate merges (round-4 fix spec G1/G8; contest F12: the report
+    used to omit it, so what merged was invisible). None when there is
+    no winner, the store cannot name candidates, or the candidate
+    carries no recorded hash — the report prints "not reported"
+    rather than guessing.
+    """
+    if winner is None:
+        return None
+    get_candidate = getattr(store, "get_candidate", None)
+    if not callable(get_candidate):
+        return None
+    try:
+        candidate = get_candidate(winner)
+    except Exception:
+        return None
+    if isinstance(candidate, dict):
+        return candidate.get("payload_hash")
+    return None
+
+
 def verdict_report(store, contract_id) -> str:
     """Lines from the latest verdict row, or "verdict: not run"."""
     verdict = None
@@ -560,9 +616,13 @@ def verdict_report(store, contract_id) -> str:
         eliminated_text = ", ".join(str(e) for e in eliminated) or "none"
     else:
         eliminated_text = str(eliminated) if eliminated is not None else "not run"
+    winner = verdict.get("winner")
     lines = [
         f"verdict for {contract_id}:",
-        f"winner: {verdict.get('winner')}",
+        f"winner: {winner}",
+        f"winner_commit: {_value_or_not_reported(_winner_commit(store, winner))}",
+        f"attempt: {_value_or_not_reported(verdict.get('attempt'))}",
+        f"tie_break: {_value_or_not_reported(verdict.get('tie_break'))}",
         f"eliminated: {eliminated_text}",
         f"hard: {verdict.get('hard')}",
         f"measured: {verdict.get('measured')}",
