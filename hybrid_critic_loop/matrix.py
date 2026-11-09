@@ -76,6 +76,7 @@ agreement-only calibration, penalty named as a gap, never faked.
 
 from __future__ import annotations
 
+import json
 import random
 import re
 import statistics
@@ -1019,6 +1020,39 @@ def _judged_negatives(judged):
 _ELIMINATED_KIND_NEGATIVES = ("hard", "measured", "gate_error", "judged")
 
 
+def _candidate_eliminated_kind(candidate):
+    """The candidate's elimination kind, resolved canonically
+    (round-6 fix spec J2, round-6 gate-core F2).
+
+    The loop's write site (``loop._mark_eliminated``) persists the
+    kind INSIDE the candidate's evidence, and the real Store's
+    candidate dict carries ``evidence`` as a nested dict — there is
+    no top-level ``eliminated_kind`` on a persisted row. Round 5's
+    read site looked only at the top level, so on the production
+    wiring the H5 branch never fired: a gate_error candidate was
+    invisible to calibration instead of grading as a negative.
+
+    Canonical resolution: a top-level ``eliminated_kind``, when
+    present, wins (hand-built rows — the round-5 unit-test shape —
+    keep working); otherwise the kind is read from the candidate's
+    ``evidence``, which may be a dict (the real Store's shape) or a
+    JSON string (duck-typed rows that carry the raw column).
+    Returns None when neither place names a kind.
+    """
+    kind = candidate.get("eliminated_kind")
+    if kind is not None:
+        return kind
+    evidence = candidate.get("evidence")
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence)
+        except ValueError:
+            evidence = None
+    if isinstance(evidence, dict):
+        return evidence.get("eliminated_kind")
+    return None
+
+
 def _decidable_outcomes(candidates_by_id, verdicts_by_contract):
     """{candidate_id: True (positive) / False (negative)} for candidates
     with a KNOWN decidable outcome; unlisted candidates are unknown.
@@ -1035,15 +1069,21 @@ def _decidable_outcomes(candidates_by_id, verdicts_by_contract):
     candidates of an escalated verdict (that contest produced no
     winner; its judged map grades nobody).
 
-    Round-5 fix spec H5 (round-5 gate-core F5): the loop now persists
-    the elimination kind on the candidate row (``eliminated_kind``:
-    hard | measured | gate_error | judged | bracket_cut). A row
-    carrying it is governed by it: the four evidence kinds are
-    negatives — ``gate_error`` included, so a candidate the gates
-    killed on re-check after scoring is graded, not silently dropped
-    — bracket_cut is excluded, and candidates of an escalated verdict
-    stay excluded whole. Rows WITHOUT the field keep the pre-fix
-    ``eliminated_at`` behavior exactly.
+    Round-5 fix spec H5 (round-5 gate-core F5): the loop persists
+    the elimination kind (hard | measured | gate_error | judged |
+    bracket_cut) and a row carrying it is governed by it: the four
+    evidence kinds are negatives — ``gate_error`` included, so a
+    candidate the gates killed on re-check after scoring is graded,
+    not silently dropped — bracket_cut is excluded, and candidates
+    of an escalated verdict stay excluded whole. Rows WITHOUT the
+    kind keep the pre-fix ``eliminated_at`` behavior exactly.
+
+    Round-6 fix spec J2 (round-6 gate-core F2): the kind is resolved
+    by :func:`_candidate_eliminated_kind` — the loop writes it into
+    the candidate's ``evidence`` (the shape the real Store returns),
+    NOT at the top level round 5's read site expected, so the H5
+    branch was dead on the production wiring until the read side
+    learned the write side's shape.
     """
     outcomes: dict = {}
     for contract_id, verdict in verdicts_by_contract.items():
@@ -1058,7 +1098,7 @@ def _decidable_outcomes(candidates_by_id, verdicts_by_contract):
             if cid != winner:
                 outcomes[cid] = False
     for cid, candidate in candidates_by_id.items():
-        kind = candidate.get("eliminated_kind")
+        kind = _candidate_eliminated_kind(candidate)
         if kind is not None:
             if kind in _ELIMINATED_KIND_NEGATIVES:
                 verdict = verdicts_by_contract.get(
