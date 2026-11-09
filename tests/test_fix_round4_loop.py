@@ -208,7 +208,20 @@ class TestCertificatePlacement(RealGitBase):
     rejected results carry no stamp and no token."""
 
     def test_waiver_run_certifies_only_at_completion(self):
-        result = self._run_to_gate("ctr_cert", measured=True)
+        result = self._run_to_gate("ctr_cert")
+        # The gate flow below needs a verdict carrying an offered
+        # measured waiver. A run no longer produces that state — a
+        # measured regression fails the contract instead of reaching
+        # the gate (owner decisions 2026-11-09, Item 2(a) = B) — so
+        # the offer is placed on the verdict row directly: the state
+        # a pre-ruling run left behind. What this test pins is the
+        # GATE's handling of such a verdict, unchanged by the ruling:
+        # approval refused, explicit waiver, certificate only at
+        # completion.
+        self.store.set_verdict_waiver(result["verdict_id"], {
+            "gate": "measured", "status": "offered",
+            "candidate": result["winner"],
+        })
         self.assertNotIn("certificate", result)
         refused = loop_mod.record_human_gate(
             self.store, "ctr_cert", "approved")

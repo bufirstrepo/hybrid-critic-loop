@@ -200,7 +200,18 @@ class TestWaiverWriteFailure(RealGitBase):
     into the recorded failure state, leaving HEAD untouched."""
 
     def test_waiver_write_failure_aborts_before_merge(self):
-        self._run_to_gate("ctr_wfail", measured=True)
+        result = self._run_to_gate("ctr_wfail")
+        # The verdict must carry an offered measured waiver for the
+        # "waived" completion below to reach the grant write. A run
+        # no longer produces that state — a measured regression fails
+        # the contract instead of reaching the gate (owner decisions
+        # 2026-11-09, Item 2(a) = B) — so the offer is placed on the
+        # verdict row directly, before the store is swapped for the
+        # failing double.
+        self.store.set_verdict_waiver(result["verdict_id"], {
+            "gate": "measured", "status": "offered",
+            "candidate": result["winner"],
+        })
         head_before = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=str(self.repo),
             capture_output=True, text=True).stdout.strip()
@@ -318,20 +329,28 @@ class TestEliminatedKindPersisted(RealGitBase):
             {"gen-a": LazyGen("gen-a", "fam-a"),
              "gen-b": ScriptedGen("gen-b", "fam-b", "gen-b", duration_ms=5)},
             human_decider=None)
-        self.assertEqual(result["status"], "awaiting_human_gate", result)
-        by_expert = {c["expert_id"]: c
-                     for c in self.store.candidates_for("ctr_kinds")}
+        # Owner decisions 2026-11-09 (Item 2(a) = B): gen-b's
+        # measured-only failure no longer waives it through to a
+        # verdict — the run retries and escalates, so BOTH kinds stay
+        # recorded on the deciding attempt's rows, gen-b's "measured"
+        # included (there is no winner to strip it from). The H5
+        # property is unchanged: each kind is persisted at its
+        # elimination site, in the candidate's evidence.
+        self.assertEqual(result["status"], "escalated", result)
+        verdict = self.store.latest_verdict("ctr_kinds")
+        self.assertTrue(verdict["escalated"], verdict)
+        self.assertIsNone(verdict["waiver"], verdict)
+        deciding = [c for c in self.store.candidates_for("ctr_kinds")
+                    if c["attempt"] == verdict["attempt"]]
+        by_expert = {c["expert_id"]: c for c in deciding}
         hard_loser = self.store.get_candidate(by_expert["gen-a"]["id"])
         self.assertEqual(
             (hard_loser.get("evidence") or {}).get("eliminated_kind"),
             "hard", hard_loser)
-        # The winner failed only the measured gate and was waived
-        # through to the verdict: it is NOT an elimination, and its
-        # row carries no elimination kind.
-        winner = self.store.get_candidate(result["winner"])
-        self.assertEqual(winner["expert_id"], "gen-b")
-        self.assertNotIn("eliminated_kind",
-                         winner.get("evidence") or {})
+        measured_loser = self.store.get_candidate(by_expert["gen-b"]["id"])
+        self.assertEqual(
+            (measured_loser.get("evidence") or {}).get("eliminated_kind"),
+            "measured", measured_loser)
 
 
 if __name__ == "__main__":

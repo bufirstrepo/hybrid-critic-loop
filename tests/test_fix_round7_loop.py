@@ -361,7 +361,13 @@ class TestGateRecordKeeping(RealGitBase):
     authority, grants are preserved, interruption records dedupe."""
 
     def test_waiver_grant_preserved_on_retry(self):
-        result = self._run_to_gate("ctr_wv", measured=True)
+        # The run reaches the gate on a clean winner now: a measured
+        # regression fails the contract instead of arriving as a
+        # waiver candidate (owner decisions 2026-11-09, Item 2(a) =
+        # B). The granted-waiver state this test builds by hand on
+        # the verdict row — the durable leavings of a death after
+        # the grant write — is exactly what it was before the ruling.
+        result = self._run_to_gate("ctr_wv")
         winner = self.store.get_candidate(result["winner"])
         verdict = self.store.latest_verdict("ctr_wv")
         # The durable state a death after the grant write leaves:
@@ -369,7 +375,7 @@ class TestGateRecordKeeping(RealGitBase):
         # reason and the granting channel, nothing else.
         self.assertTrue(
             self.store.claim_human_gate(verdict["id"], "waived"))
-        grant = dict(verdict["waiver"])
+        grant = dict(verdict["waiver"] or {})
         grant.update({
             "gate": "measured", "status": "granted", "by": "tool",
             "provenance": "tool", "candidate": winner["id"],

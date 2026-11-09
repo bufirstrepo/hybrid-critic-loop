@@ -699,10 +699,21 @@ def _record_measured_failures(test):
 
 
 class TestMeasuredFailureNeedsAnExplicitWaiver(LoopV03Base):
-    """Fix pass Wave 2.7 (review H6, invariant 6): the only way past a
-    measured failure is an explicit waiver, recorded on the verdict row.
-    Before, a plain approval merged the failure and left the row saying
-    the waiver was merely offered."""
+    """Fix pass Wave 2.7 (review H6, invariant 6) made the explicit
+    waiver the only way past a measured failure: the run offered the
+    measured-failed candidate to the human gate, a plain approval was
+    refused, and only an explicit waive merged it.
+
+    Owner decisions 2026-11-09 (Item 2(a) = B) supersede that for
+    runs: a measured-only regression is NOT a valid contract — the
+    run fails it like any other gate failure and never offers a
+    waiver (pinned by the first test below). The gate machinery over
+    a verdict that DOES carry an offered waiver — approval refused,
+    explicit waive completing it, the grant recorded with its
+    channel — is unchanged and stays pinned by the gate fixtures
+    (round-4 certificate placement, round-5 waiver-write failure,
+    round-7 grant preservation) and by
+    tests/test_fix_decisions_scoring.py."""
 
     def setUp(self):
         super().setUp()
@@ -716,7 +727,7 @@ class TestMeasuredFailureNeedsAnExplicitWaiver(LoopV03Base):
             "judge-z": FakeJudge("judge-z", "fam-z", {"m-a": 9.0, "m-b": 8.0}),
         }
 
-    def test_approving_a_waiver_offered_verdict_is_refused_until_waived(self):
+    def test_measured_regression_fails_the_contract_without_a_waiver_offer(self):
         executors = self._executors()
         self.eliminated_at.update({"m-a": "measured", "m-b": "measured"})  # nobody survives
         self.panel("gen-a", "gen-b", ["judge-z"], ["gen-a", "gen-b"])
@@ -725,33 +736,19 @@ class TestMeasuredFailureNeedsAnExplicitWaiver(LoopV03Base):
             self.store, _contract(), "repo://fake", executors,
             human_decider=lambda info: (offered.update(info), "approved")[1],
         )
-        self.assertTrue(offered.get("waiver_offered"), offered)
-        self.assertEqual(result["status"], "error", result)
-        self.assertIn("waive", result["detail"])
+        # The failure machinery ran to its end: retries exhausted and
+        # the contract escalated. The run never reached a human gate —
+        # the decider was never consulted, no verdict carries a
+        # winner, and no waiver was offered or recorded.
+        self.assertEqual(result["status"], "escalated", result)
+        self.assertEqual(offered, {})
         verdict = self.store.latest_verdict("ctr_fake")
-        self.assertEqual(verdict["human_gate"], "pending")                 # still decidable
-        self.assertEqual(verdict["waiver"]["status"], "offered")
+        self.assertTrue(verdict["escalated"], verdict)
+        self.assertIsNone(verdict["winner"], verdict)
+        self.assertIsNone(verdict["waiver"], verdict)
         self.assertEqual(verdict["measured"], "fail")
-        self.assertEqual(self.store.get_contract("ctr_fake")["status"], "awaiting_human_gate")
-        self.assertIn("waiver: measured gate — offered", verdict_report(self.store, "ctr_fake"))
-        # An explicit waiver merges, and the record says who granted it.
-        done = loop_mod.record_human_gate(
-            self.store, "ctr_fake", "waived", "bench variance accepted by the operator"
-        )
-        self.assertEqual(done["status"], "completed", done)
-        self.assertEqual(done["waiver"]["status"], "granted")
-        verdict = self.store.latest_verdict("ctr_fake")
-        self.assertEqual(verdict["human_gate"], "waived")
-        self.assertEqual(verdict["waiver"]["status"], "granted")
-        # The recorded channel is the one the decision arrived through
-        # (fix spec G1; round-4 security F7): a direct record_human_gate
-        # call is the CLI channel — never a hardcoded "human".
-        self.assertEqual(verdict["waiver"]["by"], "cli")
-        self.assertEqual(verdict["waiver"]["reason"], "bench variance accepted by the operator")
-        self.assertEqual(self.store.get_contract("ctr_fake")["status"], "completed")
-        self.assertIn("waiver: measured gate — granted by cli", verdict_report(self.store, "ctr_fake"))
-        replay = loop_mod.record_human_gate(self.store, "ctr_fake", "approved")
-        self.assertEqual(replay["status"], "error")
+        self.assertEqual(verdict["human_gate"], "not_reached")
+        self.assertEqual(self.store.get_contract("ctr_fake")["status"], "escalated")
 
     def test_waiving_a_verdict_without_a_measured_failure_is_refused(self):
         executors = self._executors()

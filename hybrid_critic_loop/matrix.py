@@ -1099,6 +1099,13 @@ def _decidable_outcomes(candidates_by_id, verdicts_by_contract):
     NOT at the top level round 5's read site expected, so the H5
     branch was dead on the production wiring until the read side
     learned the write side's shape.
+
+    Owner decisions 2026-11-09 (Item 2(b) = B): the bracket-cut
+    exclusion is absolute. The judged-map pass above runs without
+    consulting the kind, so a bracket-cut passer whose judged-block
+    entry reads as a failure was still graded as a negative; the
+    candidate pass now vetoes that negative — only genuine gate
+    failures (and judged failures with no bracket-cut kind) count.
     """
     outcomes: dict = {}
     for contract_id, verdict in verdicts_by_contract.items():
@@ -1122,6 +1129,19 @@ def _decidable_outcomes(candidates_by_id, verdicts_by_contract):
                     continue  # escalated verdicts stay excluded whole
                 if outcomes.get(cid) is not True:
                     outcomes[cid] = False
+            elif kind == "bracket_cut":
+                # The exclusion is absolute (owner decisions
+                # 2026-11-09, Item 2(b) = B): a passer the bracket
+                # cut is not a negative example, so it must not keep
+                # a negative the judged-map pass above dealt it —
+                # that pass never consults the elimination kind, and
+                # a cut passer's entry in the verdict's judged block
+                # can read as a failure (its last-scored round rides
+                # there beside the bracket record). The winner's
+                # positive is never touched: a winner carries no
+                # kind, and the guard below only removes a False.
+                if outcomes.get(cid) is False:
+                    del outcomes[cid]
             # bracket_cut (or an unknown kind): excluded, not decidable.
             continue
         eliminated_at = candidate.get("eliminated_at")

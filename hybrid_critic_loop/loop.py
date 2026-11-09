@@ -1354,18 +1354,17 @@ class _Run:
                     waiver_candidate=None, last_gate_details=last_gate_details,
                 )
 
-            # No winner. Waiver path: a candidate that passed hard and
-            # failed ONLY measured may be waived by the human gate.
-            waiver_candidate = next(
-                (c for c, _ in generated if gate_results[c["id"]].eliminated_at == "measured"),
-                None,
-            )
-            if waiver_candidate is not None:
-                eliminated = [c["id"] for c, _ in generated if c["id"] != waiver_candidate["id"]]
-                return self._verdict_and_human_gate(
-                    attempt, waiver_candidate, eliminated, gate_results, judged_map, None,
-                    waiver_candidate=waiver_candidate, last_gate_details=last_gate_details,
-                )
+            # No winner. A candidate that passed hard and failed ONLY
+            # measured used to be offered to the human gate here as a
+            # waiver candidate; the owner ruled otherwise (owner
+            # decisions 2026-11-09, Item 2(a) = B): a measured-only
+            # regression is NOT a valid contract — it fails like any
+            # other gate failure, through the retry machinery below,
+            # and no waiver is offered for it. The waiver machinery
+            # itself (an offered waiver carried on a verdict, the
+            # explicit "waived" decision at the gate) is unchanged;
+            # the run simply never produces the offer for a measured
+            # regression any more.
 
             # Retry logic.
             all_judged_below = bool(judged_items) and all(
@@ -1699,17 +1698,11 @@ class _Run:
                 last_gate_details=last_gate_details,
             )
         # The matrix failed every candidate (no passes anywhere):
-        # fall back to the standard retry / measured-waiver machinery.
-        waiver_candidate = next(
-            (c for c, _ in generated if gate_results[c["id"]].eliminated_at == "measured"),
-            None,
-        )
-        if waiver_candidate is not None:
-            eliminated = [c["id"] for c, _ in generated if c["id"] != waiver_candidate["id"]]
-            return self._verdict_and_human_gate(
-                attempt, waiver_candidate, eliminated, gate_results, judged_map, None,
-                waiver_candidate=waiver_candidate, last_gate_details=last_gate_details,
-            )
+        # escalate. A measured-only failure in the field used to fall
+        # back to a waiver offer here; the owner ruled that a measured
+        # regression is not a valid contract (owner decisions
+        # 2026-11-09, Item 2(a) = B), so there is no waiver fallback —
+        # the escalation is the failure record.
         # No retry cap was reached here; the verdict row and the run result
         # carry the reason (fix pass Wave 2.5: a false retry_cap event was
         # emitted before).
