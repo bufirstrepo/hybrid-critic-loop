@@ -208,6 +208,16 @@ CREATE TABLE IF NOT EXISTS events (
     detail TEXT,
     created_at TEXT
 );
+-- Hot-path indexes (fix spec G3; round-4 performance P5: the package
+-- had no indexes at all, so every filtered query was a full scan).
+-- Created here so fresh and pre-existing databases alike gain them
+-- through the same executescript on open.
+CREATE INDEX IF NOT EXISTS idx_ledger_contract_id
+    ON ledger (contract_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_expert_id
+    ON ledger (expert_id);
+CREATE INDEX IF NOT EXISTS idx_verdicts_contract_id
+    ON verdicts (contract_id);
 """
 
 # Columns added after v1. Existing databases created with the old
@@ -237,8 +247,9 @@ _MIGRATION_COLUMNS = {
     # backfill has run.
     # Tightening spec T2: ledger provenance (who reported the row's
     # numbers) and sealed_via (how the row got its chain hashes:
-    # "append" / "backfill" / "repair"). Pre-migration rows backfill
-    # provenance to "legacy-import" (see _migrate).
+    # "append" / "backfill" / "repair" / "upgrade" — the last added by
+    # fix spec G2 for the canonical-form cascade). Pre-migration rows
+    # backfill provenance to "legacy-import" (see _migrate).
     "ledger": (
         ("prev_hash", "TEXT"),
         ("row_hash", "TEXT"),
@@ -360,6 +371,21 @@ def _validate_cost_usd(value):
     return result
 
 
+def _row_variants(prev_hash, entry):
+    """Digests of a ledger row under every recognized canonical form.
+
+    Delegates to :func:`chain.row_hash_variants` (fix-spec pinned
+    interface): the row dict handed over carries its ``prev_hash``,
+    and the result maps ``"current"`` / ``"pre_sealed_via"`` /
+    ``"legacy"`` to the digest under that form. The sealing pass
+    recognizes a stored hash matching ANY form; only ``"current"``
+    is ever written.
+    """
+    row = dict(entry)
+    row["prev_hash"] = prev_hash
+    return _chain.row_hash_variants(row)
+
+
 class Store:
     """SQLite-backed store for Hybrid Critic Loop state.
 
@@ -378,16 +404,34 @@ class Store:
             parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
-        self._migrate()
-        # Tightening spec T3: rows the open-time sealing pass sealed, by
-        # route — "backfill" (pre-chain store) / "repair" (flagged store,
-        # unsealed suffix). Set by _backfill_chain below.
-        self.chain_backfilled = 0
-        self.chain_repairs = 0
-        self._backfill_chain()
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.executescript(_SCHEMA)
+            self._conn.commit()
+            self._migrate()
+            # Tightening spec T3: rows the open-time sealing pass sealed, by
+            # route — "backfill" (pre-chain store) / "repair" (flagged
+            # store, unsealed suffix). Fix spec G2 adds "upgrade" (the
+            # canonical-form cascade) as chain_upgrades. All three are
+            # set by _backfill_chain below.
+            self.chain_backfilled = 0
+            self.chain_repairs = 0
+            self.chain_upgrades = 0
+            self._backfill_chain()
+        except sqlite3.OperationalError as exc:
+            # Fix spec G2 (round-4 upgrade F1): a locked database at
+            # open almost always means another process — typically a
+            # long-lived host session holding its store for its whole
+            # life — has the write lock. Name the likely holder instead
+            # of surfacing sqlite's bare "database is locked", which
+            # sent operators hunting for corruption.
+            if "locked" not in str(exc).lower():
+                raise
+            raise sqlite3.OperationalError(
+                "database is locked: another process is likely holding"
+                f" this store open (database: {self.db_path}); a"
+                " long-lived host session is the usual holder — close"
+                " it or wait for it to exit, then retry") from exc
 
     def _migrate(self):
         """Add post-v1 columns to pre-existing tables, if missing.
@@ -420,19 +464,61 @@ class Store:
                 "PRAGMA table_info(ledger)").fetchall()
         }
         if "provenance" in ledger_cols:
-            self._conn.execute(
-                "UPDATE ledger SET provenance='legacy-import'"
-                " WHERE provenance IS NULL")
+            # Round-4 performance P8: probe before updating — the
+            # unconditional UPDATE scans the whole ledger and takes
+            # the WAL write path on every open while matching zero
+            # rows on a healthy book, so opening was never read-only.
+            unlabelled = self._conn.execute(
+                "SELECT 1 FROM ledger WHERE provenance IS NULL"
+                " LIMIT 1").fetchone()
+            if unlabelled is not None:
+                self._conn.execute(
+                    "UPDATE ledger SET provenance='legacy-import'"
+                    " WHERE provenance IS NULL")
         self._conn.commit()
+
+    def _chain_intact_probe(self):
+        """Cheap open-time probe (fix spec G3; round-4 performance P1).
+
+        True when the sealing pass has nothing to do: no ledger row is
+        missing hashes, and the tail row's stored hash recomputes
+        under the CURRENT canonical form and links to its
+        predecessor's stored hash. A healthy current-form store thus
+        skips the full recompute walk on open (the old pass rehashed
+        every row on every open — ~27 µs/row, seconds at book scale).
+        A book failing the probe — unsealed rows, a historical-form
+        tail, a broken link — takes the full pass below, and
+        ``chain.verify_chain`` keeps the full walk for callers that
+        want every row checked.
+        """
+        unsealed = self._one(
+            "SELECT 1 AS x FROM ledger"
+            " WHERE COALESCE(prev_hash, '') = ''"
+            " OR COALESCE(row_hash, '') = '' LIMIT 1")
+        if unsealed is not None:
+            return False
+        tail = self._all(
+            "SELECT * FROM ledger ORDER BY id DESC LIMIT 2")
+        if not tail:
+            return True
+        last = tail[0]
+        entry = self._ledger_dict(last)
+        variants = _row_variants(_col(last, "prev_hash"), entry)
+        if variants["current"] != _col(last, "row_hash"):
+            return False
+        if len(tail) > 1:
+            expected_prev = _col(tail[1], "row_hash")
+        else:
+            expected_prev = _chain.GENESIS_HASH
+        return _col(last, "prev_hash") == expected_prev
 
     def _backfill_chain(self):
         """Seal unsealed ledger rows on open (tightening spec T3;
-        correctness F1/F9, security F1/F4).
+        correctness F1/F9, security F1/F4; fix spec G2/G3).
 
-        The pass is gated on NULL hashes existing, not only on the
-        ``PRAGMA user_version`` flag — a flagged store can still gain
-        unsealed rows when a pre-chain writer appends beside the chained
-        build. Three cases:
+        Gated first on :meth:`_chain_intact_probe` — a healthy
+        current-form store skips the walk entirely. Three cases when
+        the full pass runs:
 
         - Pre-chain store (``user_version`` below
           ``_CHAIN_BACKFILL_VERSION``): every unsealed row is sealed in
@@ -442,30 +528,49 @@ class Store:
           ``sealed_via="repair"``.
         - Corruption: NULL hashes in the middle (a hashed row exists
           after them), or a pre-existing hash that recomputes under
-          neither canonical form. Pre-existing hashes are recomputed
-          during the pass, never trusted as links (the old pass trusted
-          them, so a tampered row's stored hash became the seal for
-          everything after it). Corrupt rows and everything after them
-          are left exactly as found: ``verify_chain`` names the first
-          bad row, and ``add_ledger`` refuses to extend a book whose
-          last row is unsealed.
-        - Canonical-form upgrade (tightening spec T12): a sealed row
-          whose stored hash fails the current form but matches the
-          pre-T12 form (``chain.row_hash_legacy`` — the canonical form
-          without ``provenance``) is re-sealed under the current form
-          with ``sealed_via="repair"``. Re-sealing changes that row's
-          hash, so the re-seal cascades over every later sealed row
-          (each still validated against its stored link first); a
-          store sealed before ``provenance`` joined the canonical form
+          no recognized canonical form. Pre-existing hashes are
+          recomputed during the pass, never trusted as links (the old
+          pass trusted them, so a tampered row's stored hash became
+          the seal for everything after it). Corrupt rows and
+          everything after them are left exactly as found:
+          ``verify_chain`` names the first bad row, and ``add_ledger``
+          refuses to extend a book whose last row is unsealed.
+        - Canonical-form upgrade (tightening spec T12; fix spec G2):
+          a sealed row whose stored hash matches a historical form
+          (``chain.row_hash_variants``: "pre_sealed_via" — the form
+          before ``sealed_via`` joined the canonical fields — or
+          "legacy", which also lacks ``provenance``) is re-sealed
+          under the current form with ``sealed_via="upgrade"``.
+          Re-sealing changes that row's hash, so the re-seal cascades
+          over every later sealed row (each still validated against
+          its stored link first); a store sealed under an older form
           thus survives the upgrade with its chain intact.
 
-        ``self.chain_backfilled`` / ``self.chain_repairs`` record how
-        many rows this open sealed by each route.
+        Fix spec G2 (round-3 F1, round-4 upgrade F1/F2): the pass
+        COMMITS before every non-abort return whenever it changed
+        anything — the T12 cascade previously returned with its
+        UPDATEs still in an open transaction, so the upgrade never
+        landed on disk, repeated on every open, and the dangling
+        write transaction locked every other process out for the
+        holder's whole life. Counters accumulate (``+=``) and are
+        published only on commit paths, so an aborted pass reports
+        the zeroes it actually sealed.
+
+        ``self.chain_backfilled`` / ``self.chain_repairs`` /
+        ``self.chain_upgrades`` record how many rows this open sealed
+        by each route.
         """
         self.chain_backfilled = 0
         self.chain_repairs = 0
+        self.chain_upgrades = 0
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         pre_chain = version < _CHAIN_BACKFILL_VERSION
+        if self._chain_intact_probe():
+            if pre_chain:
+                self._conn.execute(
+                    f"PRAGMA user_version = {_CHAIN_BACKFILL_VERSION}")
+                self._conn.commit()
+            return
         rows = self._all("SELECT * FROM ledger ORDER BY id ASC")
         if not rows:
             if pre_chain:
@@ -481,18 +586,21 @@ class Store:
         # Recompute the sealed prefix (every row before the first
         # unsealed one), following the STORED links: a row's hash is
         # always computed over its predecessor's stored hash. A stored
-        # hash that does not recompute under either canonical form, or
-        # does not link to its predecessor, is corruption — seal
-        # nothing. A row sealed under the pre-T12 form starts a
-        # re-seal cascade (T12): its new-form digest differs from its
-        # stored hash, so every later row's prev link changes and the
-        # rest of the prefix is re-sealed under the current form too,
-        # each row still validated against its stored link before it
-        # is rewritten — a tampered row aborts the whole pass.
+        # hash that matches no recognized canonical form, or does not
+        # link to its predecessor, is corruption — seal nothing. A row
+        # sealed under a historical form starts a re-seal cascade:
+        # its new-form digest differs from its stored hash, so every
+        # later row's prev link changes and the rest of the prefix is
+        # re-sealed under the current form too, each row still
+        # validated against its stored link before it is rewritten —
+        # a tampered row aborts the whole pass.
+        n_repairs = 0
+        n_upgrades = 0
         prefix = rows if first_unsealed is None else rows[:first_unsealed]
         prev = _chain.GENESIS_HASH        # stored link expected next
         prev_new = _chain.GENESIS_HASH    # new-form chain value
         resealing = False
+        changed = False
         for row in prefix:
             entry = self._ledger_dict(row)
             stored_prev = _col(row, "prev_hash")
@@ -500,27 +608,30 @@ class Store:
             if stored_prev != prev:
                 self._conn.rollback()
                 return
-            if not resealing:
-                if _chain.row_hash(stored_prev, entry) == stored:
+            variants = _row_variants(stored_prev, entry)
+            if variants["current"] == stored:
+                if not resealing:
                     prev = stored
                     prev_new = stored
                     continue
-                if _chain.row_hash_legacy(stored_prev, entry) != stored:
-                    self._conn.rollback()
-                    return
+                # A current-form row caught in a cascade: its link
+                # changed, so it re-seals too (fall through).
+            elif (variants["pre_sealed_via"] == stored
+                    or variants["legacy"] == stored):
                 resealing = True
-            elif (_chain.row_hash(stored_prev, entry) != stored
-                    and _chain.row_hash_legacy(stored_prev, entry)
-                    != stored):
+            else:
                 self._conn.rollback()
                 return
-            digest = _chain.row_hash(prev_new, entry)
+            new_entry = dict(entry)
+            new_entry["sealed_via"] = "upgrade"
+            digest = _row_variants(prev_new, new_entry)["current"]
             self._conn.execute(
                 "UPDATE ledger SET prev_hash=?, row_hash=?,"
                 " sealed_via=? WHERE id=?",
-                (prev_new, digest, "repair", row["id"]),
+                (prev_new, digest, "upgrade", row["id"]),
             )
-            self.chain_repairs += 1
+            n_upgrades += 1
+            changed = True
             prev = stored
             prev_new = digest
         prev = prev_new
@@ -528,6 +639,12 @@ class Store:
             if pre_chain:
                 self._conn.execute(
                     f"PRAGMA user_version = {_CHAIN_BACKFILL_VERSION}")
+                changed = True
+            self.chain_upgrades = n_upgrades
+            if changed:
+                # G2: the cascade's UPDATEs commit HERE, on the open
+                # that performed them — not whenever some later write
+                # happens to commit.
                 self._conn.commit()
             return
         suffix = rows[first_unsealed:]
@@ -539,7 +656,8 @@ class Store:
         sealed_via = "backfill" if pre_chain else "repair"
         for row in suffix:
             entry = self._ledger_dict(row)
-            digest = _chain.row_hash(prev, entry)
+            entry["sealed_via"] = sealed_via
+            digest = _row_variants(prev, entry)["current"]
             self._conn.execute(
                 "UPDATE ledger SET prev_hash=?, row_hash=?, sealed_via=?"
                 " WHERE id=?",
@@ -551,7 +669,9 @@ class Store:
             self._conn.execute(
                 f"PRAGMA user_version = {_CHAIN_BACKFILL_VERSION}")
         else:
-            self.chain_repairs = len(suffix)
+            n_repairs += len(suffix)
+        self.chain_repairs = n_repairs
+        self.chain_upgrades = n_upgrades
         self._conn.commit()
 
     # -- internal helpers -------------------------------------------------
@@ -768,6 +888,17 @@ class Store:
             f"UPDATE candidates SET {', '.join(sets)} WHERE id=?", params)
         self._conn.commit()
 
+    def set_candidate_payload_hash(self, candidate_id, payload_hash):
+        """Record a candidate's payload hash (fix spec G1: the
+        verdict-time snapshot — when a verdict names a winner, the
+        loop re-points the winner's hash at the snapshot commit the
+        human gate will later merge, so what merges is what was
+        gated). Committed before returning."""
+        self._conn.execute(
+            "UPDATE candidates SET payload_hash=? WHERE id=?",
+            (payload_hash, candidate_id))
+        self._conn.commit()
+
     def get_candidate(self, candidate_id):
         row = self._one(
             "SELECT * FROM candidates WHERE id=?", (candidate_id,))
@@ -944,6 +1075,27 @@ class Store:
             "UPDATE verdicts SET human_gate=? WHERE id=?", (decision, verdict_id),
         )
         self._conn.commit()
+
+    def claim_human_gate(self, verdict_id, decision):
+        """Atomically claim a verdict's pending human gate (fix spec
+        G1; round-4 security F4, contest-core F2).
+
+        One conditional UPDATE that fires only while the gate still
+        reads ``"pending"``, committed before returning. True iff
+        THIS caller recorded the decision — a concurrent or replayed
+        caller gets False and must not merge. The claim IS the record:
+        it replaces the old check-then-act sequence whose decision
+        write landed after the merge and was swallowed on failure, so
+        two processes could both complete one gate (two final
+        answers) and a crash could leave a merged winner whose gate
+        still read pending.
+        """
+        cur = self._conn.execute(
+            "UPDATE verdicts SET human_gate=? WHERE id=?"
+            " AND human_gate='pending'",
+            (decision, verdict_id))
+        self._conn.commit()
+        return cur.rowcount == 1
 
     def set_verdict_route_hold(self, verdict_id, hold):
         """Record a route change held on a degraded verdict (owner floor
@@ -1184,27 +1336,69 @@ class Store:
 
     def apply_route_demotion(self, category, demote_expert, promote_expert,
                              reason):
+        """Apply a route demotion and report what actually changed
+        (fix spec G8; round-3 contest-core F5).
+
+        Branches, by the seat the demoted expert holds: the route's
+        ``primary`` (the promoted expert takes the seat; the demoted
+        expert becomes ``compete_with`` — with no promoted expert,
+        nothing can move), its ``compete_with`` (the demoted expert
+        drops to the head of the fallback list; the promoted expert,
+        if any, takes the compete seat), or a ``fallback`` member
+        (moved to the END of the fallback list). An expert holding no
+        route position changes nothing — the old code had no fallback
+        or absent branch at all, so most demotions were silent no-ops
+        that callers nevertheless reported as done.
+
+        Returns the resulting route dict (the ``get_route`` shape)
+        plus the change report callers must speak from: ``changed``
+        (bool — any route field actually moved), ``branch``
+        ("primary" / "compete_with" / "fallback" / "none"),
+        ``demoted``, and ``promoted`` (the expert that actually took
+        a vacated seat, else None). When nothing changed the route
+        row is not rewritten at all.
+        """
         route = self.get_route(category)
         if route is None:
             raise KeyError(f"unknown route category: {category}")
         primary = route["primary"]
         compete_with = route["compete_with"]
         fallback = list(route["fallback"])
-        if demote_expert == primary and promote_expert:
-            primary = promote_expert
-            compete_with = demote_expert
+        before = (primary, compete_with, list(fallback))
+        branch = "none"
+        promoted = None
+        if demote_expert == primary:
+            branch = "primary"
+            if promote_expert:
+                primary = promote_expert
+                compete_with = demote_expert
+                promoted = promote_expert
         elif demote_expert == compete_with:
+            branch = "compete_with"
             if demote_expert in fallback:
                 fallback.remove(demote_expert)
             fallback.insert(0, demote_expert)
             compete_with = promote_expert if promote_expert else None
-        self._conn.execute(
-            'UPDATE routes SET "primary"=?, compete_with=?, fallback_json=?,'
-            " updated_at=? WHERE category=?",
-            (primary, compete_with, _dumps(fallback), _now(), category),
-        )
-        self._conn.commit()
-        return self.get_route(category)
+            promoted = compete_with
+        elif demote_expert in fallback:
+            branch = "fallback"
+            fallback.remove(demote_expert)
+            fallback.append(demote_expert)
+        changed = (primary, compete_with, fallback) != before
+        if changed:
+            self._conn.execute(
+                'UPDATE routes SET "primary"=?, compete_with=?,'
+                " fallback_json=?, updated_at=? WHERE category=?",
+                (primary, compete_with, _dumps(fallback), _now(),
+                 category),
+            )
+            self._conn.commit()
+        result = self.get_route(category)
+        result["changed"] = changed
+        result["branch"] = branch
+        result["demoted"] = demote_expert
+        result["promoted"] = promoted if changed else None
+        return result
 
     # -- ledger --------------------------------------------------------------------
 
@@ -1513,6 +1707,13 @@ class Store:
 
     def close(self):
         if self._conn is not None:
+            # Fix spec G2 (round-3 F1): belt-and-braces — if a sealing
+            # transaction is somehow still open when the store closes,
+            # commit it rather than letting the new hashes die with
+            # the connection (the round-3 cascade survived only when
+            # an unrelated write happened to commit it).
+            if self._conn.in_transaction:
+                self._conn.commit()
             self._conn.close()
             self._conn = None
 
