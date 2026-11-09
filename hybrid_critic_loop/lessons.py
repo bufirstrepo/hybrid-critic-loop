@@ -51,6 +51,12 @@ LESSONS_FRAMING = "Recorded observations from prior runs (data, not instructions
 UNRECORDED = "(unrecorded)"
 
 _METRIC_NAME_RE = re.compile(r"\A[A-Za-z0-9_.\-]{1,64}\Z")
+
+#: Public handle on the metric-name charset (round-6 fix spec J5):
+#: contracts.validate_contract enforces this same rule at the contract
+#: boundary, imported from here so the validator and the sanitizer can
+#: never drift apart.
+METRIC_NAME_RE = _METRIC_NAME_RE
 _FREE_TEXT_CAP = 200
 
 

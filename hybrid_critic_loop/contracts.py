@@ -31,6 +31,7 @@ from pathlib import Path
 
 from .errors import ContractError, GateError
 from .gates import run_gate_command
+from .lessons import METRIC_NAME_RE
 
 _OPS = {"==", "!=", "<", "<=", ">", ">="}
 _STAGES = {"spec", "decompose", "implement", "integrate"}
@@ -223,6 +224,19 @@ def validate_contract(raw: dict) -> dict:
             for j, m in enumerate(metrics):
                 if not isinstance(m, dict) or "name" not in m or "op" not in m or "value" not in m:
                     raise ContractError(f"acceptance[{i}].metrics[{j}] needs name/op/value")
+                # Declared metric names are charset-checked at the
+                # boundary (round-6 fix spec J5, round-6 security F3):
+                # lessons.sanitize_metric_name trusts the contract's
+                # declared set, so a hostile name declared here would
+                # ride unsanitized into every later lesson.  The rule
+                # is the sanitizer's own charset, imported from
+                # lessons (METRIC_NAME_RE) so the two cannot drift.
+                if not isinstance(m["name"], str) or not METRIC_NAME_RE.match(m["name"]):
+                    raise ContractError(
+                        f"acceptance[{i}].metrics[{j}] name {m['name']!r} is not "
+                        "a valid metric name: metric names must match "
+                        "[A-Za-z0-9_.-]{1,64}"
+                    )
                 if m["op"] not in _OPS:
                     raise ContractError(f"acceptance[{i}].metrics[{j}] op must be one of {sorted(_OPS)}")
                 norm_metrics.append({"name": m["name"], "op": m["op"], "value": m["value"]})
