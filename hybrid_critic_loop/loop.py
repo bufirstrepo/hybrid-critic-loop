@@ -2153,9 +2153,29 @@ class _Run:
             if gate_details.get("panel_status") == "degraded":
                 self._hold_route_change(lesson, verdict)
             else:
+                # Owner ruling 2026-11-09 (Item 1 = A): the router may
+                # only promote a seat that passed the deciding gate.
+                # The passed set is the candidate→expert map minus the
+                # experts whose candidates hard-failed or failed a
+                # measurement on the deciding attempt.
+                cand_experts = gate_details.get("candidate_experts") or {}
+                failed_cids = {
+                    f.get("candidate_id")
+                    for f in gate_details.get("hard_failures") or []
+                }
+                failed_cids |= {
+                    m.get("candidate_id")
+                    for m in gate_details.get("measurements") or []
+                    if not m.get("pass", True)
+                }
+                gate_passed = {
+                    exp for cid, exp in cand_experts.items()
+                    if cid not in failed_cids
+                }
                 router_mod.apply_lesson_route_change(
                     store, router_mod.category_of(self.contract["domain"]),
                     lesson["route_change"], self.contract_id,
+                    gate_passed=gate_passed,
                 )
         return lesson["id"] if lesson else None
 
