@@ -797,6 +797,7 @@ class _Run:
                 spread_threshold=float(judged_item.get("spread_threshold", 2.0)),
                 calibrations=calibrations,
                 seed=attempt,
+                round_no=round_no,
             )
             # Every recorded median is a measured validity score (fix pass
             # Wave 2.7, review H3): keep the last one per candidate, so a

@@ -17,7 +17,8 @@ Each test names the review finding it pins (source reports in
   resolve_data_dir docstring names step 1 a forward-compat probe.
 - T12 — provenance is sealed: flipping it breaks verify_chain at that
   row; a store sealed under the pre-T12 canonical form opens, re-seals
-  as "repair", verifies, and still issues/verifies certificates.
+  as "upgrade" (round-4 spec G2), verifies, and still
+  issues/verifies certificates.
 """
 
 import inspect
@@ -244,14 +245,30 @@ class TestProvenanceSealedInChain(unittest.TestCase):
 class TestLegacyFormStoreSurvives(unittest.TestCase):
     """T12 compatibility: a store sealed under the OLD canonical form
     (LEDGER_FIELDS without provenance) opens, re-seals those rows as
-    sealed_via="repair", verifies under the new form, and its
-    certificates still issue and verify."""
+    sealed_via="upgrade" (round-4 fix spec G2 — the canonical-form
+    cascade is an upgrade seal, distinct from genuine "repair" suffix
+    seals), verifies under the new form, and its certificates still
+    issue and verify."""
 
     def _old_form_store(self, tmp):
         """A file-backed store whose ledger is sealed with legacy
         hashes, built through the public API then re-hashed by hand."""
         db_path = Path(tmp) / "data.db"
         store = Store(db_path)
+        # Counted-row rule v2 (round-4 fix spec, pinned interfaces):
+        # a dispatch row counts only when its candidate exists with a
+        # matching stored provenance — the real loop creates the
+        # candidate before dispatching, so the fixture does too.
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO candidates (id, contract_id,"
+                " stage, slot, provenance, created_at) VALUES"
+                " ('cand_1', 'ctr_0001', 'solve', '0',"
+                " 'executor-reported', '2026-01-01T00:00:00+00:00')")
+            conn.commit()
+        finally:
+            conn.close()
         _dispatch(store, cost_usd=2.5)
         _dispatch(store, cost_usd=3.5)
         head = _verdict(store)
@@ -284,11 +301,12 @@ class TestLegacyFormStoreSurvives(unittest.TestCase):
             db_path, _head, old_cert = self._old_form_store(tmp)
             store = Store(db_path)
             try:
-                self.assertEqual(store.chain_repairs, 2)
+                self.assertEqual(store.chain_repairs, 0)
+                self.assertEqual(store.chain_upgrades, 2)
                 self.assertEqual(store.chain_backfilled, 0)
                 rows = store.ledger_rows()
                 self.assertEqual(
-                    [r["sealed_via"] for r in rows], ["repair", "repair"])
+                    [r["sealed_via"] for r in rows], ["upgrade", "upgrade"])
                 ok, bad = chain.verify_chain(store)
                 self.assertTrue(ok, f"chain broke at {bad}")
                 # A certificate issues and verifies against the
