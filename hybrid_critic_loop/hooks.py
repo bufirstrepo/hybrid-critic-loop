@@ -76,11 +76,17 @@ def pre_llm_call(store, data_dir, **kw):
             # computes the standing at most once and reuses it for the
             # line — and it is chain-gated (fix spec G8), so on a
             # broken chain the line degrades to the unavailable
-            # notice while the lessons below still inject.
+            # notice while the lessons below still inject. The hook's
+            # gate is the CACHED one (round-5 fix spec H3, pinned
+            # cache split): chain.verify_chain_cached re-verifies
+            # only rows past the last verified head, so a session's
+            # first turn does not re-walk the whole book; operator
+            # surfaces (standing report, verdict report, CLI) keep
+            # the full walk.
             from .standing import has_standing, standing_line
 
             if has_standing(store):
-                line = standing_line(store)
+                line = standing_line(store, cached=True)
         except Exception:
             line = None
         budget = 10000 - (len(line) + 1 if line else 0)

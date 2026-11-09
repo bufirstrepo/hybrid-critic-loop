@@ -50,6 +50,32 @@ class TestReferentialCounting(_StoreCase):
     chain still verifies (the rows are honestly sealed) — the rows
     simply do not count, and the report says why."""
 
+    def _make_legacy_row(self, row_id):
+        """Re-mark an appended row as a migration-era legacy-import
+        row, re-sealed under the current canonical form — the state
+        the upgrade pass leaves behind. (Round-5 fix spec H2: the
+        label is reserved for the migration and can no longer be
+        written through add_ledger, so the fixture builds it the way
+        the migration does — by relabeling, then re-sealing.)"""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute(
+                "UPDATE ledger SET provenance='legacy-import'"
+                " WHERE id=?", (row_id,))
+            rows = conn.execute(
+                "SELECT * FROM ledger ORDER BY id ASC").fetchall()
+            prev = chain.GENESIS_HASH
+            for row in rows:
+                digest = chain.row_hash(prev, dict(row))
+                conn.execute(
+                    "UPDATE ledger SET prev_hash=?, row_hash=?"
+                    " WHERE id=?", (prev, digest, row["id"]))
+                prev = digest
+            conn.commit()
+        finally:
+            conn.close()
+
     def _book(self):
         cand_gen = self._candidate(slot="gen")   # stored provenance "generated"
         cand_er = self._candidate(slot="er")
@@ -60,8 +86,9 @@ class TestReferentialCounting(_StoreCase):
         add("tgt-1", "ctr-1", cand_er, "implement", "exp-1",
             10, 5, 50.0, "completed", None,
             provenance="executor-reported")
-        add("tgt-1", "ctr-1", None, "implement", "exp-1",
-            10, 5, 25.0, "completed", None, provenance="legacy-import")
+        legacy_id = add("tgt-1", "ctr-1", None, "implement", "exp-1",
+                        10, 5, 25.0, "completed", None,
+                        provenance="executor-reported")
         # The attack, in its round-3 shapes.
         add("tgt-1", "ctr-1", "cand_ghost", "implement", "mallory",
             1, 1, 2_000_000.0, "completed", None,
@@ -78,6 +105,9 @@ class TestReferentialCounting(_StoreCase):
         add("tgt-1", "ctr-1", cand_er, "implement", "mallory",
             1, 1, 300.0, "observed", None,
             provenance="executor-reported")
+        # The migration-era row, relabeled + re-sealed as the
+        # upgrade pass leaves it (see _make_legacy_row).
+        self._make_legacy_row(legacy_id)
 
     def test_unbacked_labels_do_not_move_the_tier(self):
         self._book()

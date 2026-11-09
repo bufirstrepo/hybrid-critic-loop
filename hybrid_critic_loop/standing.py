@@ -27,10 +27,17 @@ correctness F6, claims #2). A ledger row is *counted* when:
   provenance is ``"legacy-import"`` (rows written before provenance
   existed — a row dict with no provenance at all reads as
   ``"legacy-import"`` too), or its ``candidate_id`` names an existing
-  candidate whose stored provenance equals the row's provenance, or
-  its provenance is ``"executor-reported"`` and the candidate exists.
-  A counted label naming a candidate that was never recorded is a
-  claim the store's own graph does not back, and it does not count.
+  candidate **on the row's own contract** whose stored provenance
+  equals the row's provenance, or its provenance is
+  ``"executor-reported"`` and such a candidate exists. A counted
+  label naming a candidate that was never recorded — or one recorded
+  under a different contract (round-5 attack F4) — is a claim the
+  store's own graph does not back, and it does not count. Where the
+  store cannot name its candidates at all (degraded stores), the leg
+  passes unevaluated and the totals carry
+  ``referential_unchecked=True``; the standing line/report then
+  append "· backing unverified" rather than silently trusting
+  labels (round-5 upgrade F1).
 
 Rows the totals do not count are never dropped silently:
 :func:`compute_standing` reports them as excluded totals split by
@@ -44,7 +51,14 @@ a broken chain they render "standing unavailable — ledger chain
 broken at row N" instead of a tier. A book that cannot prove its own
 rows does not get to state a lifetime spend. (Certificates verify
 their own prefix in chain.py; this gate is the standing surfaces'
-half of the same discipline.)
+half of the same discipline.) Round 5 (fix spec H2/H3; attack F2,
+upgrade F1) extends the same gate to the verdict report (reports.py —
+the surface that carries the stamp), maps a ``(False, None)`` result
+— the hashless-rows break of a degraded book — to the unavailable
+line with the row shown as "—", and splits the check by surface:
+operator surfaces pay the full walk, while the hook's line uses the
+cached gate (``chain.verify_chain_cached``), which re-verifies only
+rows past the last verified head.
 
 Sums are reported-only: a field no provider reported stays out of the
 sum, and a total with no reported values at all is None ("not
@@ -56,12 +70,15 @@ Aggregation runs in SQL against the store's connection when the store
 exposes one (the real Store does): the counted-row rule, referential
 leg included, is a conditional-sum query joined to the candidates
 table, so the standing / certificate / hook paths never materialize
-the whole book as dicts (round-4 fix spec G3). Stores without a
-connection (duck-typed fakes) take the same rule in Python over
-``ledger_rows()``; a store that can neither be queried nor name its
-candidates through ``get_candidate`` cannot be referentially checked,
-and there the referential leg passes — the seam is named here rather
-than hidden, and the real Store never takes it.
+the whole book as dicts (round-4 fix spec G3) — and the expert
+summary the surfaces merge in is aggregated in SQL too, with
+``Store.ledger_summary``'s exact return shape (round-5 fix spec H3).
+Stores without a connection (duck-typed fakes) take the same rules in
+Python over ``ledger_rows()``; a store that can neither be queried
+nor name its candidates through ``get_candidate`` cannot be
+referentially checked, and there the referential leg passes — the
+seam is named here rather than hidden (and disclosed on the line
+itself, above), and the real Store never takes it.
 """
 
 from __future__ import annotations
@@ -167,22 +184,33 @@ def _row_provenance(row):
 def _candidate_resolver(store):
     """Resolve candidate existence + stored provenance for the totals.
 
-    Returns a callable ``candidate_id -> (exists, stored_provenance)``,
-    or None when the store can neither be queried in SQL nor name its
-    candidates through ``get_candidate`` (see the module docstring for
-    that seam). The SQL form reads the candidates table in one query;
-    the ``get_candidate`` form caches per candidate id.
+    Returns a callable ``candidate_id -> (exists, stored_provenance,
+    contract_id)``, or None when the store can neither be queried in
+    SQL nor name its candidates through ``get_candidate`` (see the
+    module docstring for that seam). The SQL form reads the candidates
+    table in one query; the ``get_candidate`` form caches per
+    candidate id. The contract id rides along because the counted
+    rule's referential leg requires the candidate to belong to the
+    row's own contract (round-5 fix spec H2; round-5 attack F4: a
+    candidate on contract A used to back rows written under contract
+    B).
     """
     conn = getattr(store, "_conn", None)
     if conn is not None:
         try:
             pairs = conn.execute(
-                "SELECT id, provenance FROM candidates").fetchall()
+                "SELECT id, provenance, contract_id FROM candidates"
+            ).fetchall()
         except Exception:
             pairs = None
         if pairs is not None:
-            table = {row[0]: row[1] for row in pairs}
-            return lambda cid: (cid in table, table.get(cid))
+            table = {row[0]: (row[1], row[2]) for row in pairs}
+
+            def resolve_sql(cid):
+                stored, contract_id = table.get(cid, (None, None))
+                return (cid in table, stored, contract_id)
+
+            return resolve_sql
     get_candidate = getattr(store, "get_candidate", None)
     if callable(get_candidate):
         cache = {}
@@ -194,9 +222,11 @@ def _candidate_resolver(store):
                 except Exception:
                     candidate = None
                 if isinstance(candidate, dict):
-                    cache[cid] = (True, candidate.get("provenance"))
+                    cache[cid] = (
+                        True, candidate.get("provenance"),
+                        candidate.get("contract_id"))
                 else:
-                    cache[cid] = (False, None)
+                    cache[cid] = (False, None, None)
             return cache[cid]
 
         return resolve
@@ -220,10 +250,12 @@ def _classify_row(row, resolve):
         return "counted"
     if resolve is None:
         # The store cannot name its candidates at all, so the
-        # referential leg cannot be checked (module docstring).
+        # referential leg cannot be checked (module docstring);
+        # ledger_totals flags the result referential_unchecked.
         return "counted"
-    exists, stored = resolve(row.get("candidate_id"))
-    if exists and (stored == prov or prov == _EXECUTOR_REPORTED):
+    exists, stored, cand_contract = resolve(row.get("candidate_id"))
+    if exists and cand_contract == row.get("contract_id") and (
+            stored == prov or prov == _EXECUTOR_REPORTED):
         return "counted"
     return _CAUSE_REFERENTIAL
 
@@ -243,6 +275,7 @@ CASE
   WHEN COALESCE(l.provenance, 'legacy-import') = 'legacy-import'
     THEN 'counted'
   WHEN c.id IS NOT NULL
+       AND c.contract_id = l.contract_id
        AND (c.provenance = COALESCE(l.provenance, 'legacy-import')
             OR COALESCE(l.provenance, 'legacy-import')
                = 'executor-reported')
@@ -361,7 +394,15 @@ def _totals_python(store, contract_id, upto_id):
             "cost": _sum_or_none(entry["cost"]),
             "cost_n": entry["cost_n"],
         }
-    return _assemble_totals(by_class)
+    result = _assemble_totals(by_class)
+    # Degraded-mode honesty (round-5 fix spec H2; round-5 upgrade
+    # F1): when the store cannot name its candidates at all, the
+    # referential leg passed unchecked — the totals say so, and the
+    # standing surfaces disclose it ("· backing unverified") instead
+    # of silently trusting labels. The SQL path always evaluates the
+    # leg, so it never sets this.
+    result["referential_unchecked"] = resolve is None
+    return result
 
 
 def ledger_totals(store, contract_id=None, upto_id=None) -> dict:
@@ -379,12 +420,16 @@ def ledger_totals(store, contract_id=None, upto_id=None) -> dict:
     do not count, split by cause as ``excluded_provenance_*``,
     ``excluded_outcome_*`` and ``excluded_referential_*`` (amount and
     cost-carrying row count each), so excluded money is always named
-    with its reason, never vanished.
+    with its reason, never vanished. ``referential_unchecked`` is
+    True only when the store could not name its candidates at all,
+    so the referential leg passed unevaluated (degraded stores; the
+    real Store always evaluates it).
     """
     conn = getattr(store, "_conn", None)
     if conn is not None:
         result = _totals_sql(conn, contract_id, upto_id)
         if result is not None:
+            result["referential_unchecked"] = False
             return result
     return _totals_python(store, contract_id, upto_id)
 
@@ -489,7 +534,85 @@ def expert_totals(store):
     return _expert_totals_python(store)
 
 
+def _cpvp(points, cost):
+    """cost-per-validity-point, mirroring state._cost_per_validity_point."""
+    if cost is not None and points not in (None, 0):
+        return cost / points
+    return None
+
+
+def _summary_sql(conn):
+    """``Store.ledger_summary``'s return shape, aggregated in SQL.
+
+    The summary the standing/report surfaces consume (round-5 fix
+    spec H3; round-5 performance: the store's own ledger_summary
+    materializes the whole book in Python, and compute_standing paid
+    that on every call). Per expert with at least one generation
+    row, in first-dispatch order: dispatch and per-outcome counts
+    over ALL generation rows (the summary is provenance-blind by
+    design — the counted figures replace them downstream in
+    :func:`expert_rows`), reported-only token/cost sums (SQL SUM
+    skips NULLs and yields None when nothing was reported, exactly
+    the Python rule), and the experts table's own fields (wins,
+    losses, validity, cpvp) merged in. Returns None on any SQL
+    failure — an older schema without the validity columns, say —
+    and the caller falls back to the store's own method.
+    """
+    outcomes = ", ".join(f"'{name}'" for name in GENERATION_OUTCOMES)
+    try:
+        agg = conn.execute(
+            "SELECT expert_id, COUNT(*),"
+            " SUM(CASE WHEN outcome = 'completed' THEN 1 ELSE 0 END),"
+            " SUM(CASE WHEN outcome = 'refused' THEN 1 ELSE 0 END),"
+            " SUM(CASE WHEN outcome = 'timeout' THEN 1 ELSE 0 END),"
+            " SUM(CASE WHEN outcome = 'unavailable' THEN 1 ELSE 0 END),"
+            " SUM(CASE WHEN outcome = 'error' THEN 1 ELSE 0 END),"
+            " SUM(tokens_in), SUM(tokens_out), SUM(cost_usd)"
+            f" FROM ledger WHERE outcome IN ({outcomes})"
+            " GROUP BY expert_id ORDER BY MIN(id)"
+        ).fetchall()
+        experts = {}
+        for row in conn.execute(
+                "SELECT id, wins, losses, validity_points,"
+                " validity_cost_usd FROM experts").fetchall():
+            experts[row[0]] = row[1:]
+    except Exception:
+        return None
+    summary = []
+    for row in agg:
+        wins, losses, v_points, v_cost = experts.get(
+            row[0], (0, 0, None, None))
+        total = wins + losses
+        summary.append({
+            "expert_id": row[0],
+            "dispatches": row[1],
+            "completed": row[2],
+            "refused": row[3],
+            "timeout": row[4],
+            "unavailable": row[5],
+            "error": row[6],
+            "tokens_in": row[7],
+            "tokens_out": row[8],
+            "cost_usd": row[9],
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / total) if total else None,
+            "validity_points": v_points,
+            "validity_cost_usd": v_cost,
+            "cost_per_validity_point": _cpvp(v_points, v_cost),
+        })
+    return summary
+
+
 def _summary_rows(store):
+    # SQL first when the store exposes a connection (round-5 fix
+    # spec H3): compute_standing must not materialize the whole book
+    # on a real Store. Duck stores keep the store's own rows path.
+    conn = getattr(store, "_conn", None)
+    if conn is not None:
+        result = _summary_sql(conn)
+        if result is not None:
+            return result
     try:
         summary = store.ledger_summary()
     except TypeError:
@@ -627,6 +750,8 @@ def compute_standing(store) -> dict:
             "excluded_referential_cost_usd"],
         "excluded_referential_rows": totals[
             "excluded_referential_rows"],
+        "referential_unchecked": bool(
+            totals.get("referential_unchecked")),
         "experts": experts,
     }
 
@@ -652,27 +777,75 @@ def has_standing(store) -> bool:
             return row is not None
         except Exception:
             pass
+    # Fallback leg (round-5 fix spec H2; round-5 upgrade F1): a
+    # store with no connection — the degraded fallback store — answers
+    # existence over its own rows: any generation-outcome row is a
+    # dispatch on record. The previous leg went through expert_rows /
+    # expert_totals, which return None exactly for such stores, so
+    # the probe answered False over a store WITH dispatches and the
+    # session hook silently dropped the standing line.
     try:
-        return bool(expert_rows(store))
+        for row in _ledger_rows(store):
+            if isinstance(row, dict) and (
+                    row.get("outcome") in GENERATION_OUTCOMES):
+                return True
     except Exception:
-        return False
+        pass
+    return False
 
 
-def _chain_break_row(store):
-    """The first bad ledger row id when the store's chain is broken.
+def _chain_check(store, cached=False):
+    """(status, bad_row) for the store's ledger chain.
 
-    None when the chain verifies — or when the check itself cannot
-    run (a store whose rows cannot be walked at all); a definitive
-    ``(False, row)`` from :func:`chain.verify_chain` is the only thing
-    that gates a surface. Lazy import: chain.py imports this module.
+    ``status`` is ``"broken"`` only on a definitive failure from
+    chain.py — including ``(False, None)``, the hashless-rows break
+    a degraded store produces (round-5 fix spec H2; round-5 upgrade
+    F1): a book that cannot verify at all gates exactly like any
+    other break, with the row rendered as "—". ``"unknown"`` when
+    the check itself cannot run (the store's rows cannot be walked
+    at all); surfaces never gate on uncertainty. With
+    ``cached=True`` the hook's cheaper gate stands in for the full
+    walk — ``chain.verify_chain_cached`` (round-5 pinned interface:
+    verify only rows past the last verified head, falling back to
+    the full walk when no cache holds); operator surfaces always
+    pass ``cached=False`` and pay the full walk. Lazy import:
+    chain.py imports this module.
     """
     try:
         from . import chain as _chain
 
-        ok, bad = _chain.verify_chain(store)
+        verify = _chain.verify_chain
+        if cached:
+            verify = getattr(_chain, "verify_chain_cached", None) or verify
+        ok, bad = verify(store)
     except Exception:
-        return None
-    return None if ok else bad
+        return "unknown", None
+    return ("ok", None) if ok else ("broken", bad)
+
+
+def _unavailable_line(bad):
+    """The unavailable line for a broken chain (bad row id or None)."""
+    return _CHAIN_UNAVAILABLE.format(row=bad if bad is not None else "—")
+
+
+def chain_state(store):
+    """Public chain state for reports: (status, bad_row), full walk.
+
+    ``status`` is ``"ok"`` / ``"broken"`` / ``"unknown"`` — see
+    :func:`_chain_check`. reports.ledger_report prints its
+    chain-state line from this (round-5 fix spec H2).
+    """
+    return _chain_check(store)
+
+
+def chain_unavailable_line(store):
+    """The unavailable line when the chain definitively fails, else None.
+
+    The verdict report's gate (round-5 fix spec H2; round-5 attack
+    F2): full walk, exactly like the standing surfaces.
+    """
+    status, bad = _chain_check(store)
+    return _unavailable_line(bad) if status == "broken" else None
 
 
 def format_standing_line(standing) -> str:
@@ -700,21 +873,33 @@ def format_standing_line(standing) -> str:
         tokens_text = f"{format_tokens(tokens)} tokens"
     else:
         tokens_text = "tokens not reported"
-    return (
+    line = (
         f"Millionaire Matrix standing: {standing.get('tier')} — "
         f"{spend_text} · {tokens_text}"
     )
+    if standing.get("referential_unchecked"):
+        # Degraded-mode honesty (round-5 fix spec H2; round-5 upgrade
+        # F1): the referential leg could not be evaluated for this
+        # store, so the tier is label-trusted — disclosed on the line
+        # itself, never silently. The real Store always evaluates it.
+        line += " · backing unverified"
+    return line
 
 
-def standing_line(store):
+def standing_line(store, cached=False):
     """The one-line standing for a store (see :func:`format_standing_line`).
 
     Chain-gated (round-4 fix spec G8): a store whose ledger chain does
-    not verify renders the unavailable line instead of a tier.
+    not verify renders the unavailable line instead of a tier. The
+    gate is the full walk, except with ``cached=True`` — the session
+    hook's line (round-5 fix spec H3, pinned cache split): the cached
+    gate re-verifies only rows past the last verified head instead of
+    re-walking the whole book on every session's first turn. Operator
+    surfaces never pass cached=True.
     """
-    bad = _chain_break_row(store)
-    if bad is not None:
-        return _CHAIN_UNAVAILABLE.format(row=bad)
+    status, bad = _chain_check(store, cached=cached)
+    if status == "broken":
+        return _unavailable_line(bad)
     return format_standing_line(compute_standing(store))
 
 
@@ -780,11 +965,11 @@ def standing_report(store) -> str:
     )
 
     lines = ["standing — the client book:"]
-    bad = _chain_break_row(store)
-    if bad is not None:
+    status, bad = _chain_check(store)
+    if status == "broken":
         # Chain-gated (round-4 fix spec G8): no tier, no totals, no
         # expert figures from a book whose rows do not verify.
-        lines.append(_CHAIN_UNAVAILABLE.format(row=bad))
+        lines.append(_unavailable_line(bad))
         return "\n".join(lines)
     standing = compute_standing(store)
     lines.append(format_standing_line(standing))

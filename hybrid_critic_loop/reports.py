@@ -226,6 +226,33 @@ def ledger_report(store) -> str:
             f"{via}={sealed_counts[via]}" for via in sorted(sealed_counts)
         )
         lines.append(f"chain: {detail}")
+    # Chain state (round-5 fix spec H2; round-5 attack F2): the report
+    # states whether the book's hash chain verifies — the sealing-route
+    # line above says how rows were sealed, never whether they still
+    # verify, and an all-append broken book used to get silence. The
+    # check is the full walk (an operator surface); when it cannot
+    # run at all, no line prints rather than a guess.
+    try:
+        from .standing import chain_state as _chain_state
+
+        _status, _bad = _chain_state(store)
+    except Exception:
+        _status, _bad = "unknown", None
+    if _status == "broken":
+        if _bad is None:
+            lines.append("chain state: unavailable")
+        else:
+            lines.append(f"chain state: broken at row {_bad}")
+    elif _status == "ok":
+        _ids = [
+            row.get("id") for row in rows or []
+            if isinstance(row, dict)
+            and isinstance(row.get("id"), int)
+            and not isinstance(row.get("id"), bool)
+        ]
+        if _ids:
+            lines.append(
+                f"chain state: verified through row {max(_ids)}")
     if not summary and rows:
         # Rows exist but no summary implementation produced aggregates.
         for row in rows:
@@ -666,6 +693,24 @@ def verdict_report(store, contract_id) -> str:
             f"operator review required (lesson {_value_or_not_reported(hold.get('lesson_id'))})"
         )
     lines.append(f"human_gate: {verdict.get('human_gate')}")
+    # Chain gate (round-5 fix spec H2; round-5 attack F2): the verdict
+    # report is a standing surface in substance — it carries the tier
+    # and the MM CERTIFIED block — so it is gated exactly like the
+    # standing surfaces. On a broken chain the unavailable line stands
+    # in place of the tier content and NO stamp/token prints: a
+    # certificate that cannot verify must not be printable from the
+    # report an operator shares. (chain.py's issuance is gated too;
+    # this is the report layer's own half of the discipline.)
+    unavailable = None
+    try:
+        from .standing import chain_unavailable_line
+
+        unavailable = chain_unavailable_line(store)
+    except Exception:
+        unavailable = None
+    if unavailable is not None:
+        lines.append(unavailable)
+        return "\n".join(lines)
     # Standing after this run (the client book, standing.py): the store's
     # current tier and this contract's own recorded contribution. Stores
     # that cannot produce standing (duck-typed fakes) simply omit it.
