@@ -219,6 +219,82 @@ def _record_gate_failure(store, contract_id, verdict, decision, channel,
     return reason
 
 
+#: The decided values a verdict's human_gate can hold once a claim
+#: has landed (round-6 fix spec J1). "pending" is unclaimed and
+#: "failed" is the recorded post-claim failure state — neither is a
+#: decision.
+_GATE_DECISION_VALUES = ("approved", "rejected", "waived")
+
+#: Contract statuses that close a gate's life: a decided verdict over
+#: one of these is a completed (or settled) gate, never an
+#: interrupted completion. "gate_failed" is deliberately absent — it
+#: is the retryable failure state, not a settlement.
+_GATE_TERMINAL_STATUSES = frozenset({
+    "completed", "rejected", "escalated", "refused",
+})
+
+
+def _final_answer_row(store, contract_id):
+    """The contract's final_answers row as a dict, or None (round-6
+    fix spec J1; round-6 gate-core F3, security F1).
+
+    The final answer is the completion's durable record — the same
+    existence question chain._contract_completed asks — so completion
+    idempotence and failure-state honesty key on it. Read through the
+    store's connection when one exists (the real Store has no
+    final-answer getter); the ``"commit"`` column is quoted because
+    COMMIT is a SQL keyword. A store with no readable surface answers
+    None: such stores are doubles whose verdict rows are their whole
+    world, and the pre-J1 behavior (completion proceeds) is correct
+    there."""
+    conn = getattr(store, "_conn", None)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT contract_id, \"commit\", human_gate FROM final_answers"
+            " WHERE contract_id=? LIMIT 1", (contract_id,)).fetchone()
+    except Exception:  # noqa: BLE001 - unprovable is not existing
+        return None
+    if row is None:
+        return None
+    return {"contract_id": row[0], "commit": row[1], "human_gate": row[2]}
+
+
+def _recorded_gate_decision(store, contract_id, verdict):
+    """The decision a retry must present (round-6 fix spec J1;
+    round-6 security F2): the latest gate_failure observation's
+    decision when one exists, else the verdict's recorded human_gate
+    value if it is itself a decision. None when no decision is on
+    record (a first presentation, not a retry)."""
+    contract = store.get_contract(contract_id) or {}
+    for obs in reversed(contract.get("observations") or []):
+        if isinstance(obs, dict) and obs.get("kind") == "gate_failure" \
+                and obs.get("decision") in _GATE_DECISION_VALUES:
+            return obs["decision"]
+    gate = (verdict or {}).get("human_gate")
+    if gate in _GATE_DECISION_VALUES:
+        return gate
+    return None
+
+
+def _interrupted_completion(store, contract_id, verdict, contract):
+    """True when the gate's claim landed but its completion never
+    finished (round-6 fix spec J1; round-6 gate-core F1): the verdict
+    reads decided, the contract has no final answer and no terminal
+    status. A process that died after the claim — host kill, OOM,
+    power loss — leaves exactly this durable state, and the H1
+    failure record was only ever written by the process that had to
+    survive to write it. Never fires on a pending gate (no claim), an
+    escalated verdict (escalated, and winnerless gates read pending),
+    or a completed contract (final answer / terminal status)."""
+    if (verdict or {}).get("human_gate") not in _GATE_DECISION_VALUES:
+        return False
+    if (contract or {}).get("status") in _GATE_TERMINAL_STATUSES:
+        return False
+    return _final_answer_row(store, contract_id) is None
+
+
 def _delete_snapshot_ref(mgr, contract_id, candidate_id):
     """Delete a candidate's snapshot ref at a terminal state
     (round-5 fix spec H6). Best-effort: the ref is an anchor, and
@@ -386,6 +462,17 @@ class _Run:
             verdict = self.store.latest_verdict(self.contract_id) or {}
             follow_up = f"{self.contract_id}_rej{verdict.get('attempt', 1)}"
             hint = f"the rejection opened {follow_up}; run that contract"
+        elif status == "gate_failed":
+            # A gate whose completion failed after its claim is
+            # retried by presenting the decision again — never by a
+            # fresh contract id (round-6 fix spec J1; round-6
+            # gate-core F5).
+            hint = ("its human gate was claimed but its completion failed "
+                    "(contract status 'gate_failed'); present the recorded "
+                    "decision again with the critic_gate tool, "
+                    "`/critic gate <id> approve|reject|waive` or "
+                    "`hermes critic gate` to retry completion — do not "
+                    "open a new contract id")
         else:
             hint = ("a previous run left candidates behind; open a new contract id "
                     "for another attempt")
@@ -1719,6 +1806,21 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
     gate_failure observation) and returns an error result naming it;
     presenting the decision again claims with retry=True and
     re-attempts completion from the snapshot.
+
+    A claim whose process died before the wrap could run is detected
+    from the durable state alone (round-6 fix spec J1; round-6
+    gate-core F1): a decided verdict with no final answer and no
+    terminal contract status IS an interrupted completion, and
+    presenting the decision treats it as a retry — the interruption
+    is first recorded as a gate_failure observation so the audit
+    trail matches the exception path. A retry — from "failed" or
+    from the interrupted state — must present the decision that was
+    recorded; a different one is refused pre-claim, naming it
+    (round-6 security F2). Completion is idempotent and the failure
+    state is honest: once a final answer exists, a later failing
+    step converges to the completed result instead of flipping the
+    gate to "failed", and no second answer is ever written (round-6
+    gate-core F3, security F1).
     """
     if decision not in ("approved", "rejected", "waived"):
         return {"contract_id": contract_id, "status": "error",
@@ -1733,8 +1835,37 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
     waiver = verdict.get("waiver") or {}
     gate_state = verdict.get("human_gate")
     # A gate in the recorded failure state is claimable again, with
-    # retry: presenting the decision IS the retry (spec H1).
-    claimable = gate_state in ("pending", "failed")
+    # retry: presenting the decision IS the retry (spec H1). So is a
+    # gate whose claim landed but whose completion never finished —
+    # the process died after the claim and the failure state was
+    # never written (round-6 fix spec J1; round-6 gate-core F1).
+    interrupted = _interrupted_completion(store, contract_id, verdict, contract)
+    is_retry = gate_state == "failed" or interrupted
+    claimable = gate_state in ("pending", "failed") or interrupted
+
+    if is_retry:
+        # A retry re-attempts the completion of the decision that
+        # was recorded — it is not a fresh decision surface
+        # (round-6 fix spec J1; round-6 security F2). A different
+        # decision is refused here, pre-claim, naming the recorded
+        # one; the state is left untouched.
+        recorded = _recorded_gate_decision(store, contract_id, verdict)
+        if recorded is not None and decision != recorded:
+            return {"contract_id": contract_id, "status": "error",
+                    "human_gate": gate_state,
+                    "detail": (
+                        f"retry refused: this gate's recorded decision is "
+                        f"{recorded!r}; a retry must present the recorded "
+                        f"decision — a different decision needs an explicit "
+                        f"operator reset, not the retry path")}
+        if interrupted:
+            # The interruption enters the audit trail exactly as the
+            # exception path would have written it, so a reader of
+            # the book cannot tell the two apart afterwards.
+            _record_gate_failure(
+                store, contract_id, verdict, decision, channel,
+                RuntimeError(
+                    "interrupted completion (process death after claim)"))
 
     # Refusals that leave the gate undecided are decided BEFORE the
     # claim: they record nothing, consume nothing, and carry no
@@ -1761,8 +1892,18 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
                     "detail": "waiver applies only to a measured failure, never a hard one"}
 
     # The claim IS the decision record — taken before any merge, never
-    # replayable, never swallowed after the fact.
-    if not _claim_gate(store, verdict, decision, retry=gate_state == "failed"):
+    # replayable, never swallowed after the fact. A retry re-claims
+    # from the failure state — and an interrupted completion is one
+    # by now: its interruption was recorded above in exactly the
+    # failure state's shape, so it re-claims with retry like any
+    # other retry, and the claim restores the verdict's decided value.
+    if interrupted:
+        claimed = _claim_gate(
+            store, {**verdict, "human_gate": "failed"}, decision,
+            retry=True)
+    else:
+        claimed = _claim_gate(store, verdict, decision, retry=is_retry)
+    if not claimed:
         return {"contract_id": contract_id, "status": "error",
                 "detail": "no pending human gate for this contract"}
     result = dict(_result or {"contract_id": contract_id})
@@ -1772,6 +1913,19 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
             store, contract_id, decision, reason, contract, mgr,
             verdict, winner, waiver, result, channel)
     except Exception as exc:  # noqa: BLE001 - completion failures land in the failure state
+        if decision != "rejected" \
+                and _final_answer_row(store, contract_id) is not None:
+            # The completion's durable record already exists: whatever
+            # failed came after it, so the gate is completed, not
+            # failed (round-6 fix spec J1; round-6 gate-core F3,
+            # security F1). Converge instead of recording a failure
+            # state the book would contradict.
+            try:
+                return _complete_human_gate(
+                    store, contract_id, decision, reason, contract, mgr,
+                    verdict, winner, waiver, result, channel)
+            except Exception:  # noqa: BLE001 - fall through to the failure state
+                pass
         failure = _record_gate_failure(
             store, contract_id, verdict, decision, channel, exc)
         result = dict(_result or {"contract_id": contract_id})
@@ -1793,7 +1947,16 @@ def _complete_human_gate(store, contract_id, decision, reason, contract,
     the waiver-grant record, the merge, the final answer. Called by
     record_human_gate under its failure wrap — anything raised here
     lands the gate in the recorded failure state, so this function
-    records nothing speculatively and swallows nothing."""
+    records nothing speculatively and swallows nothing.
+
+    Completion is idempotent (round-6 fix spec J1; round-6 gate-core
+    F3, security F1): a retry — or a convergence after a post-answer
+    failure — re-enters here, and whatever the first attempt already
+    made durable is reused, never duplicated: an existing final
+    answer means the merge already landed, so the merge is skipped
+    outright and the remaining steps (status, ref cleanup,
+    certificate) simply converge; an existing rejection observation
+    on the child contract is reused instead of appended twice."""
     if decision == "rejected":
         new_id = f"{contract_id}_rej{verdict['attempt']}"
         if store.get_contract(new_id) is None:
@@ -1808,11 +1971,20 @@ def _complete_human_gate(store, contract_id, decision, reason, contract,
                 repo_path=contract.get("repo_path"), attempt=1,
                 contract_id=new_id,
             )
-        store.append_observation(
-            new_id,
-            {"kind": "human_rejection", "from_contract": contract_id,
-             "reason": reason or "rejected at the human gate"},
-        )
+        child = store.get_contract(new_id) or {}
+        already_rejected = any(
+            isinstance(obs, dict) and obs.get("kind") == "human_rejection"
+            and obs.get("from_contract") == contract_id
+            for obs in child.get("observations") or [])
+        if not already_rejected:
+            store.append_observation(
+                new_id,
+                {"kind": "human_rejection", "from_contract": contract_id,
+                 "reason": reason or "rejected at the human gate",
+                 # The deciding channel rides the observation, as it
+                 # does on gate_completion (round-6 fix spec J5).
+                 "channel": channel},
+            )
         store.set_contract_status(contract_id, "rejected")
         # Terminal state: the field's worktree dirs and branches go
         # away (fix spec G9; round-4 contest-core F4). No certificate:
@@ -1842,6 +2014,48 @@ def _complete_human_gate(store, contract_id, decision, reason, contract,
         setter = getattr(store, "set_verdict_waiver", None)
         if callable(setter):
             setter(verdict["id"], waiver_record)
+
+    # A final answer already on the book means a previous attempt
+    # completed the merge and wrote the completion's durable record:
+    # converge — never re-merge, never write a second answer
+    # (round-6 fix spec J1; round-6 gate-core F3, security F1).
+    existing_answer = _final_answer_row(store, contract_id)
+    if existing_answer is not None:
+        merged_sha = str(existing_answer.get("commit") or "")
+        if merged_sha.startswith("git:"):
+            merged_sha = merged_sha[len("git:"):]
+        commit = (winner or {}).get("payload_hash") or merged_sha
+        result["merge_source"] = "already_completed"
+        note = ("a final answer already exists for this contract; "
+                "completion converged without re-merging or writing "
+                "a second answer")
+        result["detail"] = (
+            f"{result['detail']}; {note}" if result.get("detail") else note
+        )
+        # The gate_completion observation is the durable merge
+        # record — append it only if the first attempt died before
+        # writing it, so a converged book carries exactly one.
+        prior = store.get_contract(contract_id) or {}
+        already_noted = any(
+            isinstance(obs, dict) and obs.get("kind") == "gate_completion"
+            for obs in prior.get("observations") or [])
+        if not already_noted:
+            try:
+                store.append_observation(contract_id, {
+                    "kind": "gate_completion", "decision": decision,
+                    "merge_source": "already_completed",
+                    "commit": merged_sha, "channel": channel,
+                })
+            except Exception:  # noqa: BLE001 - bookkeeping must not undo a merge
+                pass
+        store.set_contract_status(contract_id, "completed")
+        if winner is not None:
+            _delete_snapshot_ref(mgr, contract_id, winner["id"])
+        result.update({"status": "completed", "commit": f"git:{merged_sha}",
+                       "winner_commit": f"git:{commit}",
+                       "waiver": waiver_record})
+        _attach_certificate(result, store, contract_id)
+        return result
 
     # approved (or a valid measured waiver): merge the winner's
     # verdict-time snapshot — what was gated — never the live tree.
