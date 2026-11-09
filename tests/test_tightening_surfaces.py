@@ -272,6 +272,11 @@ class TestLegacyFormStoreSurvives(unittest.TestCase):
         _dispatch(store, cost_usd=2.5)
         _dispatch(store, cost_usd=3.5)
         head = _verdict(store)
+        # Round-5 integration: issuance is completion-gated (spec H1)
+        # — record the completion the loop would have written.
+        store.create_final_answer(
+            "repo", "ctr_0001", "deadbeef")
+        store.set_contract_status("ctr_0001", "completed")
         cert = chain.issue_certificate(store, "ctr_0001")
         self.assertIsNotNone(cert)
         store.close()

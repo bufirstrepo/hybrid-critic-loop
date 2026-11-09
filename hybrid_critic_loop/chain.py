@@ -712,6 +712,13 @@ def _publish_key_file(key_path, key):
             # The file that beat us is itself unusable; heal it via
             # the replace path with our key.
             return _replace_key_file(key_path, key)
+        except OSError:
+            # Round-5 fix (attack F6): on a filesystem without
+            # hardlink support os.link raises PermissionError/EPERM,
+            # which must not kill the certificate feature on an
+            # otherwise writable directory — fall back to the replace
+            # publish (its post-write adopt keeps racers convergent).
+            return _replace_key_file(key_path, key)
         _fsync_dir(key_path.parent)
         return key
     finally:
@@ -730,7 +737,17 @@ def _replace_key_file(key_path, key):
     corrupt file converge on one key: the last replace wins the file,
     and every replacer ends up holding the file's content rather than
     its own candidate key.
+
+    Round-5 fix (attack F6): re-read FIRST and adopt the file if it
+    has already become valid — two healers acting in SEQUENCE (not
+    simultaneously) otherwise diverge: the second would replace over
+    the first's now-valid key while the first process keeps its
+    cached key, and its certificates read "different store" until a
+    restart. Only a file still corrupt at this moment is replaced.
     """
+    existing = None if key_path.is_symlink() else _read_key_file(key_path)
+    if existing is not None and len(existing) == _KEY_LEN:
+        return existing
     _write_key_file(key_path, key)
     final = _read_key_file(key_path)
     if final is not None and len(final) == _KEY_LEN:
