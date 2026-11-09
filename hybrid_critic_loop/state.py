@@ -1618,6 +1618,16 @@ class Store:
 
     def upsert_route(self, category, primary, compete_with, fallback, judges,
                      rule, panel=None, scoring=None):
+        # Write-boundary invariant (round-9 fix M4; lane-4 F5): one
+        # expert can never hold both top slots. The Item-1 defect-2
+        # guard used to live only in apply_route_demotion's output
+        # path, so a route written directly could seat the same
+        # expert as primary AND compete_with and every consumer read
+        # it on trust. Refuse the write instead.
+        if primary is not None and primary == compete_with:
+            raise ValueError(
+                f"route for {category!r} would seat {primary!r} as both"
+                " primary and compete_with")
         # panel/scoring (v0.3): the 8-family target panel and the scoring
         # mode travel with the route. On conflict they are only
         # overwritten when the caller supplies them, so legacy callers
@@ -1678,6 +1688,18 @@ class Store:
         or absent branch at all, so most demotions were silent no-ops
         that callers nevertheless reported as done.
 
+        Seat-set invariant (round-9 fix M4; lane-4 F1/F2): EVERY
+        demotion mode preserves the route's seat set — each seat
+        present before the demotion is present after, exactly once.
+        A demotion reorders; it never duplicates or deletes. In the
+        legacy branches a promoted fallback member MOVES out of the
+        fallback (it used to keep its fallback slot too), and when a
+        primary demotion promotes anyone other than the old
+        ``compete_with`` — a fallback member or a non-route expert —
+        the old compete seat is displaced to the head of the
+        fallback instead of vanishing, and the report names it in
+        ``displaced``.
+
         Owner ruling 2026-11-09 (Item 1 = A; FIX-SPEC-DECISIONS D1,
         Claude's suggestion verbatim): "Demote = move the loser
         behind every seat that passed the deciding gate; never
@@ -1703,8 +1725,10 @@ class Store:
         plus the change report callers must speak from: ``changed``
         (bool — any route field actually moved), ``branch``
         ("primary" / "compete_with" / "fallback" / "none"),
-        ``demoted``, and ``promoted`` (the expert that actually took
-        a vacated seat, else None). When nothing changed the route
+        ``demoted``, ``promoted`` (the expert that actually took
+        a vacated seat, else None), and ``displaced`` (a seat that
+        lost a top slot to the promotion and was placed in the
+        fallback, else None). When nothing changed the route
         row is not rewritten at all.
         """
         route = self.get_route(category)
@@ -1716,13 +1740,19 @@ class Store:
         before = (primary, compete_with, list(fallback))
         branch = "none"
         promoted = None
+        displaced = None
         if promote_expert == demote_expert:
             promote_expert = None
         if passed_experts is not None:
             passed = set(passed_experts)
+            # Set-based dedupe (round-9 fix M4): the order build is
+            # linear in the route size; the old `seat not in order`
+            # list scan was O(n^2) on wide routes.
+            seen = set()
             order = []
             for seat in (primary, compete_with, *fallback):
-                if seat is not None and seat not in order:
+                if seat is not None and seat not in seen:
+                    seen.add(seat)
                     order.append(seat)
             if demote_expert in order:
                 if demote_expert == primary:
@@ -1764,19 +1794,42 @@ class Store:
         elif demote_expert == primary:
             branch = "primary"
             if promote_expert:
+                old_compete = compete_with
+                if promote_expert in fallback:
+                    # The promoted seat MOVES out of the fallback
+                    # (round-9 fix M4; lane-4 F1 — it used to keep
+                    # its fallback slot as well and hold two places).
+                    fallback.remove(promote_expert)
+                if demote_expert in fallback:
+                    fallback.remove(demote_expert)
                 primary = promote_expert
                 compete_with = demote_expert
                 promoted = promote_expert
+                if old_compete is not None \
+                        and old_compete != promote_expert \
+                        and old_compete != demote_expert:
+                    # The old compete seat keeps a fallback place
+                    # (round-9 fix M4; lane-4 F2 — promoting a
+                    # fallback member or a non-route expert used to
+                    # evict it from the route entirely, silently).
+                    if old_compete in fallback:
+                        fallback.remove(old_compete)
+                    fallback.insert(0, old_compete)
+                    displaced = old_compete
         elif demote_expert == compete_with:
             branch = "compete_with"
             if demote_expert in fallback:
                 fallback.remove(demote_expert)
             fallback.insert(0, demote_expert)
+            if promote_expert and promote_expert in fallback:
+                # The promoted seat MOVES out of the fallback
+                # (round-9 fix M4; lane-4 F1).
+                fallback.remove(promote_expert)
             compete_with = promote_expert if promote_expert else None
             promoted = compete_with
         elif demote_expert in fallback:
             branch = "fallback"
-            fallback.remove(demote_expert)
+            fallback = [s for s in fallback if s != demote_expert]
             fallback.append(demote_expert)
         if compete_with is not None and compete_with == primary:
             # Defect 2 guard (owner ruling 2026-11-09, Item 1 = A):
@@ -1800,6 +1853,7 @@ class Store:
         result["branch"] = branch
         result["demoted"] = demote_expert
         result["promoted"] = promoted if changed else None
+        result["displaced"] = displaced if changed else None
         return result
 
     # -- ledger --------------------------------------------------------------------

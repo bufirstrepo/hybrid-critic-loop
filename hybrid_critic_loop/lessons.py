@@ -160,26 +160,23 @@ def _contract_id(contract, verdict):
     )
 
 
-def _verdict_waived(verdict, gate_details):
+def _verdict_waived(verdict):
     """True when this verdict is a waiver verdict.
 
     Owner ruling 2026-11-09 (Item 1 = A; FIX-SPEC-DECISIONS D1): "a
     waiver demotes nobody — the human accepted the measured failure."
-    The waiver reaches derivation through whichever surface recorded
-    it: the verdict row's ``waiver`` record (offered/granted for the
-    measured gate), a ``waiver_candidate`` on the verdict, or the
-    gate details' ``waiver_candidate`` (the candidate the measured
-    gate failed but the verdict proposes to waive through).
+    The one channel with a production writer is the verdict row's
+    ``waiver`` record (offered/granted for the measured gate).
+
+    Round-9 fix M5: the ``waiver_candidate`` legs — one on the
+    verdict dict, one on gate_details — are removed. Nothing in
+    production ever wrote either key into the shapes derivation
+    reads, so they only fired for hand-shaped verdict dicts; keeping
+    them would let a stray key suppress a demotion the ruling never
+    covered.
     """
     verdict = verdict or {}
-    gate_details = gate_details or {}
-    if verdict.get("waiver"):
-        return True
-    if verdict.get("waiver_candidate"):
-        return True
-    if gate_details.get("waiver_candidate"):
-        return True
-    return False
+    return bool(verdict.get("waiver"))
 
 
 def derive_outcome_cause(contract, verdict, gate_details):
@@ -204,7 +201,7 @@ def derive_outcome_cause(contract, verdict, gate_details):
     # decisions doc's defect 4: the proposed winner's own expert was
     # demoted while its win was recorded), a waiver verdict's lesson
     # carries NO route_change at all (suppression, not a held row).
-    waived = _verdict_waived(verdict, gate_details)
+    waived = _verdict_waived(verdict)
 
     # 1. Measured gate failure — first failing measurement row wins.
     for row in gate_details.get("measurements") or []:

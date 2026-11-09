@@ -200,12 +200,30 @@ class TestWaiverDemotesNobody(unittest.TestCase):
         self.assertIn("failed the measured gate", outcome)
         self.assertIsNone(route_change)
 
-    def test_waiver_candidate_in_gate_details_emits_no_route_change(self):
+    def test_waiver_candidate_keys_no_longer_suppress(self):
+        # Round-9 fix M5: _verdict_waived keeps ONLY the verdict's
+        # ``waiver`` record — the one channel with a production
+        # writer. The ``waiver_candidate`` legs (on the verdict and
+        # on gate_details) had no production writer and are removed:
+        # neither key suppresses a demotion any more. (This pin
+        # replaces the decisions-pass pin that asserted suppression
+        # via gate_details["waiver_candidate"].)
         details = self._measured_failure_details()
         details["waiver_candidate"] = {"id": "cand-a"}
         _, _, _, route_change, _ = lessons.derive_outcome_cause(
             CONTRACT, {"contract_id": "c1"}, details)
-        self.assertIsNone(route_change)
+        self.assertEqual(
+            route_change,
+            {"category": "code", "demote": "codex",
+             "reason": "lost on measured gate"})
+        _, _, _, route_change, _ = lessons.derive_outcome_cause(
+            CONTRACT,
+            {"contract_id": "c1", "waiver_candidate": {"id": "cand-a"}},
+            self._measured_failure_details())
+        self.assertEqual(
+            route_change,
+            {"category": "code", "demote": "codex",
+             "reason": "lost on measured gate"})
 
     def test_waived_lesson_stores_no_route_change(self):
         # Downstream: write_lesson stores the derived route_change and

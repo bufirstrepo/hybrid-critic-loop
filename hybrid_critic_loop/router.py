@@ -167,10 +167,17 @@ def apply_lesson_route_change(store, category, route_change, contract_id,
     "Demote = move the loser behind every seat that passed the
     deciding gate; never promote a seat that failed it." When the
     caller supplies ``gate_passed`` (the experts whose candidates
-    passed the deciding gate), the promotion is gate-checked — an
-    explicitly named promote that failed the gate is ignored, and
-    the store is asked to rebuild the route order around the passed
-    set so the loser lands behind every gate-passing seat. If no
+    passed the deciding gate), the store rebuilds the route order
+    around the passed set — gate-passing seats first, in route
+    order, then the loser, then the rest — so the loser lands
+    behind every gate-passing seat. An explicitly named promote
+    does NOT steer that rebuild, not even when the named seat
+    itself passed: the seat that takes a top slot is the first
+    gate-passing seat in route order (round-9 correction — the
+    earlier wording of this docstring claimed the named promote
+    was honoured in passed mode; the store never read it there).
+    A named promote is honoured only on the legacy path below,
+    subject to the store's ``primary == compete_with`` guard. If no
     gate-passing seat exists to promote, the route cannot move: the
     demotion is still recorded — a ledger row and a line that say
     plainly that no gate-passing seat was available — instead of an
@@ -229,21 +236,30 @@ def apply_lesson_route_change(store, category, route_change, contract_id,
         # The store reported the change itself: speak from it exactly.
         changed = bool(result["changed"])
         promoted_actual = result.get("promoted")
+        displaced_actual = result.get("displaced")
         branch = result.get("branch")
         new_route = result
     else:
         new_route = result if isinstance(result, dict) and result else route_for(store, category)
         changed = _route_positions(new_route) != before
         promoted_actual = promote if changed else None
+        displaced_actual = None
         branch = None
     new_primary = (new_route or {}).get("primary", primary)
+    new_compete = (new_route or {}).get("compete_with", compete_with)
 
     if not changed:
-        if passed is not None and branch in ("primary", "compete_with"):
+        if passed is not None and branch in (
+                "primary", "compete_with", "fallback"):
             # The demoted seat holds a position, but no gate-passing
             # seat exists to move it behind (owner ruling, Item 1 =
             # A): record the demotion honestly — no unqualified
-            # promotion, no claimed reshuffle.
+            # promotion, no claimed reshuffle. Round-9 fix M4: the
+            # fallback branch belongs here too — a fallback demotee
+            # with zero passers DOES hold a route position, and the
+            # old primary/compete-only condition let it fall through
+            # to the false "holds no route position" line with no
+            # ledger row at all.
             note = (
                 f"route_change demote {demote} ({reason}) contract "
                 f"{contract_id}: no seat that passed the deciding gate "
@@ -255,23 +271,50 @@ def apply_lesson_route_change(store, category, route_change, contract_id,
                 f"passed the deciding gate to promote; route unchanged "
                 f"— {reason} (contract {contract_id})"
             )
+        if branch in ("primary", "compete_with", "fallback"):
+            # The demoted seat holds a route position; the demotion
+            # simply moved nothing (a primary with no successor
+            # named, a fallback member already last). Say that —
+            # not the position-less line below (round-9 fix M4).
+            return (
+                f"Route for {category}: no route change — {demote} holds "
+                f"a route position and the demotion moved nothing "
+                f"— {reason} (contract {contract_id})"
+            )
         return (
             f"Route for {category}: no route change — {demote} holds no "
             f"route position to demote from — {reason} (contract {contract_id})"
         )
 
     note = f"route_change demote {demote} ({reason}) contract {contract_id}"
+    if displaced_actual:
+        # Round-9 fix M4: a seat displaced to the fallback by the
+        # promotion is part of what happened; the record says so.
+        note += f"; {displaced_actual} displaced to the fallback order"
     _record_route_ledger(store, demote, contract_id, note)
 
     if promoted_actual:
-        return (
+        line = (
             f"Route for {category}: demoted {demote}, promoted {promoted_actual} "
-            f"(primary is now {new_primary}) — {reason} (contract {contract_id})"
+            f"(primary is now {new_primary})"
         )
-    return (
-        f"Route for {category}: demoted {demote} within the fallback order "
-        f"(primary is now {new_primary}) — {reason} (contract {contract_id})"
-    )
+    elif demote == new_compete:
+        # The demotee landed on the compete seat (round-9 fix M4;
+        # lane-4 F4 — the old template called every unpromoted
+        # demotion a fallback move, even when a passed-mode rebuild
+        # had placed the demotee ON the compete seat).
+        line = (
+            f"Route for {category}: demoted {demote} to the compete seat "
+            f"(primary is now {new_primary})"
+        )
+    else:
+        line = (
+            f"Route for {category}: demoted {demote} within the fallback order "
+            f"(primary is now {new_primary})"
+        )
+    if displaced_actual:
+        line += f"; {displaced_actual} moved to the fallback order"
+    return f"{line} — {reason} (contract {contract_id})"
 
 
 def _record_route_ledger(store, demote, contract_id, note):
