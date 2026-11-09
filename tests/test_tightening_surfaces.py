@@ -293,8 +293,13 @@ class TestLegacyFormStoreSurvives(unittest.TestCase):
         head = _verdict(store)
         # Round-5 integration: issuance is completion-gated (spec H1)
         # — record the completion the loop would have written.
+        # Round-9 re-base (spec M3): the row records the deciding
+        # decision, as the loop's writer always passes it — chain's
+        # completion corroboration reads the row against the
+        # verdict's gate state, and a decision-less row agrees with
+        # no decision.
         store.create_final_answer(
-            "repo", "ctr_0001", "deadbeef")
+            "repo", "ctr_0001", "deadbeef", human_gate="approved")
         store.set_contract_status("ctr_0001", "completed")
         cert = chain.issue_certificate(store, "ctr_0001")
         self.assertIsNotNone(cert)

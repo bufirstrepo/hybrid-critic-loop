@@ -1187,38 +1187,73 @@ def _book_max_ledger_id(store) -> int:
 #: exactly this one on the approval path, alongside the final answer).
 _TERMINAL_COMPLETED_STATUSES = frozenset({"completed"})
 
+#: The human-gate decisions that PRODUCE a final answer (round-9
+#: fix spec M3). The gate machinery writes a ``final_answers`` row
+#: only on its approved and waived completion paths, and its
+#: convergence trusts a row only under the decision the row itself
+#: records — so those are the only verdict states that can
+#: corroborate a row. "rejected" produces no answer (rejection
+#: completes by spawning a successor contract); "pending",
+#: "failed" and "not_reached" are not decisions at all. Defined
+#: here rather than imported from the loop: the loop imports this
+#: module, never the reverse.
+_ANSWER_PRODUCING_DECISIONS = frozenset({"approved", "waived"})
+
 
 def _contract_completed(store, contract_id) -> bool:
     """Whether the contract's run COMPLETED (round-5 fix spec H1;
-    round-5 gate-core F2).
+    round-5 gate-core F2; round-9 fix spec M3).
 
-    Completed means a ``final_answers`` row exists for the contract,
-    or the contract's status is a terminal completed status. The
-    verdict row alone is NOT completion: under claim-first gating
-    the verdict records the decision before the merge and the final
-    answer exist, so a claimed-but-uncompleted gate used to mint a
-    verifying certificate for an answer that never landed.
+    Completed means the contract's status is a terminal completed
+    status, or a ``final_answers`` row exists AND the contract's
+    own gate record corroborates it. The verdict row alone is NOT
+    completion: under claim-first gating the verdict records the
+    decision before the merge and the final answer exist, so a
+    claimed-but-uncompleted gate used to mint a verifying
+    certificate for an answer that never landed.
+
+    The row alone is not completion either (round-9 fix spec M3;
+    round-9 gate-core P3): existence says nothing about what
+    produced the row, and a planted row on an escalated contract —
+    status "escalated", its verdict's gate never reached — read
+    completed here while the gate side refused the same book. So
+    on the real Store a row counts only when the gate state agrees
+    with it: the latest verdict's ``human_gate`` is one of the
+    answer-producing decisions (approved, waived) AND equals the
+    decision the row itself records — the same agreement the
+    loop's convergence validation demands of a row it trusts. That
+    leg keeps the crash window completed: a process that died
+    after writing a genuine answer but before the terminal status
+    leaves a decided verdict over a non-terminal contract, and the
+    gate machinery converges exactly that shape, so issuance reads
+    it completed. A row over an escalated, pending, failed or
+    rejected gate corroborates nothing and reads NOT completed.
 
     Surfaces, in order: the store's connection (the real Store has
     no final-answer getter, so the lookup is SQL), then
-    ``get_contract`` for the status. A duck-typed store exposing NO
-    completion surface at all — no connection and no
-    ``get_contract`` — degrades to the pre-fix behavior (issuance
-    proceeds): such stores are test doubles whose verdict rows are
-    their whole world, and the completion question cannot even be
-    expressed there. The real Store exposes both surfaces, so
+    ``get_contract`` for the status, then ``latest_verdict`` for
+    the corroboration. A duck-typed store exposing NO completion
+    surface at all — no connection and no ``get_contract`` —
+    degrades to the pre-fix behavior (issuance proceeds): such
+    stores are test doubles whose verdict rows are their whole
+    world, and the completion question cannot even be expressed
+    there. The real Store exposes all three surfaces, so
     production issuance is always gated.
     """
     surface = False
+    row_found = False
+    row_decision = None
     conn = getattr(store, "_conn", None)
     if conn is not None:
         try:
             row = conn.execute(
-                "SELECT 1 FROM final_answers WHERE contract_id=?"
-                " LIMIT 1", (contract_id,)).fetchone()
+                "SELECT human_gate FROM final_answers"
+                " WHERE contract_id=? LIMIT 1",
+                (contract_id,)).fetchone()
             surface = True
             if row is not None:
-                return True
+                row_found = True
+                row_decision = row[0]
         except Exception:  # noqa: BLE001 - try the status surface
             pass
     get_contract = getattr(store, "get_contract", None)
@@ -1226,12 +1261,28 @@ def _contract_completed(store, contract_id) -> bool:
         surface = True
         try:
             contract = get_contract(contract_id)
-        except Exception:  # noqa: BLE001 - unprovable is not completed
-            return False
-        return (
-            isinstance(contract, dict)
-            and contract.get("status") in _TERMINAL_COMPLETED_STATUSES
-        )
+        except Exception:  # noqa: BLE001 - the verdict leg may still answer
+            contract = None
+            if not row_found:
+                # No row to corroborate and the status is
+                # unprovable: not completed (the pre-M3 answer).
+                return False
+        if isinstance(contract, dict) and contract.get(
+                "status") in _TERMINAL_COMPLETED_STATUSES:
+            return True
+    if row_found:
+        latest_verdict = getattr(store, "latest_verdict", None)
+        if callable(latest_verdict):
+            try:
+                verdict = latest_verdict(contract_id)
+            except Exception:  # noqa: BLE001 - unprovable is not completed
+                verdict = None
+            if isinstance(verdict, dict) \
+                    and verdict.get("human_gate") \
+                    in _ANSWER_PRODUCING_DECISIONS \
+                    and verdict.get("human_gate") == row_decision:
+                return True
+        return False
     return not surface
 
 
@@ -1250,11 +1301,13 @@ def issue_certificate(store, contract_id, _chain_verified=False):
     book can hold fractional counts, and the payload shape requires an
     int, so minting would produce a token verify calls malformed
     (round-3 regression F5). Also None when the run never COMPLETED
-    — no final answer, no terminal completed status (round-5 fix
-    spec H1; round-5 gate-core F2: issuance used to read only the
-    verdict row, which claim-first gating flips at claim time, so a
-    claimed-but-unmerged gate certified an answer that never
-    landed). Also None when the chain prefix the certificate would
+    — no final answer the contract's gate record corroborates, no
+    terminal completed status (round-5 fix spec H1; round-5
+    gate-core F2: issuance used to read only the verdict row, which
+    claim-first gating flips at claim time, so a claimed-but-unmerged
+    gate certified an answer that never landed; round-9 fix spec
+    M3: a final answer's mere existence no longer suffices either —
+    see :func:`_contract_completed`). Also None when the chain prefix the certificate would
     seal does not verify (round-5 fix spec H2; round-5 attack F2:
     the verdict report minted a fresh stamp and token over a
     mid-book-tampered store because issuance never consulted the
