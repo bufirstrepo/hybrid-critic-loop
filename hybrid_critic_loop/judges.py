@@ -225,17 +225,26 @@ def _validate_candidate_score(entry, rubric: dict):
 
     Every rubric item must be present with a numeric score and a
     non-empty string evidence; otherwise the whole score is discarded
-    ("no rationale, no score") and None is returned.
+    ("no rationale, no score") and None is returned. Every score must
+    also lie within the rubric's scale [0, scale] (fix pass round 4,
+    spec G6, round-3 contest-core F1) — mirroring the matrix path's
+    validator, so an off-scale score (100 on a 0-10 rubric, or a
+    negative) discards the whole score instead of passing or poisoning
+    the aggregation. NaN fails the range comparison and is discarded
+    the same way.
     """
     if not isinstance(entry, dict):
         return None
     items_raw = entry.get("items")
     if not isinstance(items_raw, dict):
         return None
+    scale = rubric.get("scale", 10)
     items = {}
     for item_name in rubric["items"]:
         score, evidence = _extract_item(items_raw, entry, item_name)
         if not _is_number(score):
+            return None
+        if not (0 <= float(score) <= float(scale)):
             return None
         if not (isinstance(evidence, str) and evidence.strip()):
             return None

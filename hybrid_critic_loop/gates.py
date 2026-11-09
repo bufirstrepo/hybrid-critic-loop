@@ -16,8 +16,11 @@ only on candidates that survive all three of these.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import operator
+import os
+import shlex
 from dataclasses import dataclass, field
 
 from .errors import GateError
@@ -32,15 +35,99 @@ _OPS = {
     ">=": operator.ge,
 }
 
+_ORDERED_OPS = ("<", "<=", ">", ">=")
+
 _TAIL = 2000
 
 
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def compare(value, op, threshold) -> bool:
-    """Compare ``value`` against ``threshold`` with a string operator."""
+    """Compare ``value`` against ``threshold`` with a string operator.
+
+    Type discipline (fix pass round 4, spec G7, round-4 security F8 /
+    contest-core F6): a measured value is a number. A boolean on either
+    side, a non-numeric value under an ordered op, or a numeric /
+    non-numeric mix under == / != raises GateError — the gate path
+    records it as that candidate's gate failure (the loop converts it
+    to an elimination), never a TypeError escaping the gate and never
+    a silent ``True == 1`` pass. Two non-numeric values may still be
+    compared with == / != (a string metric against a string threshold
+    is a legitimate equality check).
+    """
     fn = _OPS.get(op)
     if fn is None:
         raise GateError(f"unknown comparison op: {op!r}")
+    if isinstance(value, bool) or isinstance(threshold, bool):
+        raise GateError(
+            f"measured comparison {op!r} got a boolean operand "
+            f"(value={value!r}, threshold={threshold!r}); measured values are numbers"
+        )
+    if op in _ORDERED_OPS:
+        if not _is_number(value) or not _is_number(threshold):
+            raise GateError(
+                f"measured comparison {op!r} needs numeric operands, got "
+                f"value={value!r} ({type(value).__name__}) and "
+                f"threshold={threshold!r} ({type(threshold).__name__})"
+            )
+    elif _is_number(value) != _is_number(threshold):
+        raise GateError(
+            f"measured comparison {op!r} mixes a numeric and a non-numeric "
+            f"operand (value={value!r}, threshold={threshold!r})"
+        )
     return bool(fn(value, threshold))
+
+
+def exit_matches(exit_code, expected) -> bool:
+    """Strict exit-code comparison (fix pass round 4, spec G7, round-4
+    contest-core F11): a boolean expectation is only ever satisfied by
+    the identical boolean — never by an integer exit code (``1 == True``
+    must not pass a hard gate). Integer expectations compare as ints."""
+    if isinstance(expected, bool):
+        return exit_code is expected
+    return exit_code == expected
+
+
+# ------------------------------------------------------- gate environment
+
+_SECRET_ENV_PATTERNS = ("*_KEY", "*_TOKEN", "*_SECRET", "*PASSWORD*")
+
+
+def scrubbed_env_names(env=None) -> list:
+    """Environment variable names removed for gate/sensor commands.
+
+    Fix pass round 4 (spec G7, round-4 security F1): a contract is an
+    arbitrary-command document whose gate commands start running at
+    baseline time; they do not get the operator's secret-bearing
+    environment. Keys matching *_KEY, *_TOKEN, *_SECRET or *PASSWORD*
+    are stripped from the env copy handed to gate commands. Executor
+    dispatch (generation) keeps the full environment — only gate and
+    sensor commands are scrubbed.
+    """
+    source = os.environ if env is None else env
+    return sorted(
+        name for name in source
+        if any(fnmatch.fnmatchcase(name, pattern)
+               for pattern in _SECRET_ENV_PATTERNS)
+    )
+
+
+def run_gate_command(cmd: str, cwd, timeout_s=900):
+    """Run a gate/sensor command with the scrubbed gate environment.
+
+    The scrub is expressed as an ``env -u NAME ...`` prefix over the
+    command string (run_command is argv-only, and the recorded command
+    everywhere — HardResult, baseline detail, citation matching — stays
+    the contract's own string; only the executed argv loses the
+    variables). With nothing to strip, the command runs unchanged.
+    """
+    names = scrubbed_env_names()
+    if not names:
+        return run_command(cmd, cwd, timeout_s=timeout_s)
+    prefix = "env " + " ".join(f"-u {shlex.quote(name)}" for name in names)
+    return run_command(f"{prefix} {cmd}", cwd, timeout_s=timeout_s)
 
 
 @dataclass
@@ -104,20 +191,25 @@ def check_provenance(candidate: dict) -> bool:
 
 
 def run_hard_items(contract: dict, cwd) -> list:
-    """Run every hard acceptance item; passed iff exit == expected exit."""
+    """Run every hard acceptance item; passed iff exit == expected exit.
+
+    Commands run with the scrubbed gate environment (see
+    run_gate_command), each bounded by the item's own timeout_s, and
+    the exit comparison is type-strict (see exit_matches).
+    """
     results = []
     for item in _acceptance(contract):
         if item.get("class") != "hard":
             continue
         cmd = item["cmd"]
         expected = (item.get("expect") or {}).get("exit", 0)
-        res = run_command(cmd, cwd, timeout_s=item.get("timeout_s", 900))
+        res = run_gate_command(cmd, cwd, timeout_s=item.get("timeout_s", 900))
         results.append(
             HardResult(
                 cmd=cmd,
                 expected_exit=expected,
                 exit_code=res.exit_code,
-                passed=(res.exit_code == expected),
+                passed=exit_matches(res.exit_code, expected),
                 stdout_tail=(res.stdout or "")[-_TAIL:],
                 stderr_tail=(res.stderr or "")[-_TAIL:],
             )
@@ -130,7 +222,13 @@ def run_measured_items(store, contract: dict, candidate_id, cwd) -> list:
 
     A sensor command whose stdout is not a JSON object of metrics, or
     that omits a metric the contract names, is a GateError -- never a
-    silent pass or a fabricated zero.
+    silent pass or a fabricated zero. So is a reading whose type the
+    comparison cannot judge (see compare). An item's rows are stored
+    only once the WHOLE item has been read and compared (fix pass
+    round 4, spec G7, round-4 contest-core F6): a multi-metric item
+    records all of its rows or none, so a gate that errored midway
+    leaves no partial evidence behind. Sensor commands run with the
+    scrubbed gate environment, bounded by the item's timeout_s.
     """
     results = []
     for item in _acceptance(contract):
@@ -138,7 +236,7 @@ def run_measured_items(store, contract: dict, candidate_id, cwd) -> list:
             continue
         sensor_cmd = item["sensor_cmd"]
         sensor = item.get("sensor", item["sensor_cmd"])
-        res = run_command(sensor_cmd, cwd, timeout_s=item.get("timeout_s", 900))
+        res = run_gate_command(sensor_cmd, cwd, timeout_s=item.get("timeout_s", 900))
         raw = res.stdout or ""
         try:
             parsed = json.loads(raw)
@@ -163,9 +261,6 @@ def run_measured_items(store, contract: dict, candidate_id, cwd) -> list:
                 )
             value = parsed[name]
             passed_metric = compare(value, spec["op"], spec["value"])
-            store.add_measurement(
-                candidate_id, sensor, name, value, spec["op"], spec["value"], passed_metric
-            )
             rows.append(
                 {
                     "candidate_id": candidate_id,
@@ -178,6 +273,12 @@ def run_measured_items(store, contract: dict, candidate_id, cwd) -> list:
                 }
             )
             all_passed = all_passed and passed_metric
+        # The item is fully read: only now do its rows become evidence.
+        for row in rows:
+            store.add_measurement(
+                candidate_id, sensor, row["metric"], row["value"],
+                row["op"], row["threshold"], row["passed"],
+            )
         results.append(MeasureResult(sensor=sensor, metrics=rows, passed=all_passed))
     return results
 

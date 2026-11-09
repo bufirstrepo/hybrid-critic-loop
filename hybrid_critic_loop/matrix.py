@@ -497,7 +497,8 @@ class MatrixOutcome:
 
 def run_matrix(store, contract, candidates, gate_results, diffs,
                peer_executors, *, min_score, dissent_threshold=3.0,
-               spread_threshold=2.0, calibrations=None, seed=0) -> MatrixOutcome:
+               spread_threshold=2.0, calibrations=None, seed=0,
+               round_no=None) -> MatrixOutcome:
     """Run the peer validity matrix over hard/measured survivors.
 
     ``peer_executors`` maps expert_id -> executor (``.family`` and
@@ -506,6 +507,14 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
     rule, applied here per peer). Valid cells are persisted via
     ``store.add_score(..., "matrix", "validity_matrix_v1", ...)``
     with confidence / details kwargs.
+
+    ``round_no`` tags each persisted cell with its bracket round (fix
+    pass round 4, spec G9, round-3 contest-core F6): the loop re-runs
+    the matrix for the SAME round after an anchored dissent, and the
+    re-run's rows supersede the first pass's rows for that round in
+    calibration instead of double-counting them. Callers who do not
+    name a round leave rows untagged, and calibration counts untagged
+    rows individually, exactly as before.
     """
     rubric = validity_rubric()
     candidates = [c for c in (candidates or []) if isinstance(c, dict)]
@@ -579,10 +588,20 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
             mean_confidence = (
                 sum(confidences.values()) / len(confidences) if confidences else 0.0
             )
+            # The round tag rides inside each row's detail dict (the
+            # cell's metadata bag): items/rubric/confidence keep their
+            # pinned shapes, and calibration reads the tag back to let
+            # a same-round re-run supersede this pass (round-3 F6).
+            persisted_details = details
+            if round_no is not None:
+                persisted_details = {
+                    row: {**detail, "round": round_no}
+                    for row, detail in details.items()
+                }
             store.add_score(
                 cid, "matrix", "validity_matrix_v1", judge_id, judge_family,
                 True, position, items=scores, mean=mean,
-                confidence=mean_confidence, details=details,
+                confidence=mean_confidence, details=persisted_details,
             )
             collected[cid].append({
                 "judge_id": judge_id,
@@ -706,28 +725,35 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
     # the citing outlier itself measures distance 0. When a candidate
     # already carries a dissent on a row, also check the remaining
     # cells on that row for a gate citation — the citation, not the
-    # distance, is what the re-run rule keys on.
-    if dissent and not rerun_requests:
-        dissented = {(d["candidate_id"], d["row"]) for d in dissent}
-        for candidate in candidates:
-            cid = _candidate_id(candidate)
-            cells = collected.get(cid, [])
-            if not cells:
+    # distance, is what the re-run rule keys on. The pass is PER
+    # CANDIDATE (fix pass round 4, spec G9, round-3 contest-core F4):
+    # it runs for every dissented candidate that has no re-run request
+    # of its own — one candidate's first-pass citation no longer
+    # suppresses the citation check for all the others.
+    dissented = {(d["candidate_id"], d["row"]) for d in dissent}
+    for candidate in candidates:
+        cid = _candidate_id(candidate)
+        if cid in rerun_requests:
+            continue  # this candidate already has its re-run
+        if not any(dcid == cid for dcid, _row in dissented):
+            continue  # no dissent on this candidate: nothing to recheck
+        cells = collected.get(cid, [])
+        if not cells:
+            continue
+        metric_names = _metric_names_for_candidate(cid, gate_results)
+        hard_cmds = _hard_cmds(contract, cid, gate_results)
+        for row in VALIDITY_ROWS:
+            if (cid, row) not in dissented:
                 continue
-            metric_names = _metric_names_for_candidate(cid, gate_results)
-            hard_cmds = _hard_cmds(contract, cid, gate_results)
-            for row in VALIDITY_ROWS:
-                if (cid, row) not in dissented:
-                    continue
-                for cell in cells:
-                    detail = cell["details"][row]
-                    cites = _cites_gate(
-                        f"{detail.get('evidence', '')} {detail.get('rationale', '')}",
-                        metric_names, hard_cmds,
-                    )
-                    if cites is not None:
-                        rerun_requests.setdefault(cid, cites)
-                        break
+            for cell in cells:
+                detail = cell["details"][row]
+                cites = _cites_gate(
+                    f"{detail.get('evidence', '')} {detail.get('rationale', '')}",
+                    metric_names, hard_cmds,
+                )
+                if cites is not None:
+                    rerun_requests.setdefault(cid, cites)
+                    break
 
     # ---- escalation ----------------------------------------------------
     reasons: list = []
@@ -987,19 +1013,29 @@ def _judged_negatives(judged):
 
 def _decidable_outcomes(candidates_by_id, verdicts_by_contract):
     """{candidate_id: True (positive) / False (negative)} for candidates
-    with a KNOWN decidable outcome; unlisted candidates are unknown."""
+    with a KNOWN decidable outcome; unlisted candidates are unknown.
+
+    Decidability is absolute, not relative (fix pass round 4, spec G9,
+    round-3 contest-core F2): the winner of a decided verdict is
+    positive; a candidate the verdict's judged map marks as failed, or
+    whose own row carries a gate elimination (hard / measured /
+    provenance), is negative. Two classes are EXCLUDED — they decided
+    nothing a validity score can be graded against: candidates that
+    PASSED the judging but lost the bracket cut to a stronger passer
+    (the verdict's eliminated list names them alongside true failures,
+    so the list itself is never read as ground truth), and ALL
+    candidates of an escalated verdict (that contest produced no
+    winner; its judged map grades nobody).
+    """
     outcomes: dict = {}
     for contract_id, verdict in verdicts_by_contract.items():
         if not isinstance(verdict, dict):
             continue
+        if verdict.get("escalated"):
+            continue  # decided nothing: no positives, no negatives
         winner = verdict.get("winner")
-        if winner is not None and not verdict.get("escalated"):
+        if winner is not None:
             outcomes[winner] = True
-        for cid in verdict.get("eliminated") or []:
-            if cid != winner:
-                outcomes.setdefault(cid, False)
-                if cid in outcomes and outcomes[cid] is not True:
-                    outcomes[cid] = False
         for cid in _judged_negatives(verdict.get("judged")):
             if cid != winner:
                 outcomes[cid] = False
@@ -1040,13 +1076,33 @@ def _cell_mean(row):
     return None
 
 
+def _row_round(row):
+    """The bracket round a score row was persisted under, or None.
+
+    run_matrix tags each cell's per-row detail dicts with the round
+    (round-3 contest-core F6); untagged rows — legacy rows, judged-gate
+    rows, rows from callers that name no round — return None and are
+    each counted on their own, exactly as before the tag existed.
+    """
+    details = row.get("details")
+    if isinstance(details, dict):
+        for detail in details.values():
+            if isinstance(detail, dict) and detail.get("round") is not None:
+                return detail.get("round")
+    return None
+
+
 def compute_calibration(store, experts) -> dict:
     """Per-family judge calibration from the store's score history.
 
     For each scored candidate with a known decidable outcome (verdict
-    winner of a non-escalated verdict = positive; verdict-eliminated,
-    hard/measured-eliminated, or judged-losing = negative), a cell in
-    gate "matrix"/"judged" AGREES if (score >= 5) == positive.
+    winner of a non-escalated verdict = positive; judged-losing or
+    hard/measured/provenance-eliminated = negative; bracket-cut passers
+    and every candidate of an escalated verdict excluded — see
+    _decidable_outcomes), a cell in gate "matrix"/"judged" AGREES if
+    (score >= 5) == positive. A judge–candidate pair's rows are counted
+    once per bracket round, at their latest values (see the supersede
+    pass below).
     calibration = (agree + 2*0.5) / (n + 2) -- Laplace smoothing toward
     the 0.5 prior. ``active`` is True once n >= 5; before that the
     effective weight elsewhere is the prior (see _effective_calibration).
@@ -1088,7 +1144,26 @@ def compute_calibration(store, experts) -> dict:
             families_seen.append(family)
 
     for cid in candidate_ids:
-        for row in _score_rows_for(store, cid, enumerated_scores):
+        rows = _score_rows_for(store, cid, enumerated_scores)
+        # Supersede (round-3 contest-core F6): a dissent re-run persists
+        # a second set of rows for the SAME bracket round; only the
+        # latest row of each (judge, gate, round) counts — each
+        # judge–candidate pair contributes its latest row per round
+        # exactly once, to agreement and to the bias means alike.
+        # Untagged rows keep their own identity and count individually.
+        latest_by_key: dict = {}
+        ordered_keys: list = []
+        for position, row in enumerate(rows):
+            round_tag = _row_round(row)
+            if round_tag is None:
+                key = ("row", position)
+            else:
+                key = ("round", row.get("judge_id"), row.get("gate"), round_tag)
+            if key not in latest_by_key:
+                ordered_keys.append(key)
+            latest_by_key[key] = row
+        for key in ordered_keys:
+            row = latest_by_key[key]
             if row.get("gate") not in _CELL_GATES:
                 continue
             family = row.get("judge_family")

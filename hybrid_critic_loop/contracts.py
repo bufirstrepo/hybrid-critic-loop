@@ -25,13 +25,26 @@ is a ContractError).
 from __future__ import annotations
 
 import json
+import math
+import re
 from pathlib import Path
 
-from .errors import ContractError
-from .shellrun import run_command
+from .errors import ContractError, GateError
+from .gates import run_gate_command
 
 _OPS = {"==", "!=", "<", "<=", ">", ">="}
 _STAGES = {"spec", "decompose", "implement", "integrate"}
+
+# Contract ids become store keys, branch-name components, and worktree
+# path segments (fix pass round 4, spec G7, round-4 security F6): a
+# conservative charset — letters, digits, dash, underscore; no path
+# separators, no dots, never a leading dash — so no id can escape the
+# worktree root or corrupt a ref.
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+# Gate commands get at most an hour per item, however the contract asks
+# (spec G7: timeout_s carried through validation, capped at a sane max).
+_MAX_TIMEOUT_S = 3600
 
 
 def _validated_threshold(item, key, default, index):
@@ -51,6 +64,108 @@ def _validated_threshold(item, key, default, index):
     return value
 
 
+def _validated_id(raw: dict) -> str:
+    """The contract id: required, conservative charset (spec G7).
+
+    A missing id used to normalize to None and key a whole run by a
+    phantom (round-4 contest-core F11); an unsanitized one could carry
+    path separators into worktree creation (round-4 security F6). Both
+    fail loudly here instead.
+    """
+    cid = raw.get("id")
+    if cid is None:
+        raise ContractError("contract.id is required (string)")
+    if not isinstance(cid, str) or not _ID_RE.match(cid):
+        raise ContractError(
+            "contract.id must be 1-128 characters of letters, digits, "
+            f"'-' or '_', starting with a letter or digit; got {cid!r}"
+        )
+    return cid
+
+
+def _validated_attempt(raw: dict) -> int:
+    """The attempt counter: an integer >= 1, ContractError on bad types
+    (round-4 contest-core F11 — the coercion used to leak a bare
+    ValueError past callers catching the documented error type)."""
+    value = raw.get("attempt", 1)
+    if isinstance(value, bool):
+        raise ContractError(f"contract.attempt must be an integer, got {value!r}")
+    try:
+        attempt = int(value)
+    except (TypeError, ValueError):
+        raise ContractError(
+            f"contract.attempt must be an integer, got {value!r}"
+        ) from None
+    if isinstance(value, float) and not value.is_integer():
+        raise ContractError(f"contract.attempt must be an integer, got {value!r}")
+    if attempt < 1:
+        raise ContractError(f"contract.attempt must be >= 1, got {attempt}")
+    return attempt
+
+
+def _validated_timeout(item, index):
+    """An item's timeout_s: carried through normalization (spec G7,
+    round-4 contest-core F5 — validation used to drop it, so every gate
+    ran at the 900 s default). Returns None when the item sets none;
+    otherwise a positive number capped at _MAX_TIMEOUT_S. Bad types are
+    ContractError, like every other validation failure."""
+    if "timeout_s" not in item or item.get("timeout_s") is None:
+        return None
+    raw = item["timeout_s"]
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ContractError(
+            f"acceptance[{index}] timeout_s must be a number of seconds, "
+            f"got {raw!r}"
+        )
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0:
+        raise ContractError(
+            f"acceptance[{index}] timeout_s must be positive and finite, "
+            f"got {raw!r}"
+        )
+    value = min(value, float(_MAX_TIMEOUT_S))
+    return int(value) if value.is_integer() else value
+
+
+def _validated_expect_exit(item, index):
+    """expect.exit, strictly typed (spec G7, round-4 contest-core F11).
+
+    A bool stays a bool and an int stays an int — the value is stored
+    with its type intact and the gate comparison is type-strict
+    (gates.exit_matches), so ``{"exit": true}`` is never satisfied by a
+    command exiting 1. Any other type is a ContractError.
+    """
+    expect = item.get("expect") or {}
+    if not isinstance(expect, dict):
+        raise ContractError(f"acceptance[{index}] expect must be an object")
+    exit_code = expect.get("exit", 0)
+    if isinstance(exit_code, bool):
+        return exit_code
+    if not isinstance(exit_code, int):
+        raise ContractError(
+            f"acceptance[{index}] expect.exit must be an int or bool, "
+            f"got {exit_code!r}"
+        )
+    return exit_code
+
+
+def _validated_judges(item, index) -> int:
+    """A judged item's judge count: an integer >= 1 when present
+    (round-4 contest-core F11 — ``judges: 0`` used to validate cleanly
+    and only fail downstream in panel seating)."""
+    raw = item.get("judges", 3)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ContractError(
+            f"acceptance[{index}] judged item 'judges' must be an integer, "
+            f"got {raw!r}"
+        )
+    if raw < 1:
+        raise ContractError(
+            f"acceptance[{index}] judged item 'judges' must be >= 1, got {raw}"
+        )
+    return raw
+
+
 def load_contract_file(path) -> dict:
     p = Path(path)
     try:
@@ -63,6 +178,7 @@ def load_contract_file(path) -> dict:
 def validate_contract(raw: dict) -> dict:
     if not isinstance(raw, dict):
         raise ContractError("contract must be a JSON object")
+    contract_id = _validated_id(raw)
     task = raw.get("task")
     if not task or not isinstance(task, str):
         raise ContractError("contract.task is required (string)")
@@ -86,11 +202,15 @@ def validate_contract(raw: dict) -> dict:
             cmd = item.get("cmd")
             if not cmd:
                 raise ContractError(f"acceptance[{i}] hard item needs 'cmd'")
-            expect = item.get("expect") or {}
-            exit_code = expect.get("exit", 0)
-            if not isinstance(exit_code, int):
-                raise ContractError(f"acceptance[{i}] expect.exit must be an int")
-            normalized.append({"class": "hard", "cmd": cmd, "expect": {"exit": exit_code}})
+            entry = {
+                "class": "hard",
+                "cmd": cmd,
+                "expect": {"exit": _validated_expect_exit(item, i)},
+            }
+            timeout_s = _validated_timeout(item, i)
+            if timeout_s is not None:
+                entry["timeout_s"] = timeout_s
+            normalized.append(entry)
             has_decidable = True
         elif cls == "measured":
             sensor_cmd = item.get("sensor_cmd") or item.get("cmd")
@@ -106,14 +226,16 @@ def validate_contract(raw: dict) -> dict:
                 if m["op"] not in _OPS:
                     raise ContractError(f"acceptance[{i}].metrics[{j}] op must be one of {sorted(_OPS)}")
                 norm_metrics.append({"name": m["name"], "op": m["op"], "value": m["value"]})
-            normalized.append(
-                {
-                    "class": "measured",
-                    "sensor": item.get("sensor", ""),
-                    "sensor_cmd": sensor_cmd,
-                    "metrics": norm_metrics,
-                }
-            )
+            entry = {
+                "class": "measured",
+                "sensor": item.get("sensor", ""),
+                "sensor_cmd": sensor_cmd,
+                "metrics": norm_metrics,
+            }
+            timeout_s = _validated_timeout(item, i)
+            if timeout_s is not None:
+                entry["timeout_s"] = timeout_s
+            normalized.append(entry)
             has_decidable = True
         elif cls == "judged":
             rubric = item.get("rubric")
@@ -134,7 +256,7 @@ def validate_contract(raw: dict) -> dict:
                     "class": "judged",
                     "rubric": rubric,
                     "min": min_score,
-                    "judges": int(item.get("judges", 3)),
+                    "judges": _validated_judges(item, i),
                     "spread_threshold": _validated_threshold(
                         item, "spread_threshold", 2.0, i
                     ),
@@ -168,10 +290,10 @@ def validate_contract(raw: dict) -> dict:
     bracket = {"cut_mode": cut_mode, "cut_per_round": cut_per_round}
 
     return {
-        "id": raw.get("id"),
+        "id": contract_id,
         "target_id": raw.get("target_id"),
         "stage": stage,
-        "attempt": int(raw.get("attempt", 1)),
+        "attempt": _validated_attempt(raw),
         "task": task,
         "domain": domain,
         "tags": list(raw.get("tags", [])),
@@ -191,10 +313,15 @@ def verify_baseline(store, contract: dict, repo_path, worktree_mgr) -> tuple[boo
 
     Returns (proceed, detail). Proceed is True iff the acceptance suite
     FAILS on the baseline in the expected way: at least one hard item
-    fails, or (with no hard items) at least one measured metric fails.
-    Records acceptance_baseline_run on the contract row.
+    fails, or at least one measured metric fails (fix pass round 4,
+    spec G9, round-3 contest-core F3 — the rule used to refuse a mixed
+    contract whose hard items passed and measured items failed, which
+    its own docstring never said). Records acceptance_baseline_run on
+    the contract row. Commands run with the scrubbed gate environment,
+    each bounded by its item's timeout_s (spec G7 — the baseline path
+    used to pass no timeout at all).
     """
-    from .gates import compare  # lazy: gates is a sibling workstream
+    from .gates import compare, exit_matches  # lazy: gates is a sibling workstream
 
     contract_id = contract["id"]
     baseline_wt = worktree_mgr.create(contract_id, "baseline")
@@ -204,8 +331,10 @@ def verify_baseline(store, contract: dict, repo_path, worktree_mgr) -> tuple[boo
 
     hard_failed = False
     for item in hard_items:
-        res = run_command(item["cmd"], baseline_wt)
-        passed = res.exit_code == item["expect"]["exit"]
+        res = run_gate_command(
+            item["cmd"], baseline_wt, timeout_s=item.get("timeout_s", 900)
+        )
+        passed = exit_matches(res.exit_code, item["expect"]["exit"])
         hard_failed = hard_failed or not passed
         detail["hard"].append(
             {"cmd": item["cmd"], "exit_code": res.exit_code, "passed": passed}
@@ -213,7 +342,9 @@ def verify_baseline(store, contract: dict, repo_path, worktree_mgr) -> tuple[boo
 
     measured_failed = False
     for item in measured_items:
-        res = run_command(item["sensor_cmd"], baseline_wt)
+        res = run_gate_command(
+            item["sensor_cmd"], baseline_wt, timeout_s=item.get("timeout_s", 900)
+        )
         entry = {"sensor_cmd": item["sensor_cmd"], "exit_code": res.exit_code, "metrics": []}
         try:
             values = json.loads(res.stdout)
@@ -231,14 +362,26 @@ def verify_baseline(store, contract: dict, repo_path, worktree_mgr) -> tuple[boo
                     measured_failed = True
                     entry["metrics"].append({"name": spec["name"], "passed": False, "error": "missing"})
                     continue
-                ok = compare(values[spec["name"]], spec["op"], spec["value"])
+                try:
+                    ok = compare(values[spec["name"]], spec["op"], spec["value"])
+                except GateError as exc:
+                    # A reading the comparison cannot judge (a string or
+                    # boolean where a number belongs) is a baseline
+                    # failure of that metric, recorded as such — the
+                    # baseline path treats broken sensors as data.
+                    measured_failed = True
+                    entry["metrics"].append(
+                        {"name": spec["name"], "value": values[spec["name"]],
+                         "passed": False, "error": str(exc)}
+                    )
+                    continue
                 measured_failed = measured_failed or not ok
                 entry["metrics"].append(
                     {"name": spec["name"], "value": values[spec["name"]], "passed": ok}
                 )
         detail["measured"].append(entry)
 
-    proceed = hard_failed or (not hard_items and measured_failed)
+    proceed = hard_failed or measured_failed
     store.set_baseline_run(contract_id, "fail" if proceed else "pass")
     worktree_mgr.remove(baseline_wt)
     return proceed, detail

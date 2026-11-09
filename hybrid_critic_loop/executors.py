@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shlex
 import shutil
@@ -85,6 +86,35 @@ def build_prompt(contract: dict, context: str) -> str:
     return "\n".join(parts)
 
 
+def _clean_token_count(value) -> int | None:
+    """A reported token count, or None ("not reported").
+
+    Fix pass round 4 (spec G6, round-4 security F5 / round-3 regression
+    F4): a count is a non-negative integer. Negative, NaN/Inf, fractional,
+    boolean, or non-numeric values are not reported numbers — they become
+    None at this walker, never a value the ledger must reject mid-run.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        value = int(value)
+    if value < 0:
+        return None
+    return int(value)
+
+
+def _clean_cost(value) -> float | None:
+    """A reported USD cost, or None: finite, non-negative, numeric."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        return None
+    return result
+
+
 def _parse_jsonl_usage(stdout: str):
     """Token usage and request ids from a CLI's JSON output. Never raises.
 
@@ -93,6 +123,20 @@ def _parse_jsonl_usage(stdout: str):
     lines (codex ``--json``). A line that is not entirely JSON — model
     prose quoting a usage-shaped object — counts for nothing; a token
     count is a reported number or None, never a guess (invariant 5).
+
+    Envelope only (fix pass round 4, spec G6, round-4 security F5): the
+    only objects read are the CLI's own output objects themselves — the
+    whole document, or each JSONL line's object, or (for a top-level
+    JSON array) its elements. A ``usage`` / ``total_cost_usd`` key counts
+    only at THAT level; anything nested deeper (a ``detail`` / ``result``
+    payload the model itself authored) is ignored, so model text cannot
+    manufacture the ledger's numbers. Per field, a later envelope's
+    value replaces an earlier one's (the final usage line of a stream
+    is the cumulative one); an invalid value at the envelope is "not
+    reported" and never displaces a valid earlier report. Negative,
+    NaN/Inf, or fractional token/cost values likewise become None here
+    (round-3 regression F4) instead of detonating the ledger write
+    downstream.
     """
     tokens_in = None
     tokens_out = None
@@ -105,8 +149,10 @@ def _parse_jsonl_usage(stdout: str):
         whole = json.loads(stdout)
     except Exception:
         whole = None
-    if isinstance(whole, (dict, list)):
+    if isinstance(whole, dict):
         objects.append(whole)
+    elif isinstance(whole, list):
+        objects.extend(item for item in whole if isinstance(item, dict))
     else:
         for line in stdout.splitlines():
             line = line.strip()
@@ -116,74 +162,45 @@ def _parse_jsonl_usage(stdout: str):
                 obj = json.loads(line)
             except Exception:
                 continue
-            objects.append(obj)
+            if isinstance(obj, dict):
+                objects.append(obj)
     for obj in objects:
-        # Walk dicts recursively (shallow + nested)
-        stack = [obj]
-        while stack:
-            cur = stack.pop()
-            if isinstance(cur, dict):
-                # usage
-                usage = cur.get("usage") if isinstance(cur.get("usage"), dict) else None
-                if usage is not None:
-                    try:
-                        if usage.get("input_tokens") is not None:
-                            tokens_in = int(usage["input_tokens"])
-                        if usage.get("output_tokens") is not None:
-                            tokens_out = int(usage["output_tokens"])
-                        # Alternative key spellings
-                        if usage.get("prompt_tokens") is not None and tokens_in is None:
-                            tokens_in = int(usage["prompt_tokens"])
-                        if usage.get("completion_tokens") is not None and tokens_out is None:
-                            tokens_out = int(usage["completion_tokens"])
-                    except Exception:
-                        pass
-                tokens_obj = cur.get("tokens") if isinstance(cur.get("tokens"), dict) else None
-                if tokens_obj is not None:
-                    try:
-                        if tokens_obj.get("input_tokens") is not None:
-                            tokens_in = int(tokens_obj["input_tokens"])
-                        if tokens_obj.get("output_tokens") is not None:
-                            tokens_out = int(tokens_obj["output_tokens"])
-                        if tokens_obj.get("input") is not None and tokens_in is None:
-                            tokens_in = int(tokens_obj["input"])
-                        if tokens_obj.get("output") is not None and tokens_out is None:
-                            tokens_out = int(tokens_obj["output"])
-                    except Exception:
-                        pass
-                # Direct keys
-                try:
-                    if cur.get("input_tokens") is not None and tokens_in is None:
-                        tokens_in = int(cur["input_tokens"])
-                    if cur.get("output_tokens") is not None and tokens_out is None:
-                        tokens_out = int(cur["output_tokens"])
-                except Exception:
-                    pass
-                # Provider-reported cost only (fix pass Wave 2.10, review
-                # 1D-16): claude's envelope carries total_cost_usd. Never a
-                # price table.
-                for key in ("total_cost_usd", "cost_usd"):
-                    if cost is None and isinstance(cur.get(key), (int, float)) \
-                            and not isinstance(cur.get(key), bool):
-                        cost = float(cur[key])
-                for key in ("request_id", "requestId"):
-                    if cur.get(key):
-                        rid = str(cur[key])
-                        if rid not in request_ids:
-                            request_ids.append(rid)
-                # id in error/event objects
-                if cur.get("type") in ("error", "event") or "error" in cur:
-                    if cur.get("id"):
-                        rid = str(cur["id"])
-                        if rid not in request_ids:
-                            request_ids.append(rid)
-                for v in cur.values():
-                    if isinstance(v, (dict, list)):
-                        stack.append(v)
-            elif isinstance(cur, list):
-                for item in cur:
-                    if isinstance(item, (dict, list)):
-                        stack.append(item)
+        # The envelope object itself — never anything nested inside it.
+        usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else None
+        if usage is not None:
+            cleaned = _clean_token_count(usage.get("input_tokens"))
+            if cleaned is not None:
+                tokens_in = cleaned
+            cleaned = _clean_token_count(usage.get("output_tokens"))
+            if cleaned is not None:
+                tokens_out = cleaned
+            if tokens_in is None:
+                cleaned = _clean_token_count(usage.get("prompt_tokens"))
+                if cleaned is not None:
+                    tokens_in = cleaned
+            if tokens_out is None:
+                cleaned = _clean_token_count(usage.get("completion_tokens"))
+                if cleaned is not None:
+                    tokens_out = cleaned
+        # Provider-reported cost only (fix pass Wave 2.10, review
+        # 1D-16): claude's envelope carries total_cost_usd. Never a
+        # price table.
+        for key in ("total_cost_usd", "cost_usd"):
+            cleaned = _clean_cost(obj.get(key))
+            if cleaned is not None:
+                cost = cleaned
+                break
+        for key in ("request_id", "requestId"):
+            if obj.get(key):
+                rid = str(obj[key])
+                if rid not in request_ids:
+                    request_ids.append(rid)
+        # id in error/event objects
+        if obj.get("type") in ("error", "event") or "error" in obj:
+            if obj.get("id"):
+                rid = str(obj["id"])
+                if rid not in request_ids:
+                    request_ids.append(rid)
     return tokens_in, tokens_out, request_ids, cost
 
 
@@ -210,9 +227,37 @@ def _looks_like_verdict(obj) -> bool:
     )
 
 
+class _DuplicateKeyError(ValueError):
+    """A JSON object in a judge reply carried the same key twice."""
+
+
+def _object_without_duplicate_keys(pairs):
+    """object_pairs_hook (fix pass round 4, spec G6, round-4 security F3):
+    a verdict object with duplicate keys is ambiguous — stdlib json would
+    silently collapse them last-wins, letting one value show to a reader
+    and another to the parser — so any object carrying a duplicate key
+    fails to decode in the judge path and is never selected."""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise _DuplicateKeyError(f"duplicate key {key!r}")
+        obj[key] = value
+    return obj
+
+
+_JUDGE_DECODER = json.JSONDecoder(object_pairs_hook=_object_without_duplicate_keys)
+
+_FENCED_BLOCK_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
+
+
 def _iter_json_objects(text: str):
-    """Yield every JSON object decodable from ``text``, scanning from each '{'."""
-    decoder = json.JSONDecoder()
+    """Yield every JSON object decodable from ``text``, scanning from each '{'.
+
+    Decoded with the duplicate-key-rejecting hook, so an object carrying
+    a duplicate key raises inside raw_decode and is skipped here like
+    any other undecodable span.
+    """
+    decoder = _JUDGE_DECODER
     i, n = 0, len(text)
     while i < n:
         j = text.find("{", i)
@@ -228,35 +273,65 @@ def _iter_json_objects(text: str):
         i = j + max(end, 1)
 
 
+def _verdict_in_text(text: str, _depth: int):
+    """The LAST verdict-shaped object in ``text``, or None.
+
+    Scans every decodable object in order — plain verdicts and verdicts
+    carried in a wrapper's text-bearing fields (or a codex event's
+    ``item`` text) all count, at the position where they appear — and
+    keeps the last one: a judge's conclusion comes after anything it
+    quoted or drafted along the way (round-4 security F3).
+    """
+    found = None
+    for obj in _iter_json_objects(text):
+        candidate = None
+        if _looks_like_verdict(obj):
+            candidate = obj
+        else:
+            for key in ("text", "result", "content", "response", "output"):
+                inner = obj.get(key)
+                if isinstance(inner, str) and "{" in inner:
+                    inner_found = _extract_judge_verdict(inner, _depth + 1)
+                    if inner_found is not None:
+                        candidate = inner_found
+            item = obj.get("item")
+            if isinstance(item, dict):
+                inner = item.get("text") or item.get("content")
+                if isinstance(inner, str) and "{" in inner:
+                    inner_found = _extract_judge_verdict(inner, _depth + 1)
+                    if inner_found is not None:
+                        candidate = inner_found
+        if candidate is not None:
+            found = candidate
+    return found
+
+
 def _extract_judge_verdict(text: str, _depth: int = 0):
     """The model's verdict from any judge output (fix pass Wave 2.5, review H2).
 
-    Finds the first JSON object with the verdict shape (label -> {"items":
-    ...}) in: plain model text; a codex ``--json`` JSONL stream (the verdict
-    sits in ``item.completed`` events' ``agent_message`` text); a claude
-    ``--output-format json`` envelope (the verdict sits in ``result``); or
-    any wrapper whose text-bearing field carries it. None when absent — the
-    matrix then records no cell for that peer, never a wrapper object.
+    Anchored to the END of the reply (fix pass round 4, spec G6, round-4
+    security F3): a fenced block carrying a verdict is the reply's named
+    answer and wins; otherwise the LAST verdict-shaped object in the text
+    is the verdict — an early object the judge quoted, drafted, or was
+    steered to emit no longer beats its own conclusion. Verdict sources:
+    plain model text; a codex ``--json`` JSONL stream (the verdict sits
+    in ``item.completed`` events' ``agent_message`` text); a claude
+    ``--output-format json`` envelope (the verdict sits in ``result``);
+    or any wrapper whose text-bearing field carries it. An object with
+    duplicate keys never decodes, so it is never the verdict. None when
+    absent — the matrix then records no cell for that peer, never a
+    wrapper object.
     """
     if not text or _depth > 3:
         return None
-    for obj in _iter_json_objects(text):
-        if _looks_like_verdict(obj):
-            return obj
-        for key in ("text", "result", "content", "response", "output"):
-            inner = obj.get(key)
-            if isinstance(inner, str) and "{" in inner:
-                found = _extract_judge_verdict(inner, _depth + 1)
-                if found is not None:
-                    return found
-        item = obj.get("item")
-        if isinstance(item, dict):
-            inner = item.get("text") or item.get("content")
-            if isinstance(inner, str) and "{" in inner:
-                found = _extract_judge_verdict(inner, _depth + 1)
-                if found is not None:
-                    return found
-    return None
+    fenced = None
+    for match in _FENCED_BLOCK_RE.finditer(text):
+        block_found = _verdict_in_text(match.group(1), _depth)
+        if block_found is not None:
+            fenced = block_found
+    if fenced is not None:
+        return fenced
+    return _verdict_in_text(text, _depth)
 
 
 def _find_refusal_line(combined: str) -> str | None:
@@ -427,7 +502,7 @@ def _cli_generate(binary_label: str, cmd: str, worktree: Path) -> GenResult:
 
 
 def _cli_judge(cmd: str, cwd: Path) -> dict | None:
-    """Shared judge() body: run a judge command, parse the first JSON object."""
+    """Shared judge() body: run a judge command, extract its verdict."""
     try:
         result = run_command(cmd, cwd=cwd, timeout_s=300)
     except Exception:

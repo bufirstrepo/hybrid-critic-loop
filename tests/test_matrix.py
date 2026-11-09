@@ -480,7 +480,12 @@ class TestComputeCalibration(unittest.TestCase):
         ]
         verdicts = {"ctr-1": {"contract_id": "ctr-1", "winner": "cand-pos",
                               "eliminated": ["cand-neg"], "escalated": False,
-                              "judged": {}}}
+                              # cand-neg's decidable outcome: the panel
+                              # judged it failed (fix pass round 4, spec
+                              # G9 — the verdict's eliminated list alone
+                              # no longer marks a candidate negative; it
+                              # also names bracket-cut passers).
+                              "judged": {"cand-neg": {"pass": False}}}}
         store = FakeStore(candidates=cands, verdicts=verdicts)
 
         def seed(cid, judge, family, mean):
@@ -568,7 +573,11 @@ class TestComputeCalibration(unittest.TestCase):
                 store.add_score(pos, "judged", "code_quality_v1", "judge-2",
                                 "fam-y", True, 1, {"correctness": 2}, 2.0)
                 store.create_verdict(
-                    contract_id, 1, pos, [neg], "pass", "pass", {},
+                    contract_id, 1, pos, [neg], "pass", "pass",
+                    # neg's decidable outcome: judged failed (fix pass
+                    # round 4, spec G9 — an eliminated-list entry alone
+                    # is not ground truth; see _decidable_outcomes).
+                    {neg: {"pass": False}},
                     False, None, None, "pending", None)
                 result = compute_calibration(store, store.list_experts())
                 self.assertAlmostEqual(result["fam-x"]["calibration"], 0.75)
