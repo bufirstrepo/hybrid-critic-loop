@@ -188,7 +188,7 @@ def ledger_report(store) -> str:
             lines.append("chain state: unavailable")
         else:
             lines.append(f"chain state: broken at row {_bad}")
-        lines.append(_unavailable_line(_bad))
+        lines.append(_unavailable_line(_bad, store))
         lines.extend(_events_lines(store))
         return "\n".join(lines)
     if _status == "ok":

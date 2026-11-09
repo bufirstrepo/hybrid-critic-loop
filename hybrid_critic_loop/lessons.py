@@ -112,7 +112,13 @@ def sanitize_metric_name(metric, declared=None):
     if metric is None:
         return UNRECORDED
     name = str(metric)
-    if declared and name in declared:
+    # The declared shortcut still requires the charset (round-7
+    # integration; round-7 security F4 residual): a raw contract dict
+    # in the canonical shape could otherwise feed a hostile name into
+    # the declared set without ever passing validate_contract, which
+    # refuses off-charset names upstream — so no validated flow can
+    # carry a declared name this check rejects.
+    if declared and name in declared and _METRIC_NAME_RE.match(name):
         return name
     if _METRIC_NAME_RE.match(name):
         return name
