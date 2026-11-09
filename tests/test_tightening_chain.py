@@ -141,16 +141,33 @@ class TighteningTestCase(unittest.TestCase):
             None, None, cost_usd, "observed", "bookkeeping",
             **_prov(provenance))
 
+    # Round-10 re-base (fix spec N1): the fixture completion sha.
+    # Production form is a full 40-char lowercase-hex merge sha:
+    # the final_answers row stores it as "git:<sha>" and the
+    # gate_completion observation stores it BARE (loop.py fresh
+    # completion path), exactly as _complete writes them below.
+    _COMPLETE_SHA = "0123456789abcdef0123456789abcdef01234567"
+
     def _complete(self, contract_id):
         """Complete the contract the way the loop does (loop.py):
-        record the final answer, then set the terminal status.
-        Round-5 fix spec H1 gates issuance on completion, so every
-        fixture that expects a certificate completes its run first
-        — and fixtures that expect a refusal complete theirs too,
-        so the refusal under test is the only gate that can fire."""
+        record the final answer, append the gate's durable merge
+        record, then set the terminal status. Round-5 fix spec H1
+        gates issuance on completion, so every fixture that expects
+        a certificate completes its run first — and fixtures that
+        expect a refusal complete theirs too, so the refusal under
+        test is the only gate that can fire. Round-10 fix spec N1:
+        chain._contract_completed binds the row's identity to the
+        gate_completion observation (decision + bare commit), so
+        the fixture writes both, in the loop's order — a bare
+        non-"git:" row no longer completes anything."""
         target_id = self.store.get_contract(contract_id)["target_id"]
         self.store.create_final_answer(
-            target_id, contract_id, "c0ffee", human_gate="approved")
+            target_id, contract_id, f"git:{self._COMPLETE_SHA}",
+            human_gate="approved")
+        self.store.append_observation(contract_id, {
+            "kind": "gate_completion", "decision": "approved",
+            "merge_source": "fixture", "commit": self._COMPLETE_SHA,
+            "channel": "fixture"})
         self.store.set_contract_status(contract_id, "completed")
 
     def _legacy_dispatch(self, contract_id, tokens_in=100,
@@ -1150,24 +1167,30 @@ class TestCompletionGatedIssuance(TighteningTestCase):
         self.assertTrue(ok, payload)
 
     def test_final_answer_alone_completes(self):
-        """The final-answer leg: a final_answers row completes the
-        run even before the status flips."""
+        """Round-10 re-base (fix spec N1): the pre-N1 "final-answer
+        leg" — a bare final_answers row with a non-"git:" commit
+        and no gate record completes the run — is abolished. That
+        shape is now a plant (round-10 probes P2/m3b): the row's
+        identity is uncorroborated, so issuance refuses."""
         cid = self._contract()
         self._dispatch(cid, 100, 50, 1.5)
         self._verdict(cid)
         target_id = self.store.get_contract(cid)["target_id"]
         self.store.create_final_answer(
             target_id, cid, "c0ffee", human_gate="approved")
-        self.assertIsNotNone(chain.issue_certificate(self.store, cid))
+        self.assertIsNone(chain.issue_certificate(self.store, cid))
 
     def test_completed_status_alone_completes(self):
-        """The status leg: a terminal completed status completes
-        the run even with no final-answer row."""
+        """Round-10 re-base (fix spec N1): the pre-N1 "status leg"
+        — a bare set_contract_status(cid, "completed") flip with
+        NO final-answer row completes the run — is abolished. That
+        shape is round-10 probe P1, a plant: a row is required and
+        its identity must be corroborated, so issuance refuses."""
         cid = self._contract()
         self._dispatch(cid, 100, 50, 1.5)
         self._verdict(cid)
         self.store.set_contract_status(cid, "completed")
-        self.assertIsNotNone(chain.issue_certificate(self.store, cid))
+        self.assertIsNone(chain.issue_certificate(self.store, cid))
 
 
 # ---------------------------------------------------------------------------

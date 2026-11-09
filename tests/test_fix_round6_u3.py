@@ -196,8 +196,17 @@ class TestVerifyCertScopingWording(_StoreCase):
             eliminated=[], hard="pass", measured="pass", judged=None,
             escalated=False, escalation_reason=None, waiver=None,
             human_gate="approved", tie_break=None)
+        # Round-10 re-base (fix spec N1): production-form
+        # completion — the row stores "git:<40-hex sha>", the
+        # gate_completion observation stores the sha BARE, both
+        # written before the status flip, as loop.py writes them.
         self.store.create_final_answer(
-            tid, contract_id, "c0ffee", human_gate="approved")
+            tid, contract_id, "git:0123456789abcdef0123456789abcdef01234567",
+            human_gate="approved")
+        self.store.append_observation(contract_id, {
+            "kind": "gate_completion", "decision": "approved",
+            "merge_source": "fixture", "commit": "0123456789abcdef0123456789abcdef01234567",
+            "channel": "fixture"})
         self.store.set_contract_status(contract_id, "completed")
         return cand
 
@@ -443,8 +452,15 @@ class TestVerdictReportSingleWalk(_StoreCase):
             hard="pass", measured="pass", judged=None, escalated=False,
             escalation_reason=None, waiver=None, human_gate="approved",
             tie_break=None)
+        # Round-10 re-base (fix spec N1): production-form
+        # completion (see TestVerifyCertScopingWording above).
         self.store.create_final_answer(
-            tid, "ctr-1", "c0ffee", human_gate="approved")
+            tid, "ctr-1", "git:0123456789abcdef0123456789abcdef01234567",
+            human_gate="approved")
+        self.store.append_observation("ctr-1", {
+            "kind": "gate_completion", "decision": "approved",
+            "merge_source": "fixture", "commit": "0123456789abcdef0123456789abcdef01234567",
+            "channel": "fixture"})
         self.store.set_contract_status("ctr-1", "completed")
         return cand
 

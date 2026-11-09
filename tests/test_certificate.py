@@ -86,14 +86,27 @@ class CertificateTestCase(unittest.TestCase):
             tokens_in, tokens_out, cost_usd, "completed", None,
             **_DISPATCH_PROVENANCE)
 
+    # Round-10 re-base (fix spec N1): production-form completion
+    # sha — full 40-char lowercase hex; the row stores "git:<sha>",
+    # the gate_completion observation stores it BARE (loop.py).
+    _COMPLETE_SHA = "0123456789abcdef0123456789abcdef01234567"
+
     def _complete(self, contract_id):
         """Complete the contract the way the loop does: final
-        answer + terminal status. Round-5 fix spec H1 gates
-        issuance on completion, so fixtures expecting a
-        certificate complete their run first."""
+        answer, the gate_completion observation, then terminal
+        status. Round-5 fix spec H1 gates issuance on completion,
+        so fixtures expecting a certificate complete their run
+        first. Round-10 fix spec N1 binds the row's identity to
+        the gate record, so the fixture writes both, in the
+        loop's order."""
         target_id = self.store.get_contract(contract_id)["target_id"]
         self.store.create_final_answer(
-            target_id, contract_id, "c0ffee", human_gate="approved")
+            target_id, contract_id, f"git:{self._COMPLETE_SHA}",
+            human_gate="approved")
+        self.store.append_observation(contract_id, {
+            "kind": "gate_completion", "decision": "approved",
+            "merge_source": "fixture", "commit": self._COMPLETE_SHA,
+            "channel": "fixture"})
         self.store.set_contract_status(contract_id, "completed")
 
 

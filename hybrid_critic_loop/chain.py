@@ -1199,91 +1199,190 @@ _TERMINAL_COMPLETED_STATUSES = frozenset({"completed"})
 #: module, never the reverse.
 _ANSWER_PRODUCING_DECISIONS = frozenset({"approved", "waived"})
 
+#: Contract statuses in which the loop's gate is SETTLED (round-10
+#: fix spec N1): the loop's own terminal set (``loop.py``
+#: ``_GATE_TERMINAL_STATUSES``). The verdict leg below exists only
+#: for the crash window — a genuine answer over a contract whose
+#: gate never settled — so a settled status can never corroborate
+#: a row through it: a completed book carries the gate record
+#: (leg 1), and a rejected / escalated / refused book produced no
+#: answer at all. Defined here rather than imported from the
+#: loop: the loop imports this module, never the reverse.
+_GATE_SETTLED_STATUSES = frozenset(
+    {"completed", "rejected", "escalated", "refused"})
+
 
 def _contract_completed(store, contract_id) -> bool:
     """Whether the contract's run COMPLETED (round-5 fix spec H1;
-    round-5 gate-core F2; round-9 fix spec M3).
+    round-5 gate-core F2; round-9 fix spec M3; round-10 fix spec
+    N1).
 
-    Completed means the contract's status is a terminal completed
-    status, or a ``final_answers`` row exists AND the contract's
-    own gate record corroborates it. The verdict row alone is NOT
-    completion: under claim-first gating the verdict records the
-    decision before the merge and the final answer exist, so a
-    claimed-but-uncompleted gate used to mint a verifying
-    certificate for an answer that never landed.
+    Completed requires a ``final_answers`` row whose IDENTITY is
+    corroborated — never the contract status alone, and never a
+    decision string two records merely agree on. Round 9 (M3)
+    required the latest verdict's ``human_gate`` to equal the
+    row's recorded decision; round 10 (lanes 1+3) showed that is
+    still agreement, not identity: a verdict row and an answer row
+    planted in agreement — the verdict written through the store's
+    own ``create_verdict``, the answer carrying a fabricated
+    commit — minted a verifying certificate for a run that never
+    happened, and one bare ``set_contract_status(cid,
+    "completed")`` flip, with NO row at all, completed an awaiting
+    book through the status leg. So on the real Store (all
+    surfaces present) the rule is now:
 
-    The row alone is not completion either (round-9 fix spec M3;
-    round-9 gate-core P3): existence says nothing about what
-    produced the row, and a planted row on an escalated contract —
-    status "escalated", its verdict's gate never reached — read
-    completed here while the gate side refused the same book. So
-    on the real Store a row counts only when the gate state agrees
-    with it: the latest verdict's ``human_gate`` is one of the
-    answer-producing decisions (approved, waived) AND equals the
-    decision the row itself records — the same agreement the
-    loop's convergence validation demands of a row it trusts. That
-    leg keeps the crash window completed: a process that died
-    after writing a genuine answer but before the terminal status
-    leaves a decided verdict over a non-terminal contract, and the
-    gate machinery converges exactly that shape, so issuance reads
-    it completed. A row over an escalated, pending, failed or
-    rejected gate corroborates nothing and reads NOT completed.
+    * A row is REQUIRED — no row, not completed, whatever the
+      status says. The row read is deterministic: the LATEST row
+      by insertion governs (``ORDER BY rowid DESC LIMIT 1``);
+      with two rows planted, insertion order no longer decides
+      through an unordered read.
+    * The row counts when EITHER leg binds its identity:
+      - **Gate-record leg.** A ``gate_completion`` observation on
+        the contract — the gate's own durable merge record,
+        appended on both completion paths BEFORE the terminal
+        status write — whose ``decision`` equals the row's
+        recorded decision AND whose ``commit`` equals the row's
+        commit with the row's ``git:`` prefix stripped (the
+        observation stores the merged sha BARE; the row stores
+        ``git:<sha>``). Every genuine fresh or converged
+        completion carries one, so the terminal-status path is
+        subsumed: a bare status flip has no row and no record.
+      - **Verdict leg (the crash window).** The contract's status
+        is NOT one of the gate-settled statuses, no gate record
+        matches, and the latest verdict's ``human_gate`` is an
+        answer-producing decision equal to the row's decision,
+        the verdict's winner resolves to a candidate OF THIS
+        contract, and the row's commit is in ``git:`` form naming
+        a full-length sha that is not the winner candidate's own
+        recorded baseline — a genuine completion's row records
+        the post-merge head, which a ``--no-ff`` merge makes a
+        new commit, never the pre-merge baseline head a plant
+        reaches for (the repo's current HEAD) or a truncated
+        fabrication. This preserves the M3 crash window — a
+        process that died after writing a genuine answer but
+        before the gate record and the terminal status — while
+        binding the row to the verdict's actual winner and merge.
+
+    The residual, stated plainly: an actor with owner-class store
+    writes who forges the answer row AND the contract's
+    observation log consistently still passes the gate-record
+    leg — the same posture as the counted-row referential
+    exemption (round 3, disclosed) — and a winner-bound plant
+    carrying a fabricated full-length ``git:`` commit on an
+    unsettled book still passes the verdict leg, because the
+    chain has no repository to check the sha against (the gate's
+    own convergence validation, which does, refuses it). What
+    this fix removes is completion with no answer at all, and
+    completion by agreement between any two plantable rows.
 
     Surfaces, in order: the store's connection (the real Store has
     no final-answer getter, so the lookup is SQL), then
-    ``get_contract`` for the status, then ``latest_verdict`` for
-    the corroboration. A duck-typed store exposing NO completion
-    surface at all — no connection and no ``get_contract`` —
-    degrades to the pre-fix behavior (issuance proceeds): such
-    stores are test doubles whose verdict rows are their whole
-    world, and the completion question cannot even be expressed
-    there. The real Store exposes all three surfaces, so
-    production issuance is always gated.
+    ``get_contract`` for the status and the observation log, then
+    ``latest_verdict`` / ``get_candidate`` for the verdict leg.
+    Duck-typed degradation is preserved exactly: where the row
+    cannot be read at all (no connection surface), the pre-N1
+    fallbacks govern — the terminal status answers, and a store
+    exposing NO completion surface at all degrades to the pre-fix
+    behavior (issuance proceeds), because such stores are test
+    doubles whose verdict rows are their whole world. Where the
+    status surface exists but errors and no row was found, not
+    completed, as before. The real Store exposes every surface,
+    so production issuance is always gated by the rule above.
     """
     surface = False
+    row_readable = False
     row_found = False
+    row_commit = None
     row_decision = None
     conn = getattr(store, "_conn", None)
     if conn is not None:
         try:
             row = conn.execute(
-                "SELECT human_gate FROM final_answers"
-                " WHERE contract_id=? LIMIT 1",
+                "SELECT \"commit\", human_gate FROM final_answers"
+                " WHERE contract_id=? ORDER BY rowid DESC LIMIT 1",
                 (contract_id,)).fetchone()
             surface = True
+            row_readable = True
             if row is not None:
                 row_found = True
-                row_decision = row[0]
+                row_commit = row[0]
+                row_decision = row[1]
         except Exception:  # noqa: BLE001 - try the status surface
             pass
+    contract = None
     get_contract = getattr(store, "get_contract", None)
     if callable(get_contract):
         surface = True
         try:
             contract = get_contract(contract_id)
-        except Exception:  # noqa: BLE001 - the verdict leg may still answer
+        except Exception:  # noqa: BLE001 - the legs may still answer
             contract = None
             if not row_found:
                 # No row to corroborate and the status is
                 # unprovable: not completed (the pre-M3 answer).
                 return False
+    if not row_readable:
+        # The row cannot be read at all on this store: the pre-N1
+        # partial-surface fallbacks govern (see the docstring).
         if isinstance(contract, dict) and contract.get(
                 "status") in _TERMINAL_COMPLETED_STATUSES:
             return True
-    if row_found:
-        latest_verdict = getattr(store, "latest_verdict", None)
-        if callable(latest_verdict):
-            try:
-                verdict = latest_verdict(contract_id)
-            except Exception:  # noqa: BLE001 - unprovable is not completed
-                verdict = None
-            if isinstance(verdict, dict) \
-                    and verdict.get("human_gate") \
-                    in _ANSWER_PRODUCING_DECISIONS \
-                    and verdict.get("human_gate") == row_decision:
-                return True
+        return not surface
+    if not row_found:
+        # A row is required; the status alone completes nothing.
         return False
-    return not surface
+    bare_commit = None
+    if isinstance(row_commit, str) and row_commit.startswith("git:"):
+        bare_commit = row_commit[len("git:"):]
+    # Leg 1 — the gate's own durable merge record.
+    if bare_commit is not None and isinstance(contract, dict):
+        observations = contract.get("observations")
+        if isinstance(observations, list):
+            for obs in observations:
+                if isinstance(obs, dict) \
+                        and obs.get("kind") == "gate_completion" \
+                        and obs.get("decision") == row_decision \
+                        and obs.get("commit") == bare_commit:
+                    return True
+    # Leg 2 — the crash window: a decided verdict over a contract
+    # whose gate never settled, the row bound to its winner.
+    status = contract.get("status") if isinstance(contract, dict) \
+        else None
+    if status in _GATE_SETTLED_STATUSES:
+        return False
+    latest_verdict = getattr(store, "latest_verdict", None)
+    if not callable(latest_verdict):
+        return False
+    try:
+        verdict = latest_verdict(contract_id)
+    except Exception:  # noqa: BLE001 - unprovable is not completed
+        return False
+    if not isinstance(verdict, dict):
+        return False
+    decision = verdict.get("human_gate")
+    if decision not in _ANSWER_PRODUCING_DECISIONS \
+            or decision != row_decision:
+        return False
+    winner_id = verdict.get("winner")
+    if not winner_id:
+        return False
+    get_candidate = getattr(store, "get_candidate", None)
+    if not callable(get_candidate):
+        return False
+    try:
+        winner = get_candidate(winner_id)
+    except Exception:  # noqa: BLE001 - unprovable is not completed
+        return False
+    if not isinstance(winner, dict) \
+            or winner.get("contract_id") != contract_id:
+        return False
+    if bare_commit is None or len(bare_commit) != 40 \
+            or any(ch not in "0123456789abcdef" for ch in bare_commit):
+        return False
+    baseline = winner.get("baseline_hash")
+    if baseline and bare_commit == baseline:
+        return False
+    return True
 
 
 def issue_certificate(store, contract_id, _chain_verified=False):

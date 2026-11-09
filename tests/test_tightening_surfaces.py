@@ -274,6 +274,14 @@ class TestLegacyFormStoreSurvives(unittest.TestCase):
         hashes, built through the public API then re-hashed by hand."""
         db_path = Path(tmp) / "data.db"
         store = Store(db_path)
+        # Round-10 re-base (fix spec N1): the completion below
+        # appends the gate's gate_completion observation, which
+        # requires the contract row the real loop always has —
+        # create it (this fixture previously ran contract-less).
+        _tid = store.create_target("repo", "code")
+        store.create_contract(
+            _tid, stage="solve", task="fix the bug", domain="code",
+            tags=[], acceptance=[], contract_id="ctr_0001")
         # Counted-row rule v2 (round-4 fix spec, pinned interfaces):
         # a dispatch row counts only when its candidate exists with a
         # matching stored provenance — the real loop creates the
@@ -298,8 +306,19 @@ class TestLegacyFormStoreSurvives(unittest.TestCase):
         # completion corroboration reads the row against the
         # verdict's gate state, and a decision-less row agrees with
         # no decision.
+        # Round-10 re-base (fix spec N1): the completion is
+        # production-form — the row stores "git:<40-hex sha>" and
+        # the gate_completion observation (decision + BARE sha)
+        # is appended before the status flip, as loop.py writes
+        # them; chain._contract_completed binds the row's
+        # identity to that gate record.
         store.create_final_answer(
-            "repo", "ctr_0001", "deadbeef", human_gate="approved")
+            "repo", "ctr_0001", "git:0123456789abcdef0123456789abcdef01234567",
+            human_gate="approved")
+        store.append_observation("ctr_0001", {
+            "kind": "gate_completion", "decision": "approved",
+            "merge_source": "fixture", "commit": "0123456789abcdef0123456789abcdef01234567",
+            "channel": "fixture"})
         store.set_contract_status("ctr_0001", "completed")
         cert = chain.issue_certificate(store, "ctr_0001")
         self.assertIsNotNone(cert)
