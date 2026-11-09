@@ -398,6 +398,29 @@ def _row_variants(prev_hash, entry):
     return _chain.row_hash_variants(row)
 
 
+class FinalAnswerExistsError(Exception):
+    """A final answer already exists for the contract (round-7 fix
+    spec K3; round-7 gate-core F2, security F2).
+
+    Raised by :meth:`Store.create_final_answer` — the signal of its
+    atomic check-and-insert: the existence re-check and the INSERT
+    run under one write transaction, so a presenter that loses the
+    race gets this instead of writing a second final answer, and
+    converges on the winner's row (its id rides along as
+    :attr:`existing_id`). Deliberately NOT a ValueError subclass:
+    the duplicate is a race outcome to converge on, not a caller
+    bug to reject.
+    """
+
+    def __init__(self, contract_id, existing_id):
+        super().__init__(
+            f"contract {contract_id!r} already has a final answer"
+            f" (row {existing_id}); converge on it instead of"
+            " writing a second one")
+        self.contract_id = contract_id
+        self.existing_id = existing_id
+
+
 class Store:
     """SQLite-backed store for Hybrid Critic Loop state.
 
@@ -434,6 +457,14 @@ class Store:
             # cascade notice ("sealing N rows…") reports. Set by
             # _backfill_chain; 0 whenever the probe short-circuited.
             self.last_seal_count = 0
+            # Round-7 fix spec K7 (round-7 attack F4): True while a
+            # failed chain-cache clear is outstanding on THIS
+            # instance — chain.verify_chain_cached then distrusts
+            # the on-disk cache and falls back to the full walk
+            # until a successful clear or seed resets it. chain.py
+            # owns the flag's transitions; it is initialised here so
+            # the attribute always exists on a real Store.
+            self._chain_cache_untrusted = False
             self._backfill_chain()
         except sqlite3.OperationalError as exc:
             # Fix spec G2 (round-4 upgrade F1): a locked database at
@@ -572,6 +603,13 @@ class Store:
         - Pre-chain store (``user_version`` below
           ``_CHAIN_BACKFILL_VERSION``): every unsealed row is sealed in
           id order with ``sealed_via="backfill"`` and the flag is set.
+          Round-7 fix spec K4 (round-7 attack F2): the backfill route
+          additionally requires that NO row in the book already
+          carries a current-form seal — ``user_version`` alone is a
+          header field any raw writer can roll back, so a flagged
+          current book with its flag reset is treated as what it is
+          (a current book with an unsealed append) and its suffix
+          seals as "repair" instead.
         - Flagged store: an unsealed SUFFIX — rows after the last hashed
           row, the legacy-writer append case — is sealed with
           ``sealed_via="repair"``.
@@ -664,6 +702,12 @@ class Store:
         prev_new = _chain.GENESIS_HASH    # new-form chain value
         resealing = False
         changed = False
+        # Round-7 fix spec K4 (round-7 attack F2): whether any row
+        # already carries a CURRENT-form seal. Tracked across the
+        # prefix validation because it decides the suffix's seal
+        # route below: a book with a current-form seal in it is not
+        # pre-chain, whatever PRAGMA user_version claims.
+        has_current_seal = False
         for row in prefix:
             entry = self._ledger_dict(row)
             stored_prev = _col(row, "prev_hash")
@@ -674,6 +718,7 @@ class Store:
             variants = _row_variants(stored_prev, entry)
             form_converted = False
             if variants["current"] == stored:
+                has_current_seal = True
                 if not resealing:
                     prev = stored
                     prev_new = stored
@@ -732,7 +777,22 @@ class Store:
             # corruption. Leave the book exactly as found.
             self._conn.rollback()
             return
-        sealed_via = "backfill" if pre_chain else "repair"
+        # Round-7 fix spec K4 (round-7 attack F2): the "backfill"
+        # route — whose seal exempts a legacy-import row from the
+        # totals' referential leg (round-6 J4) — is granted only to
+        # a book no current-form seal contradicts. user_version is
+        # a database-header field any raw writer can roll back to 0,
+        # and round 6's route decision rested on that flag alone: a
+        # healthy current book, flag reset, one raw NULL-provenance
+        # append, reopen — the append sealed as "backfill" and
+        # counted $2M unbacked. A genuine pre-chain book has NO
+        # current-form seals (pre-chain code sealed nothing), so a
+        # sealed prefix behind the append proves the era claim
+        # false: the suffix is a post-hoc append and seals as
+        # "repair", exactly as on a flagged store. The version flag
+        # itself still advances whenever it was behind, as before.
+        backfill_route = pre_chain and not has_current_seal
+        sealed_via = "backfill" if backfill_route else "repair"
         for row in suffix:
             entry = self._ledger_dict(row)
             entry["sealed_via"] = sealed_via
@@ -744,12 +804,13 @@ class Store:
             )
             n_sealed += 1
             prev = digest
-        if pre_chain:
+        if backfill_route:
             self.chain_backfilled = len(suffix)
-            self._conn.execute(
-                f"PRAGMA user_version = {_CHAIN_BACKFILL_VERSION}")
         else:
             n_repairs += len(suffix)
+        if pre_chain:
+            self._conn.execute(
+                f"PRAGMA user_version = {_CHAIN_BACKFILL_VERSION}")
         self.chain_repairs = n_repairs
         self.chain_upgrades = n_upgrades
         self.last_seal_count = n_sealed
@@ -1192,6 +1253,35 @@ class Store:
         )
         self._conn.commit()
 
+    def set_human_gate_if(self, verdict_id, expected, value):
+        """Conditionally set a verdict's ``human_gate`` (round-7 fix
+        spec K3; round-7 gate-core F2, security F2).
+
+        One conditional UPDATE that lands only while the gate still
+        reads exactly ``expected`` — the compare-and-swap the
+        interrupted-completion detector's decided→failed flip needs:
+        round 6's detector OBSERVED a decided verdict with no final
+        answer and then flipped it with the unconditional setter, so
+        a second presenter could fabricate a gate_failure over a
+        LIVE completion and re-claim a gate another process was
+        mid-completion on. With the conditional flip, the detector
+        acts only on the state it actually saw; when the flip loses
+        (rowcount 0), the state moved under it and the caller
+        re-reads and answers per the fresh state.
+
+        Committed before returning, like every store write. True iff
+        THIS caller landed the flip. No value validation — like
+        :meth:`set_verdict_human_gate`, this is the low-level write
+        primitive; callers own the values (the claim path validates
+        its decisions in :meth:`claim_human_gate`).
+        """
+        cur = self._conn.execute(
+            "UPDATE verdicts SET human_gate=? WHERE id=?"
+            " AND human_gate=?",
+            (value, verdict_id, expected))
+        self._conn.commit()
+        return cur.rowcount == 1
+
     #: The decisions a human gate can be claimed with (round-5 fix
     #: spec, pinned interfaces). Anything else is a caller bug, not a
     #: decision: the round-5 attack (F5) claimed with "pending" (True
@@ -1286,15 +1376,78 @@ class Store:
 
     def create_final_answer(self, target_id, contract_id, commit,
                             intent_check=None, human_gate=None):
-        cur = self._conn.execute(
-            'INSERT INTO final_answers (target_id, contract_id, "commit",'
-            " intent_check_json, human_gate, created_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (target_id, contract_id, commit, _dumps(intent_check),
-             human_gate, _now()),
-        )
-        self._conn.commit()
-        return cur.lastrowid
+        """Write the contract's final answer — atomically, at most
+        one per contract (round-7 fix spec K3; round-7 gate-core F2,
+        security F2).
+
+        The duplicate signal is :class:`FinalAnswerExistsError`:
+        the existence re-check for the contract and the INSERT run
+        under one ``BEGIN IMMEDIATE`` write transaction (the store's
+        :meth:`_begin_write` discipline), so two presenters — the
+        plugin's gate tool beside the CLI, each with its own Store —
+        cannot both pass the check the way round 6's recovery race
+        did (the loop's existence check and this insert were separate
+        reads/writes, and the loser of the race wrote a SECOND final
+        answer). When a row already exists, nothing is inserted and
+        the exception carries the existing row's id as
+        ``existing_id``; the caller converges on that row (the loop's
+        completion validates it per round-7 spec K1) instead of
+        duplicating it. Callers that trip the signal mid-completion
+        land in record_human_gate's failure wrap, which converges on
+        the existing answer — the signal never surfaces as a crash
+        from a gate presentation.
+
+        Returns the new row's id on success. A transaction this call
+        opened is rolled back on any failure; an ambient caller
+        transaction is left exactly as found.
+        """
+        began = not self._conn.in_transaction
+        self._begin_write()
+        try:
+            existing = self._one(
+                "SELECT id FROM final_answers WHERE contract_id=?"
+                " ORDER BY id ASC LIMIT 1", (contract_id,))
+            if existing is not None:
+                raise FinalAnswerExistsError(
+                    contract_id, existing["id"])
+            cur = self._conn.execute(
+                'INSERT INTO final_answers (target_id, contract_id,'
+                ' "commit", intent_check_json, human_gate, created_at)'
+                " VALUES (?,?,?,?,?,?)",
+                (target_id, contract_id, commit, _dumps(intent_check),
+                 human_gate, _now()),
+            )
+            row_id = cur.lastrowid
+            self._conn.commit()
+            return row_id
+        except Exception:
+            if began:
+                # Tightening spec T7 discipline: a failed write never
+                # leaks the transaction this call opened.
+                self._conn.rollback()
+            raise
+
+    def final_answers_for(self, contract_id):
+        """Every final_answers row for a contract, as dicts, in id
+        order. Normally zero or one row — :meth:`create_final_answer`
+        refuses a second (round-7 fix spec K3); a list is returned so
+        a book that somehow carries more (written before the atomic
+        insert, or by a raw writer) can be inspected as found."""
+        rows = self._all(
+            "SELECT * FROM final_answers WHERE contract_id=?"
+            " ORDER BY id ASC", (contract_id,))
+        return [
+            {
+                "id": row["id"],
+                "target_id": row["target_id"],
+                "contract_id": row["contract_id"],
+                "commit": row["commit"],
+                "intent_check": _loads(row["intent_check_json"], None),
+                "human_gate": row["human_gate"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
     # -- experts ---------------------------------------------------------------
 
@@ -1717,11 +1870,17 @@ class Store:
     def set_chain_verified_head(self, max_id, head_hash, row_count):
         """Record the chain-verified head cache (see
         :meth:`get_chain_verified_head`). Committed before
-        returning, like every store write."""
+        returning, like every store write.
+
+        A successful seed also clears this instance's cache-distrust
+        flag (round-7 fix spec K7): the cache now holds a head a
+        full verification just produced, so chain.verify_chain_cached
+        may trust it again."""
         self._meta_set("chain_verified_max_id", str(int(max_id)))
         self._meta_set("chain_verified_head_hash", str(head_hash))
         self._meta_set("chain_verified_row_count", str(int(row_count)))
         self._conn.commit()
+        self._chain_cache_untrusted = False
 
     def clear_chain_verified_head(self):
         """Drop the chain-verified head cache entirely (round-6 fix
@@ -1734,12 +1893,19 @@ class Store:
         With the cache gone, cached-check surfaces fall back to the
         full walk until a successful walk re-seeds it. Committed
         before returning, like every store write.
+
+        A successful clear also resets this instance's
+        cache-distrust flag (round-7 fix spec K7) — the flag exists
+        for the case where THIS method is the thing that fails: if
+        the DELETE raises, the flag stays set (chain.py sets it on
+        the failure path) and the cached check keeps full-walking.
         """
         self._conn.execute(
             "DELETE FROM store_meta WHERE key IN"
             " ('chain_verified_max_id', 'chain_verified_head_hash',"
             " 'chain_verified_row_count')")
         self._conn.commit()
+        self._chain_cache_untrusted = False
 
     @staticmethod
     def _ledger_dict(row):

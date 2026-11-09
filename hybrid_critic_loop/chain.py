@@ -418,6 +418,34 @@ def _walk_records(records, upto_id=None):
     return True, None, (max_id, prev, count)
 
 
+def _mark_cache_untrusted(store):
+    """Record a failed cache clear on the store instance (round-7
+    fix spec K7; round-7 attack F4).
+
+    ``store._chain_cache_untrusted`` is the marker
+    :func:`verify_chain_cached` reads: while it stands, the cached
+    check distrusts the on-disk cache — which a proven break may
+    have left behind, because the delete that was supposed to drop
+    it just failed — and falls back to the full walk. Best-effort,
+    like every cache interaction: a store that refuses attributes
+    simply keeps the pre-K7 behavior.
+    """
+    try:
+        store._chain_cache_untrusted = True
+    except Exception:  # noqa: BLE001 - the cache must never break a walk
+        pass
+
+
+def _mark_cache_trusted(store):
+    """Clear the cache-distrust marker (round-7 fix spec K7): a
+    clear or a seed just succeeded, so the cache's state is known
+    again and the cached check may trust it."""
+    try:
+        store._chain_cache_untrusted = False
+    except Exception:  # noqa: BLE001 - the cache must never break a walk
+        pass
+
+
 def _refresh_verified_head(store, head):
     """Record a successful walk in the chain-verified head cache.
 
@@ -425,6 +453,11 @@ def _refresh_verified_head(store, head):
     that produced the head: the cache is an optimization for the
     hook-path gate check, so bookkeeping errors are swallowed
     (round-5 fix spec, pinned interfaces).
+
+    A seed that lands — or a cache already holding exactly this
+    verified head — also clears the instance's cache-distrust
+    marker (round-7 fix spec K7): the cache now provably holds a
+    head a full verification produced.
     """
     get = getattr(store, "get_chain_verified_head", None)
     set_head = getattr(store, "set_chain_verified_head", None)
@@ -437,8 +470,10 @@ def _refresh_verified_head(store, head):
             if cached[0] > max_id:
                 return
             if tuple(cached) == (max_id, head_hash, row_count):
+                _mark_cache_trusted(store)
                 return
         set_head(max_id, head_hash, row_count)
+        _mark_cache_trusted(store)
     except Exception:  # noqa: BLE001 - the cache must never break a walk
         pass
 
@@ -457,6 +492,18 @@ def _clear_verified_head(store):
     :func:`_refresh_verified_head`: a store without the accessor
     keeps working, and a deletion error never masks the walk's
     verdict.
+
+    Round-7 fix spec K7 (round-7 attack F4): best-effort was also
+    SILENT — when the delete itself failed (the reviewer's stand-in
+    was WAL lock contention on the meta rows at exactly the failure
+    moment), the stale cache survived byte-identical and the hook
+    went on certifying the doctored book, with no trace anywhere
+    that the clear had failed. A failed clear now records itself on
+    the store instance (:func:`_mark_cache_untrusted`), and
+    :func:`verify_chain_cached` distrusts the cache on that
+    instance until a successful clear or seed. The verdict is still
+    never masked; what changed is that the failure is no longer
+    invisible to the one instance that knows about it.
     """
     clear = getattr(store, "clear_chain_verified_head", None)
     if not callable(clear):
@@ -464,7 +511,9 @@ def _clear_verified_head(store):
     try:
         clear()
     except Exception:  # noqa: BLE001 - the cache must never break a walk
-        pass
+        _mark_cache_untrusted(store)
+        return
+    _mark_cache_trusted(store)
 
 
 def verify_chain(store, upto_id=None):
@@ -485,7 +534,10 @@ def verify_chain(store, upto_id=None):
     chain-verified head cache — the cache the hook-path
     :func:`verify_chain_cached` trusts — and a FAILED walk deletes
     that cache (round-6 fix spec J3), so a proven break is never
-    followed by a cached pass. Operator surfaces use this walk,
+    followed by a cached pass. If the delete itself fails, the
+    failure is recorded on the store instance and the cached check
+    distrusts the cache until a successful clear or seed
+    (round-7 fix spec K7). Operator surfaces use this walk,
     never the cached check.
     """
     ok, bad, head = _walk_records(_chain_records(store, upto_id), upto_id)
@@ -581,7 +633,16 @@ def _verify_chain_cached_detail(store):
     verdict rests on the cache (the trusted head at ``head_id``
     spot-checked, the suffix verified), ``mode == "full"`` when the
     full walk produced the verdict (``head_id`` is None then).
+
+    Round-7 fix spec K7 (round-7 attack F4): while the store
+    instance carries the cache-distrust marker — a failed walk's
+    attempt to delete the cache itself failed, so the on-disk
+    cache may be the stale head a proven break left behind — the
+    cache is not consulted at all: the full walk answers, until a
+    successful clear or seed clears the marker.
     """
+    if getattr(store, "_chain_cache_untrusted", False):
+        return _full_walk_outcome(store)
     get = getattr(store, "get_chain_verified_head", None)
     cache = None
     if callable(get):
@@ -670,7 +731,11 @@ def verify_chain_cached(store):
     check did not perform). A failed full walk anywhere in this
     check deletes the cache (see :func:`verify_chain`), and nothing
     here resurrects a cache a failed walk cleared: with no cache,
-    this check IS the full walk.
+    this check IS the full walk. And when the delete itself failed,
+    the instance's cache-distrust marker (round-7 fix spec K7)
+    makes this check the full walk too — a cache a proven break
+    may have left behind is not trusted on the say-so of a delete
+    that never landed.
     """
     ok, bad, mode, head_id = _verify_chain_cached_detail(store)
     try:

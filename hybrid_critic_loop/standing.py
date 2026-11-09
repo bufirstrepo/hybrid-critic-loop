@@ -148,6 +148,19 @@ _CHAIN_UNAVAILABLE = (
     "ledger chain broken at row {row}"
 )
 
+#: The unavailable line's older-form variant (round-7 fix spec K9;
+#: round-7 upgrade-walk F1): the first bad row's stored hash DOES
+#: recompute — under a historical canonical form. That book is not
+#: corrupt; it is sealed under an older form the open-time probe
+#: did not see (its spot checks cover the head and tail rows, so a
+#: historical row at an interior position strands un-upgraded and
+#: was reported as "broken"). The line names the state the row is
+#: actually in, distinct from a row matching no recognised form.
+_CHAIN_OLDER_FORM = (
+    "Millionaire Matrix standing unavailable — "
+    "ledger sealed under an older form at row {row}"
+)
+
 #: The ledger-derived fields of a per-expert row — the figures the
 #: unified totals own (round-4 fix spec G8, contest F8). Everything
 #: else on an expert row (wins, losses, validity, calibration) is the
@@ -853,8 +866,72 @@ def _chain_check(store, cached=False):
     return ("ok", None) if ok else ("broken", bad)
 
 
-def _unavailable_line(bad):
-    """The unavailable line for a broken chain (bad row id or None)."""
+def _ledger_row_by_id(store, row_id):
+    """One ledger row as a dict, or None — SQL through the store's
+    connection when it exposes one, else the rows walk (the same
+    source discipline as chain.py's head snapshot)."""
+    conn = getattr(store, "_conn", None)
+    if conn is not None:
+        try:
+            raw = conn.execute(
+                "SELECT * FROM ledger WHERE id=?", (row_id,)).fetchone()
+            if raw is None:
+                return None
+            return {key: raw[key] for key in raw.keys()}
+        except Exception:  # noqa: BLE001 - fall back to the rows walk
+            pass
+    try:
+        for row in _ledger_rows(store):
+            if isinstance(row, dict) and row.get("id") == row_id:
+                return row
+    except Exception:  # noqa: BLE001 - no source at all
+        pass
+    return None
+
+
+def _bad_row_older_form(store, bad):
+    """True when the walk's first bad row is sealed under a
+    HISTORICAL canonical form (round-7 fix spec K9): its stored
+    ``row_hash`` recomputes under a recognised historical variant
+    (``pre_sealed_via`` or ``legacy`` — :func:`chain.row_hash_variants`)
+    but NOT under the current form. A row whose stored hash matches
+    the current form recomputes fine and failed the walk on its
+    link, and a row matching no variant is tampered or unsealed —
+    both are genuinely "broken", never "older form". Any failure to
+    determine the form answers False: wording must never break the
+    line it decorates."""
+    if bad is None or store is None:
+        return False
+    row = _ledger_row_by_id(store, bad)
+    if not isinstance(row, dict):
+        return False
+    stored = row.get("row_hash")
+    if not stored:
+        return False
+    try:
+        from . import chain as _chain
+
+        variants = _chain.row_hash_variants(row)
+    except Exception:  # noqa: BLE001 - undeterminable is "broken"
+        return False
+    if stored == variants.get("current"):
+        return False
+    return stored in (
+        variants.get("pre_sealed_via"), variants.get("legacy"))
+
+
+def _unavailable_line(bad, store=None):
+    """The unavailable line for a broken chain (bad row id or None).
+
+    With the store in hand, a first bad row sealed under a
+    historical canonical form renders the older-form line instead
+    (round-7 fix spec K9; round-7 upgrade-walk F1) — the state is
+    named, not misdiagnosed as corruption. Callers without a store
+    (reports.py's imports of this helper) keep the plain broken
+    wording exactly as before.
+    """
+    if _bad_row_older_form(store, bad):
+        return _CHAIN_OLDER_FORM.format(row=bad)
     return _CHAIN_UNAVAILABLE.format(row=bad if bad is not None else "—")
 
 
@@ -875,7 +952,7 @@ def chain_unavailable_line(store):
     F2): full walk, exactly like the standing surfaces.
     """
     status, bad = _chain_check(store)
-    return _unavailable_line(bad) if status == "broken" else None
+    return _unavailable_line(bad, store) if status == "broken" else None
 
 
 def format_standing_line(standing) -> str:
@@ -958,7 +1035,7 @@ def standing_line(store, cached=False):
     """
     status, bad = _chain_check(store, cached=cached)
     if status == "broken":
-        return _unavailable_line(bad)
+        return _unavailable_line(bad, store)
     return format_standing_line(_headline_standing(store))
 
 
@@ -1028,7 +1105,7 @@ def standing_report(store) -> str:
     if status == "broken":
         # Chain-gated (round-4 fix spec G8): no tier, no totals, no
         # expert figures from a book whose rows do not verify.
-        lines.append(_unavailable_line(bad))
+        lines.append(_unavailable_line(bad, store))
         return "\n".join(lines)
     standing = compute_standing(store)
     lines.append(format_standing_line(standing))
