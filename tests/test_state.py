@@ -20,6 +20,9 @@ EXPECTED_TABLES = {
     "ledger",
     "lessons",
     "events",
+    # Round-5 fix spec: store_meta holds the chain-verified head
+    # cache (the spec-pinned meta accessors' table).
+    "store_meta",
 }
 
 
@@ -58,7 +61,7 @@ class StoreTestCase(unittest.TestCase):
 
 
 class TestSchema(StoreTestCase):
-    def test_exactly_twelve_tables(self):
+    def test_exactly_thirteen_tables(self):
         conn = sqlite3.connect(str(self.db_path))
         try:
             rows = conn.execute(
@@ -67,7 +70,7 @@ class TestSchema(StoreTestCase):
         finally:
             conn.close()
         self.assertEqual({r[0] for r in rows}, EXPECTED_TABLES)
-        self.assertEqual(len(rows), 12)
+        self.assertEqual(len(rows), 13)
 
     def test_wal_mode(self):
         conn = sqlite3.connect(str(self.db_path))

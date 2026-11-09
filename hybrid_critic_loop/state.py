@@ -1,8 +1,10 @@
 """SQLite state store for the Hybrid Critic Loop plugin.
 
-Stdlib ``sqlite3`` only, WAL mode. Exactly 12 tables mirroring the
-spec objects: targets, contracts, candidates, measurements, scores,
-verdicts, final_answers, experts, routes, ledger, lessons, events.
+Stdlib ``sqlite3`` only, WAL mode. Twelve tables mirroring the
+spec objects — targets, contracts, candidates, measurements, scores,
+verdicts, final_answers, experts, routes, ledger, lessons, events —
+plus store_meta, the key/value table for facts about the book itself
+(round-5 fix spec: the chain-verified head cache).
 
 JSON-shaped columns are stored as TEXT and returned parsed.
 Timestamps are UTC ISO strings.
@@ -218,6 +220,16 @@ CREATE INDEX IF NOT EXISTS idx_ledger_expert_id
     ON ledger (expert_id);
 CREATE INDEX IF NOT EXISTS idx_verdicts_contract_id
     ON verdicts (contract_id);
+-- Store meta (round-5 fix spec, pinned interfaces): key/value rows
+-- for facts about the book itself. First tenant: the chain-verified
+-- head cache (chain.verify_chain records the head it last verified
+-- in full, so chain.verify_chain_cached can check only what came
+-- after it). Created here — fresh and pre-existing databases alike
+-- gain it through the same executescript on open, like the indexes.
+CREATE TABLE IF NOT EXISTS store_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 # Columns added after v1. Existing databases created with the old
@@ -417,6 +429,11 @@ class Store:
             self.chain_backfilled = 0
             self.chain_repairs = 0
             self.chain_upgrades = 0
+            # Round-5 fix spec H3: rows the open-time pass (re)sealed
+            # this open, all routes together — the one number the
+            # cascade notice ("sealing N rows…") reports. Set by
+            # _backfill_chain; 0 whenever the probe short-circuited.
+            self.last_seal_count = 0
             self._backfill_chain()
         except sqlite3.OperationalError as exc:
             # Fix spec G2 (round-4 upgrade F1): a locked database at
@@ -457,7 +474,9 @@ class Store:
         # existed carry no attribution; label them "legacy-import"
         # (counted by the totals, but never mistaken for rows a writer
         # attributed at insert time). Idempotent: after the first open
-        # no row has NULL provenance.
+        # no row has NULL provenance. This UPDATE is the label's ONLY
+        # legitimate writer (round-5 fix spec H2): the public
+        # add_ledger rejects "legacy-import" outright.
         ledger_cols = {
             row[1]
             for row in self._conn.execute(
@@ -481,15 +500,25 @@ class Store:
         """Cheap open-time probe (fix spec G3; round-4 performance P1).
 
         True when the sealing pass has nothing to do: no ledger row is
-        missing hashes, and the tail row's stored hash recomputes
-        under the CURRENT canonical form and links to its
-        predecessor's stored hash. A healthy current-form store thus
-        skips the full recompute walk on open (the old pass rehashed
-        every row on every open — ~27 µs/row, seconds at book scale).
-        A book failing the probe — unsealed rows, a historical-form
-        tail, a broken link — takes the full pass below, and
-        ``chain.verify_chain`` keeps the full walk for callers that
-        want every row checked.
+        missing hashes, the tail row's stored hash recomputes under
+        the CURRENT canonical form and links to its predecessor's
+        stored hash, AND the book's HEAD is current too — the first
+        row recomputes under the current form against genesis and
+        the second row links to it. A healthy current-form store
+        thus skips the full recompute walk on open (the old pass
+        rehashed every row on every open — ~27 µs/row, seconds at
+        book scale). A book failing the probe — unsealed rows, a
+        historical-form tail OR head, a broken link — takes the
+        full pass below, and ``chain.verify_chain`` keeps the full
+        walk for callers that want every row checked.
+
+        The head check is round-5 fix spec H6 (round-5 attack F3):
+        the tail-only probe stranded mixed-form books (legacy
+        prefix, current tail) forever — the pass never ran, the
+        prefix never upgraded, and verify_chain called the intact
+        legacy seal "broken at row 1". A historical HEAD with a
+        current tail is exactly that book's shape, so the head is
+        probed with the same two indexed reads as the tail.
         """
         unsealed = self._one(
             "SELECT 1 AS x FROM ledger"
@@ -510,7 +539,27 @@ class Store:
             expected_prev = _col(tail[1], "row_hash")
         else:
             expected_prev = _chain.GENESIS_HASH
-        return _col(last, "prev_hash") == expected_prev
+        if _col(last, "prev_hash") != expected_prev:
+            return False
+        # Head completeness (H6): the first row must recomputes
+        # under the current form against genesis, and row 2 must
+        # link to row 1's stored hash. A one-row book's head IS its
+        # tail, already checked above.
+        head = self._all(
+            "SELECT * FROM ledger ORDER BY id ASC LIMIT 2")
+        if len(head) > 1 or head[0]["id"] != last["id"]:
+            first = head[0]
+            first_entry = self._ledger_dict(first)
+            first_variants = _row_variants(
+                _col(first, "prev_hash"), first_entry)
+            if first_variants["current"] != _col(first, "row_hash"):
+                return False
+            if _col(first, "prev_hash") != _chain.GENESIS_HASH:
+                return False
+            if len(head) > 1:
+                if _col(head[1], "prev_hash") != _col(first, "row_hash"):
+                    return False
+        return True
 
     def _backfill_chain(self):
         """Seal unsealed ledger rows on open (tightening spec T3;
@@ -544,7 +593,10 @@ class Store:
           Re-sealing changes that row's hash, so the re-seal cascades
           over every later sealed row (each still validated against
           its stored link first); a store sealed under an older form
-          thus survives the upgrade with its chain intact.
+          thus survives the upgrade with its chain intact. A
+          current-form row caught in the cascade is rehashed for its
+          link only and KEEPS its existing ``sealed_via`` (round-5
+          fix spec H6, round-5 attack F8: marker preservation).
 
         Fix spec G2 (round-3 F1, round-4 upgrade F1/F2): the pass
         COMMITS before every non-abort return whenever it changed
@@ -563,6 +615,7 @@ class Store:
         self.chain_backfilled = 0
         self.chain_repairs = 0
         self.chain_upgrades = 0
+        self.last_seal_count = 0
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         pre_chain = version < _CHAIN_BACKFILL_VERSION
         if self._chain_intact_probe():
@@ -596,6 +649,7 @@ class Store:
         # a tampered row aborts the whole pass.
         n_repairs = 0
         n_upgrades = 0
+        n_sealed = 0
         prefix = rows if first_unsealed is None else rows[:first_unsealed]
         prev = _chain.GENESIS_HASH        # stored link expected next
         prev_new = _chain.GENESIS_HASH    # new-form chain value
@@ -609,6 +663,7 @@ class Store:
                 self._conn.rollback()
                 return
             variants = _row_variants(stored_prev, entry)
+            form_converted = False
             if variants["current"] == stored:
                 if not resealing:
                     prev = stored
@@ -619,18 +674,31 @@ class Store:
             elif (variants["pre_sealed_via"] == stored
                     or variants["legacy"] == stored):
                 resealing = True
+                form_converted = True
             else:
                 self._conn.rollback()
                 return
+            # Round-5 fix spec H6 (round-5 attack F8): marker
+            # preservation. A FORM-CONVERTED row (its own seal was a
+            # historical form) is marked "upgrade". A current-form
+            # row caught in the cascade is only being rehashed
+            # because its LINK changed — its own seal already speaks
+            # the current form, sealed_via included — so it KEEPS
+            # its existing marker: a genuine "repair" row downstream
+            # of a historical row no longer loses its route to the
+            # cascade's mark.
             new_entry = dict(entry)
-            new_entry["sealed_via"] = "upgrade"
+            if form_converted:
+                new_entry["sealed_via"] = "upgrade"
+            marker = new_entry["sealed_via"]
             digest = _row_variants(prev_new, new_entry)["current"]
             self._conn.execute(
                 "UPDATE ledger SET prev_hash=?, row_hash=?,"
                 " sealed_via=? WHERE id=?",
-                (prev_new, digest, "upgrade", row["id"]),
+                (prev_new, digest, marker, row["id"]),
             )
             n_upgrades += 1
+            n_sealed += 1
             changed = True
             prev = stored
             prev_new = digest
@@ -641,6 +709,7 @@ class Store:
                     f"PRAGMA user_version = {_CHAIN_BACKFILL_VERSION}")
                 changed = True
             self.chain_upgrades = n_upgrades
+            self.last_seal_count = n_sealed
             if changed:
                 # G2: the cascade's UPDATEs commit HERE, on the open
                 # that performed them — not whenever some later write
@@ -663,6 +732,7 @@ class Store:
                 " WHERE id=?",
                 (prev, digest, sealed_via, row["id"]),
             )
+            n_sealed += 1
             prev = digest
         if pre_chain:
             self.chain_backfilled = len(suffix)
@@ -672,6 +742,7 @@ class Store:
             n_repairs += len(suffix)
         self.chain_repairs = n_repairs
         self.chain_upgrades = n_upgrades
+        self.last_seal_count = n_sealed
         self._conn.commit()
 
     # -- internal helpers -------------------------------------------------
@@ -874,6 +945,25 @@ class Store:
                 f"unsupported candidate fields: {sorted(unknown)}")
         if not fields:
             return
+        if "provenance" in fields:
+            # Round-5 fix spec H2 (round-5 attack F4): candidate
+            # provenance is WRITE-ONCE once the candidate has ledger
+            # rows. The counted rule's referential leg trusts this
+            # stored value; while it stayed rewritable, one call
+            # could retroactively back previously-excluded rows or
+            # un-back counted history (killing issued certificates
+            # while the chain still verified), because the candidate
+            # table is not chain-sealed. Before the first dispatch
+            # lands, nothing trusts the value yet and it may still
+            # be corrected.
+            backed = self._one(
+                "SELECT 1 AS x FROM ledger WHERE candidate_id=?"
+                " LIMIT 1", (candidate_id,))
+            if backed is not None:
+                raise ValueError(
+                    f"candidate {candidate_id!r} already has ledger"
+                    " rows: its provenance is write-once and cannot"
+                    " be changed")
         sets = []
         params = []
         for key, value in fields.items():
@@ -1070,30 +1160,62 @@ class Store:
 
     def set_verdict_human_gate(self, verdict_id, decision):
         """Record the human's decision on the verdict row (fix pass Wave 2.6,
-        review H5): after this the gate is no longer pending."""
+        review H5): after this the gate is no longer pending. Also the
+        write path for the round-5 H1 failure state: the loop records
+        ``decision="failed"`` here when a claimed gate's completion
+        fails, and ``latest_verdict`` / ``verdict_for`` return that
+        value plainly like any other."""
         self._conn.execute(
             "UPDATE verdicts SET human_gate=? WHERE id=?", (decision, verdict_id),
         )
         self._conn.commit()
 
-    def claim_human_gate(self, verdict_id, decision):
-        """Atomically claim a verdict's pending human gate (fix spec
-        G1; round-4 security F4, contest-core F2).
+    #: The decisions a human gate can be claimed with (round-5 fix
+    #: spec, pinned interfaces). Anything else is a caller bug, not a
+    #: decision: the round-5 attack (F5) claimed with "pending" (True
+    #: returned, nothing recorded, gate claimable again) and with a
+    #: nonsense value (gate consumed by garbage no surface can act
+    #: on). "failed" is deliberately NOT claimable — it is the
+    #: recorded post-claim failure state (H1), reachable only as a
+    #: claim SOURCE with retry=True, never as a decision.
+    _GATE_DECISIONS = ("approved", "rejected", "waived")
+
+    def claim_human_gate(self, verdict_id, decision, retry=False):
+        """Atomically claim a verdict's human gate (fix spec G1;
+        round-4 security F4, contest-core F2; round-5 fix spec H1).
 
         One conditional UPDATE that fires only while the gate still
-        reads ``"pending"``, committed before returning. True iff
+        reads ``"pending"`` — or, with ``retry=True``, also from
+        ``"failed"`` (the recorded post-claim failure state: a fresh
+        decision presented after a failed completion re-claims the
+        gate and re-attempts) — committed before returning. True iff
         THIS caller recorded the decision — a concurrent or replayed
-        caller gets False and must not merge. The claim IS the record:
-        it replaces the old check-then-act sequence whose decision
-        write landed after the merge and was swallowed on failure, so
-        two processes could both complete one gate (two final
-        answers) and a crash could leave a merged winner whose gate
-        still read pending.
+        caller gets False and must not merge. The claim IS the
+        record: it replaces the old check-then-act sequence whose
+        decision write landed after the merge and was swallowed on
+        failure, so two processes could both complete one gate (two
+        final answers) and a crash could leave a merged winner whose
+        gate still read pending.
+
+        ``decision`` is validated against :data:`_GATE_DECISIONS`
+        and anything else raises ValueError (round-5 attack F5: the
+        primitive previously validated nothing, so "pending" and
+        nonsense values consumed or no-op'd the gate).
         """
-        cur = self._conn.execute(
-            "UPDATE verdicts SET human_gate=? WHERE id=?"
-            " AND human_gate='pending'",
-            (decision, verdict_id))
+        if decision not in self._GATE_DECISIONS:
+            raise ValueError(
+                f"invalid human-gate decision {decision!r}: must be"
+                f" one of {sorted(self._GATE_DECISIONS)}")
+        if retry:
+            cur = self._conn.execute(
+                "UPDATE verdicts SET human_gate=? WHERE id=?"
+                " AND human_gate IN ('pending', 'failed')",
+                (decision, verdict_id))
+        else:
+            cur = self._conn.execute(
+                "UPDATE verdicts SET human_gate=? WHERE id=?"
+                " AND human_gate='pending'",
+                (decision, verdict_id))
         self._conn.commit()
         return cur.rowcount == 1
 
@@ -1418,6 +1540,22 @@ class Store:
         cost_usd = _validate_cost_usd(cost_usd)
         if provenance is None:
             provenance = "unattributed"
+        elif provenance == "legacy-import":
+            # Round-5 fix spec H2 (round-5 attack F1): the label is
+            # RESERVED for rows the migration itself marked. Round
+            # 4's counted rule exempted "legacy-import" rows from
+            # its referential leg unconditionally, and any writer
+            # could mint counted money by simply using the label —
+            # the round-3 mint with a new magic string. The only
+            # legitimate writer is _migrate's backfill UPDATE (rows
+            # that predate the provenance column), which never comes
+            # through this public method. A raw-SQL writer remains
+            # owner-class: provenance sits inside the canonical form,
+            # so relabelling a sealed row breaks its chain seal.
+            raise ValueError(
+                "provenance 'legacy-import' is reserved for rows the"
+                " migration marked; it cannot be written through"
+                " add_ledger")
         # Hash chain (standing spec, Unit B): the new row seals the
         # previous row's hash. The id is assigned here, inside the write
         # transaction and the store lock, because the id is one of the
@@ -1486,6 +1624,72 @@ class Store:
                 "SELECT * FROM ledger WHERE expert_id=? ORDER BY id ASC",
                 (expert_id,))
         return [self._ledger_dict(r) for r in rows]
+
+    #: Column order of :meth:`ledger_rows_raw` tuples: the chain's
+    #: LEDGER_FIELDS in order, then the two hash columns. (sealed_via
+    #: is LEDGER_FIELDS' last field, so the hashes are the only
+    #: appendage.)
+    LEDGER_RAW_COLUMNS = tuple(_chain.LEDGER_FIELDS) + (
+        "prev_hash", "row_hash")
+
+    def ledger_rows_raw(self):
+        """Every ledger row as a tuple, in id order (round-5 fix
+        spec H3; round-5 performance findings: chain verification
+        materialized a dict per row through :meth:`ledger_rows` —
+        ~10 µs/row before any hashing started).
+
+        Tuple layout is :data:`LEDGER_RAW_COLUMNS`:
+        ``chain.LEDGER_FIELDS`` in order (id … provenance,
+        sealed_via), then ``prev_hash``, then ``row_hash`` — 16
+        values. This is the fast path's raw material only; the
+        canonical serialization chain.py builds from a tuple must
+        byte-match ``canonical_row`` for the same row.
+        """
+        cols = ", ".join(self.LEDGER_RAW_COLUMNS)
+        return self._conn.execute(
+            f"SELECT {cols} FROM ledger ORDER BY id ASC").fetchall()
+
+    # -- store meta (round-5 fix spec, pinned interfaces) ----------------
+
+    def _meta_get(self, key):
+        row = self._conn.execute(
+            "SELECT value FROM store_meta WHERE key=?",
+            (key,)).fetchone()
+        return None if row is None else row[0]
+
+    def _meta_set(self, key, value):
+        self._conn.execute(
+            "INSERT INTO store_meta (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value))
+
+    def get_chain_verified_head(self):
+        """The chain-verified head cache: ``(max_id, head_hash,
+        row_count)`` recorded by the last FULL ``chain.verify_chain``
+        walk that succeeded on this book, or None when no full walk
+        has succeeded (or the cache was never written). Round-5 fix
+        spec, pinned interfaces: ``chain.verify_chain_cached`` may
+        trust rows up to this head and verify only what came after;
+        the operator surfaces keep the full walk.
+        """
+        max_id = self._meta_get("chain_verified_max_id")
+        head_hash = self._meta_get("chain_verified_head_hash")
+        row_count = self._meta_get("chain_verified_row_count")
+        if max_id is None or head_hash is None or row_count is None:
+            return None
+        try:
+            return (int(max_id), head_hash, int(row_count))
+        except (TypeError, ValueError):
+            return None
+
+    def set_chain_verified_head(self, max_id, head_hash, row_count):
+        """Record the chain-verified head cache (see
+        :meth:`get_chain_verified_head`). Committed before
+        returning, like every store write."""
+        self._meta_set("chain_verified_max_id", str(int(max_id)))
+        self._meta_set("chain_verified_head_hash", str(head_hash))
+        self._meta_set("chain_verified_row_count", str(int(row_count)))
+        self._conn.commit()
 
     @staticmethod
     def _ledger_dict(row):

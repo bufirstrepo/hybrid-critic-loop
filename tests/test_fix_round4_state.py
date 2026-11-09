@@ -338,10 +338,14 @@ class TestOpenFastPath(unittest.TestCase):
             finally:
                 store.close()
             # Structural assertion, not timing: a 25-row book was
-            # probed at its tail (one variants call) — a full walk
-            # would have cost one call per row.
-            self.assertEqual(counts["variants"], 1)
-            self.assertLessEqual(counts["hash"] + counts["legacy"], 3)
+            # probed at its tail AND its head (round-5 fix spec H6:
+            # two variants calls — the tail-only probe stranded
+            # mixed-form books) — a full walk would have cost one
+            # call per row.
+            self.assertEqual(counts["variants"], 2)
+            # Two probe points × up to three forms each — a walk
+            # over 25 rows would be 25 variants calls, ~75 digests.
+            self.assertLessEqual(counts["hash"] + counts["legacy"], 6)
 
     def test_healthy_open_issues_no_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
