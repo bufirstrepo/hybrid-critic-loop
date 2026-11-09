@@ -332,7 +332,13 @@ class TestHookComputesStandingOnce(_StoreCase):
     """Round-5 test-audit Finding 4 / spec H3 acceptance: the G3
     bullet "the hook computes standing once" is pinned by counting —
     one standing_line call (with the cached gate), one underlying
-    compute_standing, per pre_llm_call."""
+    compute_standing, per pre_llm_call.
+
+    Round-6 fix spec J6 supersedes the second half of that pin:
+    standing_line now takes the light totals path (headline figures
+    only), so the hook must not call compute_standing AT ALL — its
+    per-expert aggregations are exactly the cost J6 removes from
+    the session path (round-6 performance F1)."""
 
     def test_one_computation_per_hook_call(self):
         cand = self._candidate()
@@ -351,7 +357,9 @@ class TestHookComputesStandingOnce(_StoreCase):
                 result = hooks.pre_llm_call(self.store, Path(tmp))
         self.assertIsNotNone(result)
         self.assertEqual(line_spy.call_count, 1)
-        self.assertEqual(compute_spy.call_count, 1)
+        # J6: the light path — no full standing computation (and no
+        # per-expert aggregations) on the hook path.
+        self.assertEqual(compute_spy.call_count, 0)
         # The hook's gate is the cached one (spec H3 pinned split).
         self.assertTrue(line_spy.call_args.kwargs.get("cached"))
         self.assertIn(

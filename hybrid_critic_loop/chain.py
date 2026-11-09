@@ -28,6 +28,11 @@ invisible to the cached check — by design, and only the full walk
 catches it. The session hook pays for the cached check on every
 first turn; anything an operator acts on pays for the walk
 (round-5 fix spec, pinned interfaces; round-5 performance HIGH).
+Round 6 (fix spec J3) closes the invalidation half of the split: a
+FAILED full walk deletes the cache, so once any operator surface
+has proven the book broken, the cached check stops passing it —
+cached surfaces fall back to the full walk until a success
+re-seeds the cache.
 
 **The certificate.** A run that reached a verdict with a winner is issued
 a certificate: the ``MM CERTIFIED`` stamp plus a signed token
@@ -344,7 +349,7 @@ def _records_from_tuples(rows, fields):
         )
 
 
-def _chain_records(store):
+def _chain_records(store, upto_id=None):
     """Walk records from the cheapest confirmed source.
 
     The raw-tuple path (round-5 fix spec H3) skips the per-row dict
@@ -353,11 +358,23 @@ def _chain_records(store):
     book's own seals. Anything else — no raw method, an unconfirmable
     layout — falls back to the dict rows, so the verdicts are the
     dict path's verdicts by construction.
+
+    With ``upto_id``, the raw source is asked for the bounded prefix
+    (round-6 fix spec J6; round-6 performance F4): the walk stops
+    hashing at the bound either way, but an unbounded fetch made a
+    25-row prefix cost like the whole book. A raw source that does
+    not accept the bound (the test doubles' zero-arg shape) is
+    retried unbounded — same rows, same verdicts, just fetched whole.
     """
     raw = getattr(store, "ledger_rows_raw", None)
     if callable(raw):
         try:
-            rows = raw()
+            rows = raw(upto_id)
+        except TypeError:
+            try:
+                rows = raw()
+            except Exception:  # noqa: BLE001 - dict path below
+                rows = None
         except Exception:  # noqa: BLE001 - fall back to the dict path
             rows = None
         if rows is not None:
@@ -426,6 +443,30 @@ def _refresh_verified_head(store, head):
         pass
 
 
+def _clear_verified_head(store):
+    """Drop the verified-head cache after a FAILED full walk.
+
+    Round-6 fix spec J3 (round-6 attack F1): the cache was only ever
+    written on success and never invalidated, so once any full walk
+    proved the book broken, the hook's cached check went on trusting
+    its stale head — spot-checking the (untouched) head row, passing,
+    and printing the doctored tier at every session start,
+    indefinitely. A failed walk now deletes the cache, so
+    cached-check surfaces fall back to the full walk until a
+    successful walk re-seeds it. Best-effort, mirroring
+    :func:`_refresh_verified_head`: a store without the accessor
+    keeps working, and a deletion error never masks the walk's
+    verdict.
+    """
+    clear = getattr(store, "clear_chain_verified_head", None)
+    if not callable(clear):
+        return
+    try:
+        clear()
+    except Exception:  # noqa: BLE001 - the cache must never break a walk
+        pass
+
+
 def verify_chain(store, upto_id=None):
     """Recompute the chain from genesis — the FULL walk.
 
@@ -442,12 +483,16 @@ def verify_chain(store, upto_id=None):
     otherwise; the two sources produce identical verdicts (pinned by
     the equivalence tests). A successful walk refreshes the store's
     chain-verified head cache — the cache the hook-path
-    :func:`verify_chain_cached` trusts. Operator surfaces use this
-    walk, never the cached check.
+    :func:`verify_chain_cached` trusts — and a FAILED walk deletes
+    that cache (round-6 fix spec J3), so a proven break is never
+    followed by a cached pass. Operator surfaces use this walk,
+    never the cached check.
     """
-    ok, bad, head = _walk_records(_chain_records(store), upto_id)
+    ok, bad, head = _walk_records(_chain_records(store, upto_id), upto_id)
     if ok:
         _refresh_verified_head(store, head)
+    else:
+        _clear_verified_head(store)
     return ok, bad
 
 
@@ -520,6 +565,84 @@ def _suffix_records(store, after_id):
     ]
 
 
+def _full_walk_outcome(store):
+    """:func:`verify_chain`'s verdict in the cached check's outcome
+    shape: ``(ok, bad, "full", None)``."""
+    ok, bad = verify_chain(store)
+    return ok, bad, "full", None
+
+
+def _verify_chain_cached_detail(store):
+    """The cached check, naming the check that ran.
+
+    Returns ``(ok, bad, mode, head_id)`` — the verdict plus, for
+    surfaces that word a claim about the check (round-6 fix spec
+    J3), which check produced it: ``mode == "cached"`` when the
+    verdict rests on the cache (the trusted head at ``head_id``
+    spot-checked, the suffix verified), ``mode == "full"`` when the
+    full walk produced the verdict (``head_id`` is None then).
+    """
+    get = getattr(store, "get_chain_verified_head", None)
+    cache = None
+    if callable(get):
+        try:
+            cache = get()
+        except Exception:  # noqa: BLE001 - a broken cache is no cache
+            cache = None
+    if not cache:
+        return _full_walk_outcome(store)
+    try:
+        max_id, head_hash, row_count = cache
+    except (TypeError, ValueError):
+        return _full_walk_outcome(store)
+    if (
+        not _is_int(max_id)
+        or not _is_int(row_count)
+        or not isinstance(head_hash, str)
+    ):
+        return _full_walk_outcome(store)
+    snapshot = _head_snapshot(store, max_id)
+    if snapshot is None:
+        return _full_walk_outcome(store)
+    count, head_row, pred_hash = snapshot
+    if count != row_count:
+        return _full_walk_outcome(store)
+    if max_id == 0:
+        if head_row is not None:
+            return _full_walk_outcome(store)
+        prev = GENESIS_HASH
+    else:
+        if head_row is None or head_row.get("id") != max_id:
+            return _full_walk_outcome(store)
+        if head_row.get("row_hash") != head_hash:
+            return _full_walk_outcome(store)
+        if head_row.get("prev_hash") != pred_hash:
+            return _full_walk_outcome(store)
+        if row_hash(pred_hash, head_row) != head_hash:
+            return _full_walk_outcome(store)
+        prev = head_hash
+    verified = row_count
+    last_id = max_id
+    for rid, stored_prev, stored_hash, canonical in _suffix_records(
+        store, max_id
+    ):
+        if not stored_prev or not stored_hash:
+            return False, rid, "cached", max_id
+        if stored_prev != prev:
+            # The suffix does not link to the spot-checked head: the
+            # book changed in a way the spot check cannot localize —
+            # get the exact answer from the full walk.
+            return _full_walk_outcome(store)
+        if _digest(prev, canonical) != stored_hash:
+            return False, rid, "cached", max_id
+        prev = stored_hash
+        verified += 1
+        if _is_int(rid):
+            last_id = rid
+    _refresh_verified_head(store, (last_id, prev, verified))
+    return True, None, "cached", max_id
+
+
 def verify_chain_cached(store):
     """The cache-aware gate check: suffix verification from the
     chain-verified head cache.
@@ -537,66 +660,24 @@ def verify_chain_cached(store):
     returns ITS verdict. A successful suffix walk extends the
     cache to the new head. This is the hook path's check; operator
     surfaces use :func:`verify_chain`.
+
+    The check that ran is recorded on the store as
+    ``_mm_last_chain_check`` — ``("cached", head_id)`` when the
+    cached head was trusted, ``("full", None)`` when the full walk
+    ran — so a surface can word its claim to match the check
+    (round-6 fix spec J3: the CLI's verify-cert scoping sentence
+    reads it, and must not assert a whole-chain walk the cached
+    check did not perform). A failed full walk anywhere in this
+    check deletes the cache (see :func:`verify_chain`), and nothing
+    here resurrects a cache a failed walk cleared: with no cache,
+    this check IS the full walk.
     """
-    get = getattr(store, "get_chain_verified_head", None)
-    cache = None
-    if callable(get):
-        try:
-            cache = get()
-        except Exception:  # noqa: BLE001 - a broken cache is no cache
-            cache = None
-    if not cache:
-        return verify_chain(store)
+    ok, bad, mode, head_id = _verify_chain_cached_detail(store)
     try:
-        max_id, head_hash, row_count = cache
-    except (TypeError, ValueError):
-        return verify_chain(store)
-    if (
-        not _is_int(max_id)
-        or not _is_int(row_count)
-        or not isinstance(head_hash, str)
-    ):
-        return verify_chain(store)
-    snapshot = _head_snapshot(store, max_id)
-    if snapshot is None:
-        return verify_chain(store)
-    count, head_row, pred_hash = snapshot
-    if count != row_count:
-        return verify_chain(store)
-    if max_id == 0:
-        if head_row is not None:
-            return verify_chain(store)
-        prev = GENESIS_HASH
-    else:
-        if head_row is None or head_row.get("id") != max_id:
-            return verify_chain(store)
-        if head_row.get("row_hash") != head_hash:
-            return verify_chain(store)
-        if head_row.get("prev_hash") != pred_hash:
-            return verify_chain(store)
-        if row_hash(pred_hash, head_row) != head_hash:
-            return verify_chain(store)
-        prev = head_hash
-    verified = row_count
-    last_id = max_id
-    for rid, stored_prev, stored_hash, canonical in _suffix_records(
-        store, max_id
-    ):
-        if not stored_prev or not stored_hash:
-            return False, rid
-        if stored_prev != prev:
-            # The suffix does not link to the spot-checked head: the
-            # book changed in a way the spot check cannot localize —
-            # get the exact answer from the full walk.
-            return verify_chain(store)
-        if _digest(prev, canonical) != stored_hash:
-            return False, rid
-        prev = stored_hash
-        verified += 1
-        if _is_int(rid):
-            last_id = rid
-    _refresh_verified_head(store, (last_id, prev, verified))
-    return True, None
+        store._mm_last_chain_check = (mode, head_id)
+    except Exception:  # noqa: BLE001 - a store that refuses attributes
+        pass
+    return ok, bad
 
 
 # ---------------------------------------------------------------------------
@@ -1037,7 +1118,7 @@ def _contract_completed(store, contract_id) -> bool:
     return not surface
 
 
-def issue_certificate(store, contract_id):
+def issue_certificate(store, contract_id, _chain_verified=False):
     """Issue the certificate block for a contract, or None.
 
     A certificate exists only for a run that reached a verdict with a
@@ -1063,7 +1144,19 @@ def issue_certificate(store, contract_id):
     chain). Also None when the store's certificate key cannot be
     persisted (:class:`CertificateKeyError`): no certificate beats
     one that can never verify. Returns ``{"stamp", "cert",
-    "payload"}``. The payload's ``issued_at`` is the verdict row's
+    "payload"}``.
+
+    ``_chain_verified`` is an internal threading seam (round-6 fix
+    spec J6; round-6 performance F2): a caller that has JUST
+    full-walked this book successfully in the same operation —
+    reports.verdict_report's chain gate — passes True, and issuance
+    reuses that walk instead of re-walking the prefix the gate just
+    verified (a verdict report used to pay both walks). Standalone
+    callers leave it False and issuance verifies its own prefix,
+    exactly as before; passing it without a just-completed
+    successful full walk of the same book state voids the
+    chain-gated-issuance guarantee, so nothing outside that one
+    call site may set it. The payload's ``issued_at`` is the verdict row's
     own timestamp, so the same run renders the same token every time.
     The payload also seals the verdict's gate outcome — ``measured``
     and ``waived`` — so a winner that failed the measured gate and
@@ -1085,9 +1178,10 @@ def issue_certificate(store, contract_id):
         return None
     if not _contract_completed(store, contract_id):
         return None
-    prefix_ok, _bad = verify_chain(store, upto_id=upto)
-    if not prefix_ok:
-        return None
+    if not _chain_verified:
+        prefix_ok, _bad = verify_chain(store, upto_id=upto)
+        if not prefix_ok:
+            return None
     payload = {
         "contract_id": contract_id,
         "verdict_id": verdict.get("id"),

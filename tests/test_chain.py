@@ -191,10 +191,13 @@ class TestChainBackfill(unittest.TestCase):
 
 class TestVerifiedHeadCache(ChainTestCase):
     """Round-5 fix spec H3 (pinned interfaces): a successful FULL
-    walk records the chain-verified head cache in store meta; a
-    failed walk leaves it untouched; the cached check agrees with
-    the walk on a healthy book and extends the cache over new
-    rows."""
+    walk records the chain-verified head cache in store meta; the
+    cached check agrees with the walk on a healthy book and extends
+    the cache over new rows. Round-6 fix spec J3 supersedes the
+    failed-walk half of the round-5 pin: a failed walk no longer
+    leaves the cache untouched — it DELETES it, so the cached check
+    cannot go on certifying a book a full walk proved broken
+    (round-6 attack F1)."""
 
     def test_successful_walk_populates_the_cache(self):
         self.assertIsNone(self.store.get_chain_verified_head())
@@ -209,11 +212,17 @@ class TestVerifiedHeadCache(ChainTestCase):
             head[1], self.store.ledger_rows()[-1]["row_hash"])
         self.assertEqual(head[2], 2)
 
-    def test_failed_walk_does_not_refresh_the_cache(self):
+    def test_failed_walk_deletes_the_cache(self):
+        """Round-6 fix spec J3 (round-6 attack F1): the round-5 pin
+        here asserted the failed walk left the cache untouched —
+        which is precisely what let the hook keep certifying a
+        proven-broken book from its stale head. Now the failed walk
+        deletes the cache, and the cached check falls back to the
+        full walk and answers honestly."""
         self._row()
         self._row(expert="exp-2")
         chain.verify_chain(self.store)
-        cached = self.store.get_chain_verified_head()
+        self.assertIsNotNone(self.store.get_chain_verified_head())
         conn = sqlite3.connect(str(self.db_path))
         try:
             conn.execute(
@@ -223,7 +232,12 @@ class TestVerifiedHeadCache(ChainTestCase):
             conn.close()
         ok, bad = chain.verify_chain(self.store)
         self.assertEqual((ok, bad), (False, 1))
-        self.assertEqual(self.store.get_chain_verified_head(), cached)
+        self.assertIsNone(self.store.get_chain_verified_head())
+        # No resurrection: the cached check pays the full walk now
+        # and returns its verdict; the cache stays deleted.
+        self.assertEqual(
+            chain.verify_chain_cached(self.store), (False, 1))
+        self.assertIsNone(self.store.get_chain_verified_head())
 
     def test_cached_check_agrees_and_extends(self):
         self._row()

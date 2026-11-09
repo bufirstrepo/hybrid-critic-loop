@@ -26,10 +26,20 @@ correctness F6, claims #2). A ledger row is *counted* when:
 - it is *referentially backed* (round-3 attack F1/F2): either its
   provenance is ``"legacy-import"`` (rows written before provenance
   existed — a row dict with no provenance at all reads as
-  ``"legacy-import"`` too), or its ``candidate_id`` names an existing
-  candidate **on the row's own contract** whose stored provenance
-  equals the row's provenance, or its provenance is
-  ``"executor-reported"`` and such a candidate exists. A counted
+  ``"legacy-import"`` too) AND its seal came from a migration route
+  — ``sealed_via`` is ``"backfill"`` (pre-chain books) or
+  ``"upgrade"`` (the canonical-form cascade) — or its
+  ``candidate_id`` names an existing candidate **on the row's own
+  contract** whose stored provenance equals the row's provenance,
+  or its provenance is ``"executor-reported"`` and such a candidate
+  exists. The seal-route condition is round-6 fix spec J4
+  (round-6 attack F2): the open-time migration labels ANY
+  NULL-provenance row ``"legacy-import"`` and the sealing pass
+  seals an unsealed suffix ``"repair"``, so keyed on the label
+  alone the exemption laundered a raw post-hoc append into counted
+  money with no hash math at all; a ``"repair"``-sealed
+  legacy-import row now counts only via the ordinary referential
+  leg, like any other label. A counted
   label naming a candidate that was never recorded — or one recorded
   under a different contract (round-5 attack F4) — is a claim the
   store's own graph does not back, and it does not count. Where the
@@ -111,6 +121,15 @@ _NON_COUNTED_PROVENANCES = frozenset({"internal", "unattributed", ""})
 #: before the provenance column existed are imports of the old book
 #: and count (the state migration labels them exactly this).
 _MISSING_PROVENANCE = "legacy-import"
+
+#: The seal routes that mark a row as genuinely migration-era
+#: (round-6 fix spec J4): "backfill" (the pre-chain sealing pass)
+#: and "upgrade" (the canonical-form cascade). The legacy-import
+#: exemption requires one of these — a "repair"-sealed
+#: legacy-import row is a post-hoc append the open-time machinery
+#: labelled and sealed, not a row the migration carried over, and
+#: it counts only via the ordinary referential leg.
+_MIGRATION_SEALS = frozenset({"backfill", "upgrade"})
 
 #: The provenance the dispatch path stamps when the candidate carries
 #: none of its own (loop.py): counted when the named candidate exists.
@@ -246,7 +265,17 @@ def _classify_row(row, resolve):
     prov = _row_provenance(row)
     if prov in _NON_COUNTED_PROVENANCES:
         return _CAUSE_PROVENANCE
-    if prov == _MISSING_PROVENANCE:
+    if prov == _MISSING_PROVENANCE and (
+            row.get("sealed_via") in _MIGRATION_SEALS):
+        # The legacy exemption (round-6 fix spec J4; round-6 attack
+        # F2): only a migration route's seal exempts a legacy-import
+        # row from the referential leg below. Keyed on the label
+        # alone it also exempted the raw NULL-provenance append the
+        # open-time migration labels and the suffix pass seals
+        # "repair" — indistinguishable in the totals from a genuine
+        # pre-provenance row, with no hash math required of the
+        # writer. A repair-sealed (or unsealed) legacy-import row
+        # falls through to the ordinary leg.
         return "counted"
     if resolve is None:
         # The store cannot name its candidates at all, so the
@@ -273,6 +302,7 @@ CASE
   WHEN COALESCE(l.provenance, 'legacy-import')
        IN ('internal', 'unattributed', '') THEN 'provenance'
   WHEN COALESCE(l.provenance, 'legacy-import') = 'legacy-import'
+       AND l.sealed_via IN ('backfill', 'upgrade')
     THEN 'counted'
   WHEN c.id IS NOT NULL
        AND c.contract_id = l.contract_id
@@ -886,6 +916,31 @@ def format_standing_line(standing) -> str:
     return line
 
 
+def _headline_standing(store):
+    """The standing line's figures only: tier + lifetime totals.
+
+    Round-6 fix spec J6 (round-6 performance F1): the warm hook was
+    still ~1.3 s at 200k rows AFTER the cached chain check left it,
+    and the residue was :func:`compute_standing`'s per-expert
+    machinery — the summary aggregation and the expert totals, two
+    more whole-book GROUP BYs — computed for a one-line standing
+    that prints none of it. The line needs only the headline
+    totals, so it takes them straight from the one aggregation;
+    the keys are exactly the ones :func:`format_standing_line`
+    reads. :func:`standing_report` keeps the full computation.
+    """
+    totals = ledger_totals(store)
+    return {
+        "tier": tier_for(totals["cost_usd"]),
+        "cost_usd": totals["cost_usd"],
+        "tokens": totals["tokens"],
+        "cost_rows": totals["cost_rows"],
+        "cost_missing": totals["cost_missing"],
+        "referential_unchecked": bool(
+            totals.get("referential_unchecked")),
+    }
+
+
 def standing_line(store, cached=False):
     """The one-line standing for a store (see :func:`format_standing_line`).
 
@@ -896,11 +951,15 @@ def standing_line(store, cached=False):
     gate re-verifies only rows past the last verified head instead of
     re-walking the whole book on every session's first turn. Operator
     surfaces never pass cached=True.
+
+    The figures come from the light totals path
+    (:func:`_headline_standing`; round-6 fix spec J6) — the line
+    never computes the per-expert aggregations it does not print.
     """
     status, bad = _chain_check(store, cached=cached)
     if status == "broken":
         return _unavailable_line(bad)
-    return format_standing_line(compute_standing(store))
+    return format_standing_line(_headline_standing(store))
 
 
 def contract_totals(store, contract_id, upto_id=None) -> dict:

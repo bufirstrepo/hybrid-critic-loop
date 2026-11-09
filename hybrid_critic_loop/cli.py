@@ -276,10 +276,25 @@ def _cmd_verify_cert(token, data_dir) -> int:
         # through the chain-verified head cache (fix spec H3): on a
         # book whose head still seals it re-verifies only the rows
         # past the cached head instead of walking the whole book a
-        # second time; the wording is unchanged.
+        # second time.
+        #
+        # The sentence names the check that ran (round-6 fix spec
+        # J3; round-6 attack F3 — this supersedes the round-5 spec's
+        # "wording unchanged" pin for this line): when the cached
+        # check trusted the last full walk's head, the line says so
+        # and must not assert a whole-chain walk that did not
+        # happen; the full-walk case keeps the whole-chain sentence.
+        # verify_chain_cached records the check on the store; an
+        # unrecorded check keeps the whole-chain sentence.
         chain_ok, first_bad = verify_chain_cached(store)
         if chain_ok:
-            print("chain: the whole ledger chain verifies")
+            last_check = getattr(store, "_mm_last_chain_check", None)
+            if last_check and last_check[0] == "cached":
+                print(
+                    f"chain: verified from the last full check at row "
+                    f"{last_check[1]}; suffix verified (cached check)")
+            else:
+                print("chain: the whole ledger chain verifies")
         else:
             print(
                 f"warning: the certificate's prefix verifies, but the "

@@ -611,6 +611,15 @@ class Store:
         ``self.chain_backfilled`` / ``self.chain_repairs`` /
         ``self.chain_upgrades`` record how many rows this open sealed
         by each route.
+
+        Round-6 fix spec J6 (round-6 performance F3): a completing
+        pass also SEEDS the chain-verified head cache
+        (:meth:`_seed_chain_verified_head`) — it has just recomputed
+        every row in the book, so the head it ends on is a full
+        verification's head. Without the seed, the first hook after
+        the one-time upgrade paid a second full walk on top of the
+        cascade. The probe short-circuit never seeds: it spot-checks
+        two rows, which is not a verification of the book.
         """
         self.chain_backfilled = 0
         self.chain_repairs = 0
@@ -715,6 +724,7 @@ class Store:
                 # that performed them — not whenever some later write
                 # happens to commit.
                 self._conn.commit()
+            self._seed_chain_verified_head(rows, prev_new)
             return
         suffix = rows[first_unsealed:]
         if any(_col(row, "row_hash") for row in suffix):
@@ -744,6 +754,18 @@ class Store:
         self.chain_upgrades = n_upgrades
         self.last_seal_count = n_sealed
         self._conn.commit()
+        self._seed_chain_verified_head(rows, prev)
+
+    def _seed_chain_verified_head(self, rows, head_hash):
+        """Record the verified head a completing sealing pass made.
+
+        See :meth:`_backfill_chain` (round-6 fix spec J6): the pass
+        recomputed every row in the book, so its final head is a
+        full verification's head — exactly what the chain-verified
+        head cache records for the hook's cached check.
+        """
+        self.set_chain_verified_head(
+            int(rows[-1]["id"]), head_hash, len(rows))
 
     # -- internal helpers -------------------------------------------------
 
@@ -1632,7 +1654,7 @@ class Store:
     LEDGER_RAW_COLUMNS = tuple(_chain.LEDGER_FIELDS) + (
         "prev_hash", "row_hash")
 
-    def ledger_rows_raw(self):
+    def ledger_rows_raw(self, upto_id=None):
         """Every ledger row as a tuple, in id order (round-5 fix
         spec H3; round-5 performance findings: chain verification
         materialized a dict per row through :meth:`ledger_rows` —
@@ -1644,10 +1666,20 @@ class Store:
         values. This is the fast path's raw material only; the
         canonical serialization chain.py builds from a tuple must
         byte-match ``canonical_row`` for the same row.
+
+        With ``upto_id`` (round-6 fix spec J6; round-6 performance
+        F4), only rows with ``id <= upto_id`` are fetched, so a
+        prefix verification — a certificate's, sealing a 25-row
+        prefix of a 200k-row book — no longer materializes the whole
+        book just to stop hashing at the bound.
         """
         cols = ", ".join(self.LEDGER_RAW_COLUMNS)
+        if upto_id is None:
+            return self._conn.execute(
+                f"SELECT {cols} FROM ledger ORDER BY id ASC").fetchall()
         return self._conn.execute(
-            f"SELECT {cols} FROM ledger ORDER BY id ASC").fetchall()
+            f"SELECT {cols} FROM ledger WHERE id<=?"
+            " ORDER BY id ASC", (upto_id,)).fetchall()
 
     # -- store meta (round-5 fix spec, pinned interfaces) ----------------
 
@@ -1689,6 +1721,24 @@ class Store:
         self._meta_set("chain_verified_max_id", str(int(max_id)))
         self._meta_set("chain_verified_head_hash", str(head_hash))
         self._meta_set("chain_verified_row_count", str(int(row_count)))
+        self._conn.commit()
+
+    def clear_chain_verified_head(self):
+        """Drop the chain-verified head cache entirely (round-6 fix
+        spec J3; round-6 attack F1).
+
+        :func:`chain.verify_chain` calls this after a FAILED full
+        walk: a proven break used to leave the cache untouched, so
+        the hook's cached check kept certifying the tampered book
+        from its stale head at every session start, indefinitely.
+        With the cache gone, cached-check surfaces fall back to the
+        full walk until a successful walk re-seeds it. Committed
+        before returning, like every store write.
+        """
+        self._conn.execute(
+            "DELETE FROM store_meta WHERE key IN"
+            " ('chain_verified_max_id', 'chain_verified_head_hash',"
+            " 'chain_verified_row_count')")
         self._conn.commit()
 
     @staticmethod

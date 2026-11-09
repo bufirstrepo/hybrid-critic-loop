@@ -67,9 +67,26 @@ class FakeMatrixStore:
 class FakeLedgerStore:
     def __init__(self, summary):
         self._summary = summary
+        # Round-6 fix spec J3: ledger_report gates on the chain
+        # exactly like the standing surfaces (figures suppressed on
+        # a broken book), and hashless rows read as a broken book —
+        # so the fake's rows carry real seals (chain.row_hash over
+        # each row, chained) instead of no hashes at all.
+        from hybrid_critic_loop import chain as _chain
+
+        self._rows = []
+        prev = _chain.GENESIS_HASH
+        for i, r in enumerate(summary, start=1):
+            row = {"id": i, "expert_id": r.get("expert_id")}
+            row["prev_hash"] = prev
+            row["row_hash"] = _chain.row_hash(prev, row)
+            prev = row["row_hash"]
+            self._rows.append(row)
 
     def ledger_rows(self, expert_id=None):
-        return [{"expert_id": r.get("expert_id")} for r in self._summary]
+        if expert_id is None:
+            return list(self._rows)
+        return [r for r in self._rows if r.get("expert_id") == expert_id]
 
     def ledger_summary(self):
         return list(self._summary)

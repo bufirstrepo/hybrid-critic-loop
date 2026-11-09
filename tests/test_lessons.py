@@ -93,6 +93,19 @@ class FakeStore:
             {"expert_id": expert_id, "outcome": outcome, "note": note, **kw}
         )
         row = {"expert_id": expert_id, "outcome": outcome, "note": note}
+        # Round-6 fix spec J3: ledger_report now suppresses its
+        # figures on a broken chain exactly like the standing
+        # surfaces, and a hashless row reads as a broken book — so
+        # the fake's rows carry real seals (chain.row_hash over the
+        # row, chained) instead of no hashes at all.
+        from hybrid_critic_loop import chain as _chain
+
+        prev = (
+            self._ledger[-1]["row_hash"]
+            if self._ledger else _chain.GENESIS_HASH)
+        row["id"] = len(self._ledger) + 1
+        row["prev_hash"] = prev
+        row["row_hash"] = _chain.row_hash(prev, row)
         self._ledger.append(row)
         return len(self._ledger)
 

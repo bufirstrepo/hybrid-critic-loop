@@ -103,11 +103,30 @@ class TestLedgerReportChainLine(unittest.TestCase):
             _dispatch(store)
         store.close()
         conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
         try:
             for row_id, via in enumerate(sealed_vias, start=1):
                 conn.execute(
                     "UPDATE ledger SET sealed_via=? WHERE id=?",
                     (via, row_id))
+            # Round-6 fix spec J3: ledger_report is chain-gated now,
+            # and sealed_via is a canonical field — rewriting it
+            # without re-sealing breaks every row's seal, and the
+            # gated report suppresses the very line these tests
+            # assert. Re-seal the book under the current form with
+            # its new routes (the migration's own move) so the book
+            # verifies and the line prints.
+            from hybrid_critic_loop import chain as _chain
+
+            rows = conn.execute(
+                "SELECT * FROM ledger ORDER BY id ASC").fetchall()
+            prev = _chain.GENESIS_HASH
+            for row in rows:
+                digest = _chain.row_hash(prev, dict(row))
+                conn.execute(
+                    "UPDATE ledger SET prev_hash=?, row_hash=?"
+                    " WHERE id=?", (prev, digest, row["id"]))
+                prev = digest
             conn.commit()
         finally:
             conn.close()

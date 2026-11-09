@@ -56,12 +56,17 @@ class TestReferentialCounting(_StoreCase):
         the upgrade pass leaves behind. (Round-5 fix spec H2: the
         label is reserved for the migration and can no longer be
         written through add_ledger, so the fixture builds it the way
-        the migration does — by relabeling, then re-sealing.)"""
+        the migration does — by relabeling, then re-sealing.)
+        Round-6 fix spec J4: the counted rule's exemption keys on
+        the seal route too, so the fixture also writes the route the
+        upgrade pass writes — sealed_via='upgrade' — which is what
+        a genuine migration-era row carries on disk."""
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         try:
             conn.execute(
-                "UPDATE ledger SET provenance='legacy-import'"
+                "UPDATE ledger SET provenance='legacy-import',"
+                " sealed_via='upgrade'"
                 " WHERE id=?", (row_id,))
             rows = conn.execute(
                 "SELECT * FROM ledger ORDER BY id ASC").fetchall()

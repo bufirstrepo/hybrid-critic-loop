@@ -165,6 +165,42 @@ def ledger_report(store) -> str:
         events = _events_lines(store)
         return "\n".join([text] + events) if events else text
     lines = ["ledger:"]
+    # Chain state FIRST, and suppression on a broken chain (round-6
+    # fix spec J3; round-6 attack F4): the chain-state line used to
+    # trail the figures, so a tampered book printed its doctored
+    # per-expert figures with the break as a footnote — where the
+    # standing surfaces render "unavailable" for the same book, this
+    # report showed full figures. Now the state leads, and on a
+    # broken chain the counted figures are suppressed exactly as the
+    # standing surfaces suppress theirs: the unavailable line
+    # replaces them. The check is the full walk (an operator
+    # surface); when it cannot run at all ("unknown"), no line
+    # prints and the figures stand — surfaces never gate on
+    # uncertainty.
+    try:
+        from .standing import _unavailable_line, chain_state
+
+        _status, _bad = chain_state(store)
+    except Exception:
+        _status, _bad = "unknown", None
+    if _status == "broken":
+        if _bad is None:
+            lines.append("chain state: unavailable")
+        else:
+            lines.append(f"chain state: broken at row {_bad}")
+        lines.append(_unavailable_line(_bad))
+        lines.extend(_events_lines(store))
+        return "\n".join(lines)
+    if _status == "ok":
+        _ids = [
+            row.get("id") for row in rows or []
+            if isinstance(row, dict)
+            and isinstance(row.get("id"), int)
+            and not isinstance(row.get("id"), bool)
+        ]
+        if _ids:
+            lines.append(
+                f"chain state: verified through row {max(_ids)}")
     # Per-expert dispatch counts/costs come from the unified totals
     # (standing.expert_rows — counted-row rule v2), not from the
     # provenance-blind summary figures, so this report and the
@@ -226,33 +262,6 @@ def ledger_report(store) -> str:
             f"{via}={sealed_counts[via]}" for via in sorted(sealed_counts)
         )
         lines.append(f"chain: {detail}")
-    # Chain state (round-5 fix spec H2; round-5 attack F2): the report
-    # states whether the book's hash chain verifies — the sealing-route
-    # line above says how rows were sealed, never whether they still
-    # verify, and an all-append broken book used to get silence. The
-    # check is the full walk (an operator surface); when it cannot
-    # run at all, no line prints rather than a guess.
-    try:
-        from .standing import chain_state as _chain_state
-
-        _status, _bad = _chain_state(store)
-    except Exception:
-        _status, _bad = "unknown", None
-    if _status == "broken":
-        if _bad is None:
-            lines.append("chain state: unavailable")
-        else:
-            lines.append(f"chain state: broken at row {_bad}")
-    elif _status == "ok":
-        _ids = [
-            row.get("id") for row in rows or []
-            if isinstance(row, dict)
-            and isinstance(row.get("id"), int)
-            and not isinstance(row.get("id"), bool)
-        ]
-        if _ids:
-            lines.append(
-                f"chain state: verified through row {max(_ids)}")
     if not summary and rows:
         # Rows exist but no summary implementation produced aggregates.
         for row in rows:
@@ -701,11 +710,29 @@ def verdict_report(store, contract_id) -> str:
     # certificate that cannot verify must not be printable from the
     # report an operator shares. (chain.py's issuance is gated too;
     # this is the report layer's own half of the discipline.)
+    #
+    # One walk per report (round-6 fix spec J6; round-6 performance
+    # F2): the gate walk here is the report's ONLY full walk. The
+    # certificate's prefix is a subset of the book this walk just
+    # verified, so issuance below reuses it through
+    # issue_certificate's _chain_verified seam instead of re-walking
+    # the same prefix (the report used to pay both walks — at 200k
+    # rows the second walk ate the round-5 tuple-path gains whole).
+    # A walk that cannot run at all gates nothing (the standing
+    # surfaces' "unknown" rule) and issuance verifies its own
+    # prefix as it always did standalone.
     unavailable = None
+    book_verified = False
     try:
-        from .standing import chain_unavailable_line
+        from . import chain as _chain
 
-        unavailable = chain_unavailable_line(store)
+        _gate_ok, _gate_bad = _chain.verify_chain(store)
+        if _gate_ok:
+            book_verified = True
+        else:
+            from .standing import _unavailable_line
+
+            unavailable = _unavailable_line(_gate_bad)
     except Exception:
         unavailable = None
     if unavailable is not None:
@@ -722,23 +749,27 @@ def verdict_report(store, contract_id) -> str:
         standing_text = None
     if standing_text:
         lines.append(standing_text)
-    lines.extend(_certificate_lines(store, contract_id))
+    lines.extend(_certificate_lines(
+        store, contract_id, _chain_verified=book_verified))
     return "\n".join(lines)
 
 
-def _certificate_lines(store, contract_id):
+def _certificate_lines(store, contract_id, _chain_verified=False):
     """The MM CERTIFIED block for a run that reached a verdict.
 
     Stamp + signed token, computed from the ledger by chain.py — the
     local signature is a store-integrity seal only (see chain.py's
     docstring for what it does not prove). A contract with no verdict
     gets no block; any failure to compute one prints nothing rather
-    than breaking the report.
+    than breaking the report. ``_chain_verified`` threads the
+    verdict report's just-completed gate walk into issuance
+    (round-6 fix spec J6) — see verdict_report.
     """
     try:
         from . import chain as _chain
 
-        cert = _chain.issue_certificate(store, contract_id)
+        cert = _chain.issue_certificate(
+            store, contract_id, _chain_verified=_chain_verified)
     except Exception:  # noqa: BLE001 - a report must not break on the seal
         return []
     if not cert:
@@ -747,18 +778,32 @@ def _certificate_lines(store, contract_id):
 
 
 def lessons_report(store, domain=None, tags=None, limit=10) -> str:
-    """Numbered lesson lines, newest first, or "lessons: not run"."""
+    """Numbered lesson lines, newest first, or "lessons: not run".
+
+    Every lesson field renders through the same render-time
+    sanitizer the injected context uses
+    (:func:`hybrid_critic_loop.lessons.sanitize_free_text` —
+    round-6 fix spec J5; round-6 security F4): a row stored before
+    the write-time nets existed can carry raw multi-line text, and
+    this report reaches the plugin tool and the CLI, so no raw
+    domain/rule/outcome text prints — each field is a single
+    capped line, exactly as in ``lessons_context``.
+    """
     try:
         lessons = store.lessons_for(domain=domain, tags=tags, limit=limit)
     except TypeError:
         lessons = store.lessons_for(domain, tags, limit)
     if not lessons:
         return "lessons: not run"
+    from .lessons import sanitize_free_text
+
     lines = []
     for i, lesson in enumerate(lessons, start=1):
         lesson_id = lesson.get("id", lesson.get("lesson_id", "?"))
         lines.append(
-            f"{i}. [{lesson_id}] {lesson.get('domain')}: "
-            f"{lesson.get('rule')} — {lesson.get('outcome')}"
+            f"{i}. [{lesson_id}] "
+            f"{sanitize_free_text(lesson.get('domain'))}: "
+            f"{sanitize_free_text(lesson.get('rule'))} — "
+            f"{sanitize_free_text(lesson.get('outcome'))}"
         )
     return "\n".join(lines)
