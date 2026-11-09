@@ -189,5 +189,50 @@ class TestChainBackfill(unittest.TestCase):
                 store.close()
 
 
+class TestVerifiedHeadCache(ChainTestCase):
+    """Round-5 fix spec H3 (pinned interfaces): a successful FULL
+    walk records the chain-verified head cache in store meta; a
+    failed walk leaves it untouched; the cached check agrees with
+    the walk on a healthy book and extends the cache over new
+    rows."""
+
+    def test_successful_walk_populates_the_cache(self):
+        self.assertIsNone(self.store.get_chain_verified_head())
+        self._row()
+        self._row(expert="exp-2")
+        ok, _bad = chain.verify_chain(self.store)
+        self.assertTrue(ok)
+        head = self.store.get_chain_verified_head()
+        self.assertIsNotNone(head)
+        self.assertEqual(head[0], 2)
+        self.assertEqual(
+            head[1], self.store.ledger_rows()[-1]["row_hash"])
+        self.assertEqual(head[2], 2)
+
+    def test_failed_walk_does_not_refresh_the_cache(self):
+        self._row()
+        self._row(expert="exp-2")
+        chain.verify_chain(self.store)
+        cached = self.store.get_chain_verified_head()
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(
+                "UPDATE ledger SET note='tampered' WHERE id=1")
+            conn.commit()
+        finally:
+            conn.close()
+        ok, bad = chain.verify_chain(self.store)
+        self.assertEqual((ok, bad), (False, 1))
+        self.assertEqual(self.store.get_chain_verified_head(), cached)
+
+    def test_cached_check_agrees_and_extends(self):
+        self._row()
+        chain.verify_chain(self.store)
+        self._row(expert="exp-2")
+        self.assertEqual(
+            chain.verify_chain_cached(self.store), (True, None))
+        self.assertEqual(self.store.get_chain_verified_head()[0], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

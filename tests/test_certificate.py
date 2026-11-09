@@ -86,6 +86,16 @@ class CertificateTestCase(unittest.TestCase):
             tokens_in, tokens_out, cost_usd, "completed", None,
             **_DISPATCH_PROVENANCE)
 
+    def _complete(self, contract_id):
+        """Complete the contract the way the loop does: final
+        answer + terminal status. Round-5 fix spec H1 gates
+        issuance on completion, so fixtures expecting a
+        certificate complete their run first."""
+        target_id = self.store.get_contract(contract_id)["target_id"]
+        self.store.create_final_answer(
+            target_id, contract_id, "c0ffee", human_gate="approved")
+        self.store.set_contract_status(contract_id, "completed")
+
 
 class TestStamp(CertificateTestCase):
     def test_stamp_with_cost_is_the_full_form(self):
@@ -93,6 +103,7 @@ class TestStamp(CertificateTestCase):
         self._dispatch(cid, 100, 50, 1.5)
         self._dispatch(cid, 200, None, None, expert="exp-2")
         self._verdict(cid)
+        self._complete(cid)
         cert = chain.issue_certificate(self.store, cid)
         self.assertIsNotNone(cert)
         self.assertEqual(
@@ -103,6 +114,7 @@ class TestStamp(CertificateTestCase):
         cid = self._contract()
         self._dispatch(cid, 40, 10, None)
         self._verdict(cid)
+        self._complete(cid)
         cert = chain.issue_certificate(self.store, cid)
         self.assertIsNotNone(cert)
         self.assertEqual(
@@ -114,6 +126,7 @@ class TestStamp(CertificateTestCase):
         cid = self._contract()
         self._dispatch(cid, None, None, None)
         self._verdict(cid)
+        self._complete(cid)
         cert = chain.issue_certificate(self.store, cid)
         self.assertIn("TOKENS NOT REPORTED", cert["stamp"])
         self.assertNotIn("$", cert["stamp"])
@@ -125,6 +138,7 @@ class TestVerify(CertificateTestCase):
         self._dispatch(cid, 100, 50, 1.5)
         self._dispatch(cid, 200, 25, 0.25, expert="exp-2")
         self._verdict(cid)
+        self._complete(cid)
         return cid, chain.issue_certificate(self.store, cid)
 
     def test_certificate_verifies_against_its_store(self):
@@ -191,6 +205,7 @@ class TestNoVerdictNoCertificate(CertificateTestCase):
         self.assertNotIn("MM CERTIFIED", reports.verdict_report(
             self.store, cid))
         self._verdict(cid)
+        self._complete(cid)
         text = reports.verdict_report(self.store, cid)
         self.assertIn("MM CERTIFIED · 15 TOKENS SPENT", text)
         self.assertIn("cert: mm1.", text)
@@ -213,6 +228,7 @@ class TestVerifyCertCli(CertificateTestCase):
         cid = self._contract()
         self._dispatch(cid, 10, 5, 0.5)
         self._verdict(cid)
+        self._complete(cid)
         cert = chain.issue_certificate(self.store, cid)
         self.store.close()
         rc = cli.main(["verify-cert", cert["cert"],

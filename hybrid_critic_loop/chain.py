@@ -12,6 +12,23 @@ it, and :func:`verify_chain` names the first row that no longer seals.
 With ``upto_id``, verification covers only the chain prefix up to that
 row — the high-water mark a certificate seals (tightening spec T4).
 
+**Full walk vs cached check — the split, stated plainly.** Two
+verification strengths exist, and they are NOT interchangeable.
+:func:`verify_chain` is the full walk: every row in scope is
+recomputed from genesis, and a success refreshes the store's
+chain-verified head cache (``get_chain_verified_head`` /
+``set_chain_verified_head``). Operator surfaces — the standing
+report, the verdict report, the CLI — use the full walk.
+:func:`verify_chain_cached` is the hook-path gate check: it trusts
+that the prefix up to the cached head was verified when the cache
+was written, spot-checks that the head row still recomputes and
+links, and verifies only the rows AFTER the head. A tamper inside
+the cached prefix that leaves the head row untouched is therefore
+invisible to the cached check — by design, and only the full walk
+catches it. The session hook pays for the cached check on every
+first turn; anything an operator acts on pays for the walk
+(round-5 fix spec, pinned interfaces; round-5 performance HIGH).
+
 **The certificate.** A run that reached a verdict with a winner is issued
 a certificate: the ``MM CERTIFIED`` stamp plus a signed token
 ``mm1.<base64url(payload)>.<base64url(sig)>``. The payload names the
@@ -71,6 +88,7 @@ __all__ = [
     "row_hash_legacy",
     "row_hash_variants",
     "verify_chain",
+    "verify_chain_cached",
     "cert_key",
     "key_id",
     "run_totals",
@@ -227,8 +245,189 @@ def row_hash_variants(row) -> dict:
     }
 
 
+def _canonical_from_values(values) -> str:
+    """``canonical_row`` for a row carried as raw values.
+
+    ``values`` aligns with :data:`LEDGER_FIELDS`; the serialization
+    must byte-match :func:`canonical_row` for the same row (round-5
+    fix spec H3) — it builds the identical dict and dumps it with the
+    identical parameters, which the equivalence tests pin byte for
+    byte.
+    """
+    body = dict(zip(LEDGER_FIELDS, values))
+    return json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+
+#: The pinned raw-tuple layout of ``Store.ledger_rows_raw()``
+#: (round-5 fix spec H3): the row's canonical fields in
+#: :data:`LEDGER_FIELDS` order, then the seal plumbing appended.
+_RAW_FIELDS = LEDGER_FIELDS + ("prev_hash", "row_hash")
+
+#: Layout variants the raw path tolerates from duck-typed stores:
+#: the pinned layout first, then ``sealed_via`` carried in the
+#: appended seal group instead of its LEDGER_FIELDS slot, then the
+#: ledger table's physical column order. The seal itself is the
+#: layout oracle (see :func:`_detect_raw_layout`), so a variant is
+#: only ever trusted after it has produced a sealed, linked row.
+_RAW_LAYOUTS = (
+    _RAW_FIELDS,
+    tuple(f for f in LEDGER_FIELDS if f != "sealed_via")
+    + ("prev_hash", "row_hash", "sealed_via"),
+    (
+        "id", "target_id", "contract_id", "candidate_id", "stage",
+        "expert_id", "tokens_in", "tokens_out", "cost_usd", "outcome",
+        "note", "created_at", "prev_hash", "row_hash", "provenance",
+        "sealed_via",
+    ),
+)
+
+
+def _detect_raw_layout(rows):
+    """The raw-tuple layout that seals this book, or None.
+
+    Under the true layout, the first hash-carrying row whose stored
+    ``prev_hash`` links to its predecessor's stored hash (genesis for
+    row one) must recompute to its stored ``row_hash``. A layout that
+    produces no such row is not the layout; if NO layout does — an
+    empty or hashless book, or a tamper at the head — None is
+    returned and the caller falls back to the dict path, whose
+    verdicts are the reference. A wrong layout cannot be confirmed
+    short of a hash collision: the canonical bytes differ per layout,
+    so only the true layout's reading seals.
+    """
+    for fields in _RAW_LAYOUTS:
+        width = len(fields)
+        if any(len(tup) != width for tup in rows):
+            continue
+        pos = {field: i for i, field in enumerate(fields)}
+        prev_stored = GENESIS_HASH
+        confirmed = False
+        for tup in rows:
+            stored_prev = tup[pos["prev_hash"]]
+            stored_hash = tup[pos["row_hash"]]
+            if stored_prev and stored_hash:
+                if stored_prev == prev_stored:
+                    values = tuple(tup[pos[f]] for f in LEDGER_FIELDS)
+                    if _digest(
+                        stored_prev, _canonical_from_values(values)
+                    ) == stored_hash:
+                        confirmed = True
+                break  # the first hash-carrying row decides the layout
+            prev_stored = stored_hash
+        if confirmed:
+            return fields
+    return None
+
+
+def _records_from_dicts(rows):
+    """Walk records ``(id, prev_hash, row_hash, canonical)`` from
+    dict rows — the reference source."""
+    for row in rows:
+        yield (
+            row.get("id"),
+            row.get("prev_hash"),
+            row.get("row_hash"),
+            canonical_row(row),
+        )
+
+
+def _records_from_tuples(rows, fields):
+    """Walk records from raw tuples under a confirmed layout."""
+    pos = {field: i for i, field in enumerate(fields)}
+    for tup in rows:
+        values = tuple(tup[pos[f]] for f in LEDGER_FIELDS)
+        yield (
+            tup[pos["id"]],
+            tup[pos["prev_hash"]],
+            tup[pos["row_hash"]],
+            _canonical_from_values(values),
+        )
+
+
+def _chain_records(store):
+    """Walk records from the cheapest confirmed source.
+
+    The raw-tuple path (round-5 fix spec H3) skips the per-row dict
+    construction ``ledger_rows`` performs; it is used only when
+    ``ledger_rows_raw`` exists AND its layout confirms against the
+    book's own seals. Anything else — no raw method, an unconfirmable
+    layout — falls back to the dict rows, so the verdicts are the
+    dict path's verdicts by construction.
+    """
+    raw = getattr(store, "ledger_rows_raw", None)
+    if callable(raw):
+        try:
+            rows = raw()
+        except Exception:  # noqa: BLE001 - fall back to the dict path
+            rows = None
+        if rows is not None:
+            rows = list(rows)
+            if not rows:
+                return iter(())
+            fields = _detect_raw_layout(rows)
+            if fields is not None:
+                return _records_from_tuples(rows, fields)
+    return _records_from_dicts(store.ledger_rows())
+
+
+def _walk_records(records, upto_id=None):
+    """The chain walk over normalized records.
+
+    Returns ``(ok, first_bad_id, head)``; ``head`` is
+    ``(max_id, head_hash, row_count)`` of the verified scope on
+    success, else None. With ``upto_id``, only rows with
+    ``id <= upto_id`` are in scope and the walk stops AT the bound
+    (rows arrive in id order; round-4 fix spec G3).
+    """
+    prev = GENESIS_HASH
+    count = 0
+    max_id = 0
+    for rid, stored_prev, stored_hash, canonical in records:
+        if upto_id is not None:
+            if _is_int(rid) and rid > upto_id:
+                break
+            if not _is_int(rid):
+                continue
+        if not stored_prev or not stored_hash:
+            return False, rid, None
+        if stored_prev != prev:
+            return False, rid, None
+        if _digest(prev, canonical) != stored_hash:
+            return False, rid, None
+        prev = stored_hash
+        count += 1
+        if _is_int(rid):
+            max_id = rid
+    return True, None, (max_id, prev, count)
+
+
+def _refresh_verified_head(store, head):
+    """Record a successful walk in the chain-verified head cache.
+
+    Never regresses a fuller cache, and never fails the verification
+    that produced the head: the cache is an optimization for the
+    hook-path gate check, so bookkeeping errors are swallowed
+    (round-5 fix spec, pinned interfaces).
+    """
+    get = getattr(store, "get_chain_verified_head", None)
+    set_head = getattr(store, "set_chain_verified_head", None)
+    if not callable(get) or not callable(set_head):
+        return
+    try:
+        max_id, head_hash, row_count = head
+        cached = get()
+        if cached is not None:
+            if cached[0] > max_id:
+                return
+            if tuple(cached) == (max_id, head_hash, row_count):
+                return
+        set_head(max_id, head_hash, row_count)
+    except Exception:  # noqa: BLE001 - the cache must never break a walk
+        pass
+
+
 def verify_chain(store, upto_id=None):
-    """Recompute the chain from genesis.
+    """Recompute the chain from genesis — the FULL walk.
 
     Returns ``(True, None)`` when every row in scope seals, else
     ``(False, first_bad_id)`` — the id of the first row whose stored
@@ -238,30 +437,165 @@ def verify_chain(store, upto_id=None):
     ``id <= upto_id`` are in scope (prefix verification — a certificate
     verifies the book as it stood at issuance, tightening spec T4).
 
-    The walk stops AT the bound: rows arrive in id order, so the first
-    row past ``upto_id`` ends the scan instead of the whole book being
-    walked (round-4 fix spec G3). Seam: the store API
-    (``Store.ledger_rows``) still materializes every row before this
-    walk sees them — pushing the bound into that query is state.py's
-    side of G3; chain.py never consumes past the bound.
+    Rows come from the raw-tuple path when the store offers it
+    (``ledger_rows_raw``; round-5 fix spec H3) and from dict rows
+    otherwise; the two sources produce identical verdicts (pinned by
+    the equivalence tests). A successful walk refreshes the store's
+    chain-verified head cache — the cache the hook-path
+    :func:`verify_chain_cached` trusts. Operator surfaces use this
+    walk, never the cached check.
     """
-    prev = GENESIS_HASH
-    for row in store.ledger_rows():
-        if upto_id is not None:
-            rid = row.get("id")
-            if _is_int(rid) and rid > upto_id:
-                break
-            if not _is_int(rid):
-                continue
-        stored_prev = row.get("prev_hash")
-        stored_hash = row.get("row_hash")
+    ok, bad, head = _walk_records(_chain_records(store), upto_id)
+    if ok:
+        _refresh_verified_head(store, head)
+    return ok, bad
+
+
+def _head_snapshot(store, max_id):
+    """``(row_count, head_row, predecessor_hash)`` for ``id <= max_id``.
+
+    The head row is the one with the largest id in scope, as a dict;
+    ``predecessor_hash`` is the stored ``row_hash`` of the row before
+    it (genesis when the head is the first row, or when the scope is
+    empty). SQL through the store's connection when it exposes one,
+    else the rows walk. Returns None only when neither source works.
+    """
+    conn = getattr(store, "_conn", None)
+    if conn is not None:
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM ledger WHERE id<=?",
+                (max_id,)).fetchone()[0]
+            rows = conn.execute(
+                "SELECT * FROM ledger WHERE id<=?"
+                " ORDER BY id DESC LIMIT 2", (max_id,)).fetchall()
+            if not rows:
+                return count, None, GENESIS_HASH
+            head = {key: rows[0][key] for key in rows[0].keys()}
+            pred = rows[1]["row_hash"] if len(rows) > 1 else GENESIS_HASH
+            return count, head, pred
+        except Exception:  # noqa: BLE001 - fall back to the rows walk
+            pass
+    try:
+        rows = store.ledger_rows()
+    except Exception:  # noqa: BLE001 - no source at all
+        return None
+    scoped = [
+        row for row in rows
+        if _is_int(row.get("id")) and row["id"] <= max_id
+    ]
+    if not scoped:
+        return len(scoped), None, GENESIS_HASH
+    head = scoped[-1]
+    pred = scoped[-2]["row_hash"] if len(scoped) > 1 else GENESIS_HASH
+    return len(scoped), head, pred
+
+
+def _suffix_records(store, after_id):
+    """Walk records for rows with ``id > after_id``, in id order.
+
+    SQL through the store's connection when it exposes one (so the
+    cached check does not materialize the verified prefix), else the
+    cheapest confirmed row source, filtered.
+    """
+    conn = getattr(store, "_conn", None)
+    if conn is not None:
+        try:
+            cursor = conn.execute(
+                "SELECT * FROM ledger WHERE id>? ORDER BY id ASC",
+                (after_id,))
+            cols = [col[0] for col in cursor.description]
+            records = []
+            for raw in cursor.fetchall():
+                row = dict(zip(cols, raw))
+                records.append((
+                    row.get("id"), row.get("prev_hash"),
+                    row.get("row_hash"), canonical_row(row)))
+            return records
+        except Exception:  # noqa: BLE001 - fall back to the row source
+            pass
+    return [
+        record for record in _chain_records(store)
+        if _is_int(record[0]) and record[0] > after_id
+    ]
+
+
+def verify_chain_cached(store):
+    """The cache-aware gate check: suffix verification from the
+    chain-verified head cache.
+
+    Returns ``(True, None)`` / ``(False, first_bad_id)`` like
+    :func:`verify_chain`, but it is NOT a full verification — the
+    split is documented in the module docstring and matters: the
+    cached prefix's interior is trusted from the full walk that
+    wrote the cache; this check confirms the head row still
+    recomputes and links and that the row count at/below it is
+    unchanged, then verifies only the rows after the head. Any
+    doubt — no cache, a malformed cache, the head moved or fails to
+    recompute, the count changed, the first suffix row does not
+    link to the cached head — falls back to the full walk and
+    returns ITS verdict. A successful suffix walk extends the
+    cache to the new head. This is the hook path's check; operator
+    surfaces use :func:`verify_chain`.
+    """
+    get = getattr(store, "get_chain_verified_head", None)
+    cache = None
+    if callable(get):
+        try:
+            cache = get()
+        except Exception:  # noqa: BLE001 - a broken cache is no cache
+            cache = None
+    if not cache:
+        return verify_chain(store)
+    try:
+        max_id, head_hash, row_count = cache
+    except (TypeError, ValueError):
+        return verify_chain(store)
+    if (
+        not _is_int(max_id)
+        or not _is_int(row_count)
+        or not isinstance(head_hash, str)
+    ):
+        return verify_chain(store)
+    snapshot = _head_snapshot(store, max_id)
+    if snapshot is None:
+        return verify_chain(store)
+    count, head_row, pred_hash = snapshot
+    if count != row_count:
+        return verify_chain(store)
+    if max_id == 0:
+        if head_row is not None:
+            return verify_chain(store)
+        prev = GENESIS_HASH
+    else:
+        if head_row is None or head_row.get("id") != max_id:
+            return verify_chain(store)
+        if head_row.get("row_hash") != head_hash:
+            return verify_chain(store)
+        if head_row.get("prev_hash") != pred_hash:
+            return verify_chain(store)
+        if row_hash(pred_hash, head_row) != head_hash:
+            return verify_chain(store)
+        prev = head_hash
+    verified = row_count
+    last_id = max_id
+    for rid, stored_prev, stored_hash, canonical in _suffix_records(
+        store, max_id
+    ):
         if not stored_prev or not stored_hash:
-            return False, row.get("id")
+            return False, rid
         if stored_prev != prev:
-            return False, row.get("id")
-        if row_hash(prev, row) != stored_hash:
-            return False, row.get("id")
+            # The suffix does not link to the spot-checked head: the
+            # book changed in a way the spot check cannot localize —
+            # get the exact answer from the full walk.
+            return verify_chain(store)
+        if _digest(prev, canonical) != stored_hash:
+            return False, rid
         prev = stored_hash
+        verified += 1
+        if _is_int(rid):
+            last_id = rid
+    _refresh_verified_head(store, (last_id, prev, verified))
     return True, None
 
 
@@ -538,8 +872,45 @@ def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _sql_scalar(store, sql, params=()):
+    """One scalar via the store's connection, or None when the store
+    exposes no usable connection (round-5 fix spec H3: the one-row
+    questions below are indexed lookups on the real store — the
+    round-5 performance audit measured the whole-book walks they
+    replace at ~1.95 s per call on a 200k-row book, against 0.0001 s
+    for the indexed query). A query that fails also yields None:
+    callers fall back to the rows walk, whose answer is the
+    reference."""
+    conn = getattr(store, "_conn", None)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(sql, params).fetchone()
+    except Exception:  # noqa: BLE001 - fall back to the rows walk
+        return None
+    if row is None:
+        return None
+    return row[0]
+
+
 def _chain_head(store, contract_id, upto_id=None):
     """The row_hash of the contract's last ledger row in scope, or None."""
+    if upto_id is None:
+        head = _sql_scalar(
+            store,
+            "SELECT row_hash FROM ledger WHERE contract_id=?"
+            " ORDER BY id DESC LIMIT 1",
+            (contract_id,))
+        if head is not None:
+            return head
+    else:
+        head = _sql_scalar(
+            store,
+            "SELECT row_hash FROM ledger WHERE contract_id=?"
+            " AND id<=? ORDER BY id DESC LIMIT 1",
+            (contract_id, upto_id))
+        if head is not None:
+            return head
     head = None
     for row in store.ledger_rows():
         if not isinstance(row, dict):
@@ -556,6 +927,12 @@ def _chain_head(store, contract_id, upto_id=None):
 
 def _ledger_upto(store, contract_id) -> int:
     """The contract's high-water mark: its max ledger id (0 when none)."""
+    top = _sql_scalar(
+        store,
+        "SELECT MAX(id) FROM ledger WHERE contract_id=?",
+        (contract_id,))
+    if top is not None:
+        return int(top)
     upto = 0
     for row in store.ledger_rows():
         if not isinstance(row, dict):
@@ -571,10 +948,16 @@ def _ledger_upto(store, contract_id) -> int:
 def _book_max_ledger_id(store) -> int:
     """The whole book's high-water mark: its max ledger id (0 if empty).
 
-    Used in verify failure reasons so an operator can see at a glance
-    whether their book is simply BEHIND the certificate's prefix or
-    genuinely diverges from it (round-4 upgrade F4).
+    Used ONLY when phrasing a verify failure reason, so an operator
+    can see at a glance whether their book is simply BEHIND the
+    certificate's prefix or genuinely diverges from it (round-4
+    upgrade F4) — it is computed lazily, at the moment a reason is
+    being built, never on a successful verify (round-5 fix spec H3;
+    round-5 performance findings).
     """
+    top = _sql_scalar(store, "SELECT MAX(id) FROM ledger")
+    if top is not None:
+        return int(top)
     top = 0
     for row in store.ledger_rows():
         if not isinstance(row, dict):
@@ -583,6 +966,58 @@ def _book_max_ledger_id(store) -> int:
         if _is_int(rid) and rid > top:
             top = rid
     return top
+
+
+#: Contract statuses that mean the run completed (the loop sets
+#: exactly this one on the approval path, alongside the final answer).
+_TERMINAL_COMPLETED_STATUSES = frozenset({"completed"})
+
+
+def _contract_completed(store, contract_id) -> bool:
+    """Whether the contract's run COMPLETED (round-5 fix spec H1;
+    round-5 gate-core F2).
+
+    Completed means a ``final_answers`` row exists for the contract,
+    or the contract's status is a terminal completed status. The
+    verdict row alone is NOT completion: under claim-first gating
+    the verdict records the decision before the merge and the final
+    answer exist, so a claimed-but-uncompleted gate used to mint a
+    verifying certificate for an answer that never landed.
+
+    Surfaces, in order: the store's connection (the real Store has
+    no final-answer getter, so the lookup is SQL), then
+    ``get_contract`` for the status. A duck-typed store exposing NO
+    completion surface at all — no connection and no
+    ``get_contract`` — degrades to the pre-fix behavior (issuance
+    proceeds): such stores are test doubles whose verdict rows are
+    their whole world, and the completion question cannot even be
+    expressed there. The real Store exposes both surfaces, so
+    production issuance is always gated.
+    """
+    surface = False
+    conn = getattr(store, "_conn", None)
+    if conn is not None:
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM final_answers WHERE contract_id=?"
+                " LIMIT 1", (contract_id,)).fetchone()
+            surface = True
+            if row is not None:
+                return True
+        except Exception:  # noqa: BLE001 - try the status surface
+            pass
+    get_contract = getattr(store, "get_contract", None)
+    if callable(get_contract):
+        surface = True
+        try:
+            contract = get_contract(contract_id)
+        except Exception:  # noqa: BLE001 - unprovable is not completed
+            return False
+        return (
+            isinstance(contract, dict)
+            and contract.get("status") in _TERMINAL_COMPLETED_STATUSES
+        )
+    return not surface
 
 
 def issue_certificate(store, contract_id):
@@ -599,15 +1034,24 @@ def issue_certificate(store, contract_id):
     None when the run's token total is fractional — a pre-validation
     book can hold fractional counts, and the payload shape requires an
     int, so minting would produce a token verify calls malformed
-    (round-3 regression F5). Also None when the store's certificate
-    key cannot be persisted (:class:`CertificateKeyError`): no
-    certificate beats one that can never verify. Returns
-    ``{"stamp", "cert", "payload"}``. The payload's ``issued_at`` is
-    the verdict row's own timestamp, so the same run renders the same
-    token every time. The payload also seals the verdict's gate
-    outcome — ``measured`` and ``waived`` — so a winner that failed
-    the measured gate and merged only by human waiver is
-    distinguishable from a clean pass (round-4 regression F3).
+    (round-3 regression F5). Also None when the run never COMPLETED
+    — no final answer, no terminal completed status (round-5 fix
+    spec H1; round-5 gate-core F2: issuance used to read only the
+    verdict row, which claim-first gating flips at claim time, so a
+    claimed-but-unmerged gate certified an answer that never
+    landed). Also None when the chain prefix the certificate would
+    seal does not verify (round-5 fix spec H2; round-5 attack F2:
+    the verdict report minted a fresh stamp and token over a
+    mid-book-tampered store because issuance never consulted the
+    chain). Also None when the store's certificate key cannot be
+    persisted (:class:`CertificateKeyError`): no certificate beats
+    one that can never verify. Returns ``{"stamp", "cert",
+    "payload"}``. The payload's ``issued_at`` is the verdict row's
+    own timestamp, so the same run renders the same token every time.
+    The payload also seals the verdict's gate outcome — ``measured``
+    and ``waived`` — so a winner that failed the measured gate and
+    merged only by human waiver is distinguishable from a clean pass
+    (round-4 regression F3).
     """
     verdict = store.latest_verdict(contract_id)
     if verdict is None or verdict.get("winner") is None:
@@ -621,6 +1065,11 @@ def issue_certificate(store, contract_id):
     if totals["cost_rows"] + totals["cost_missing"] < 1:
         return None
     if totals["tokens"] is not None and not _is_int(totals["tokens"]):
+        return None
+    if not _contract_completed(store, contract_id):
+        return None
+    prefix_ok, _bad = verify_chain(store, upto_id=upto)
+    if not prefix_ok:
         return None
     payload = {
         "contract_id": contract_id,
@@ -717,6 +1166,38 @@ def _named_verdict(store, contract_id, verdict_id):
     return None
 
 
+def _totals_mismatch_reason(store, upto, what, seals, counts):
+    """The figured reason for a certificate/store totals mismatch.
+
+    Built LAZILY — only when a mismatch has already been found —
+    because phrasing it needs the whole book's high-water mark, a
+    one-row question that must not run on a successful verify
+    (round-5 fix spec H3; round-5 performance findings). When the
+    book's max id is BELOW the certificate's sealed prefix, the
+    reason says rows are missing outright — the book behind the
+    certificate — instead of the bare mismatch wording that made a
+    truncated restore indistinguishable from a divergent one
+    (round-5 fix spec H6). Otherwise the wording is the format the
+    earlier rounds established, unchanged.
+    """
+    book_max = _book_max_ledger_id(store)
+    scope = (
+        f"certificate covers ledger rows up to {upto}; "
+        f"this book's ledger runs to row {book_max}"
+    )
+    if book_max < upto:
+        return (
+            f"run totals do not match the ledger ({what}): "
+            f"certificate seals {seals}, this book counts {counts}"
+            f" — rows are missing: {scope}, so the book is behind"
+            " the certificate (a truncated or older restore?)"
+        )
+    return (
+        f"run totals do not match the ledger ({what}): certificate "
+        f"seals {seals}, this book counts {counts} ({scope})"
+    )
+
+
 def verify_certificate(store, token):
     """Verify a certificate token against this store.
 
@@ -807,25 +1288,16 @@ def verify_certificate(store, token):
     if not ok:
         return False, f"ledger chain broken at row {bad_id}"
     totals = run_totals(store, contract_id, upto_id=upto)
-    scope = (
-        f"certificate covers ledger rows up to {upto}; "
-        f"this book's ledger runs to row {_book_max_ledger_id(store)}"
-    )
     if payload["tokens"] != totals["tokens"]:
-        return False, (
-            "run totals do not match the ledger (tokens): certificate "
-            f"seals {payload['tokens']}, this book counts "
-            f"{totals['tokens']} ({scope})"
-        )
+        return False, _totals_mismatch_reason(
+            store, upto, "tokens", payload["tokens"], totals["tokens"])
     cost = payload["cost_usd"]
     actual_cost = totals["cost_usd"]
     if (cost is None) != (actual_cost is None) or (
         cost is not None and abs(float(cost) - float(actual_cost)) > 1e-9
     ):
-        return False, (
-            "run totals do not match the ledger (cost_usd): certificate "
-            f"seals {cost}, this book counts {actual_cost} ({scope})"
-        )
+        return False, _totals_mismatch_reason(
+            store, upto, "cost_usd", cost, actual_cost)
     if payload["chain_head"] != _chain_head(store, contract_id, upto_id=upto):
         return False, "chain head does not match the ledger"
     current_tier = tier_for(lifetime_spend(store))

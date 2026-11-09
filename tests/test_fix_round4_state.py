@@ -452,7 +452,7 @@ class TestClaimHumanGate(unittest.TestCase):
         finally:
             store.close()
 
-    def test_claim_race_across_processes_has_one_winner(self):
+    def test_claim_race_two_instances_in_process_has_one_winner(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "data.db"
             store = Store(db_path)
