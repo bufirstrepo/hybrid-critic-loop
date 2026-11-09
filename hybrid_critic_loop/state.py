@@ -464,6 +464,13 @@ class Store:
             # until a successful clear or seed resets it. chain.py
             # owns the flag's transitions; it is initialised here so
             # the attribute always exists on a real Store.
+            # Round-8 fix spec L3 (round-8 attack F3): the flag is
+            # only this instance's fast path — the CONTRACT is the
+            # durable record in store_meta (see
+            # mark_chain_cache_untrusted / chain_cache_untrusted),
+            # which every instance opening the file checks, because
+            # the hook the distrust protects is itself a fresh
+            # process per firing.
             self._chain_cache_untrusted = False
             self._backfill_chain()
         except sqlite3.OperationalError as exc:
@@ -609,7 +616,12 @@ class Store:
           header field any raw writer can roll back, so a flagged
           current book with its flag reset is treated as what it is
           (a current book with an unsealed append) and its suffix
-          seals as "repair" instead.
+          seals as "repair" instead. Round-8 fix spec L2 (round-8
+          attack F2): the requirement widens to ANY recognised seal
+          — a prefix sealed entirely under a historical form (the
+          legacy digest) disqualifies the route too; only a book no
+          seal of any form contradicts (genuine pre-chain rows carry
+          row_hash NULL throughout) still backfills.
         - Flagged store: an unsealed SUFFIX — rows after the last hashed
           row, the legacy-writer append case — is sealed with
           ``sealed_via="repair"``.
@@ -702,12 +714,17 @@ class Store:
         prev_new = _chain.GENESIS_HASH    # new-form chain value
         resealing = False
         changed = False
-        # Round-7 fix spec K4 (round-7 attack F2): whether any row
-        # already carries a CURRENT-form seal. Tracked across the
-        # prefix validation because it decides the suffix's seal
-        # route below: a book with a current-form seal in it is not
-        # pre-chain, whatever PRAGMA user_version claims.
-        has_current_seal = False
+        # Round-7 fix spec K4 (round-7 attack F2), widened by
+        # round-8 fix spec L2 (round-8 attack F2): whether any row
+        # already carries a RECOGNISED seal — its stored hash
+        # matching any canonical form in _row_variants. Tracked
+        # across the prefix validation because it decides the
+        # suffix's seal route below: a book with a recognised seal
+        # in it is not pre-chain, whatever PRAGMA user_version
+        # claims. K4 counted only current-form seals; an entirely
+        # historical (legacy-digest) prefix slipped past it and a
+        # laundering suffix still sealed as "backfill".
+        has_recognised_seal = False
         for row in prefix:
             entry = self._ledger_dict(row)
             stored_prev = _col(row, "prev_hash")
@@ -718,7 +735,7 @@ class Store:
             variants = _row_variants(stored_prev, entry)
             form_converted = False
             if variants["current"] == stored:
-                has_current_seal = True
+                has_recognised_seal = True
                 if not resealing:
                     prev = stored
                     prev_new = stored
@@ -727,6 +744,11 @@ class Store:
                 # changed, so it re-seals too (fall through).
             elif (variants["pre_sealed_via"] == stored
                     or variants["legacy"] == stored):
+                # A historical-form seal is still a seal (round-8
+                # fix spec L2): it proves the book lived in a sealed
+                # era, so it disqualifies the backfill route exactly
+                # as a current-form seal does.
+                has_recognised_seal = True
                 resealing = True
                 form_converted = True
             else:
@@ -777,21 +799,30 @@ class Store:
             # corruption. Leave the book exactly as found.
             self._conn.rollback()
             return
-        # Round-7 fix spec K4 (round-7 attack F2): the "backfill"
+        # Round-7 fix spec K4 (round-7 attack F2), widened by
+        # round-8 fix spec L2 (round-8 attack F2): the "backfill"
         # route — whose seal exempts a legacy-import row from the
         # totals' referential leg (round-6 J4) — is granted only to
-        # a book no current-form seal contradicts. user_version is
+        # a book no recognised seal contradicts. user_version is
         # a database-header field any raw writer can roll back to 0,
         # and round 6's route decision rested on that flag alone: a
         # healthy current book, flag reset, one raw NULL-provenance
         # append, reopen — the append sealed as "backfill" and
-        # counted $2M unbacked. A genuine pre-chain book has NO
-        # current-form seals (pre-chain code sealed nothing), so a
-        # sealed prefix behind the append proves the era claim
-        # false: the suffix is a post-hoc append and seals as
-        # "repair", exactly as on a flagged store. The version flag
-        # itself still advances whenever it was behind, as before.
-        backfill_route = pre_chain and not has_current_seal
+        # counted $2M unbacked. K4's seal test counted only the
+        # current form, so the same construction over a prefix
+        # sealed entirely under the LEGACY digest still routed to
+        # "backfill" and counted $2M more. A genuine pre-chain book
+        # has NO seals of any form (pre-chain code sealed nothing),
+        # so a sealed prefix behind the append — current-form or
+        # historical — proves the era claim false: the suffix is a
+        # post-hoc append and seals as "repair", exactly as on a
+        # flagged store. A genuine historical book's own rows are
+        # untouched by this: they count through the cascade and the
+        # exemption as before; only suffix rows that could count
+        # SOLELY via the backfill exemption lose it. The version
+        # flag itself still advances whenever it was behind, as
+        # before.
+        backfill_route = pre_chain and not has_recognised_seal
         sealed_via = "backfill" if backfill_route else "repair"
         for row in suffix:
             entry = self._ledger_dict(row)
@@ -1873,14 +1904,16 @@ class Store:
         returning, like every store write.
 
         A successful seed also clears this instance's cache-distrust
-        flag (round-7 fix spec K7): the cache now holds a head a
-        full verification just produced, so chain.verify_chain_cached
-        may trust it again."""
+        flag (round-7 fix spec K7) and any durable distrust record
+        (round-8 fix spec L3), in the same commit: the cache now
+        holds a head a full verification just produced, so
+        chain.verify_chain_cached may trust it again, on any
+        instance."""
         self._meta_set("chain_verified_max_id", str(int(max_id)))
         self._meta_set("chain_verified_head_hash", str(head_hash))
         self._meta_set("chain_verified_row_count", str(int(row_count)))
+        self._drop_chain_cache_untrusted()
         self._conn.commit()
-        self._chain_cache_untrusted = False
 
     def clear_chain_verified_head(self):
         """Drop the chain-verified head cache entirely (round-6 fix
@@ -1895,17 +1928,71 @@ class Store:
         before returning, like every store write.
 
         A successful clear also resets this instance's
-        cache-distrust flag (round-7 fix spec K7) — the flag exists
-        for the case where THIS method is the thing that fails: if
-        the DELETE raises, the flag stays set (chain.py sets it on
-        the failure path) and the cached check keeps full-walking.
+        cache-distrust flag (round-7 fix spec K7) and removes any
+        durable distrust record (round-8 fix spec L3) — the flag
+        exists for the case where THIS method is the thing that
+        fails: if the DELETE raises, the distrust stays recorded
+        (chain.py records it on the failure path, durably) and the
+        cached check keeps full-walking, on every instance, until
+        some clear or seed succeeds.
         """
         self._conn.execute(
             "DELETE FROM store_meta WHERE key IN"
             " ('chain_verified_max_id', 'chain_verified_head_hash',"
-            " 'chain_verified_row_count')")
+            " 'chain_verified_row_count', 'chain_cache_untrusted')")
         self._conn.commit()
         self._chain_cache_untrusted = False
+
+    # -- durable cache distrust (round-8 fix spec L3) ---------------------
+
+    def _drop_chain_cache_untrusted(self):
+        """Remove the durable cache-distrust record and reset this
+        instance's flag, WITHOUT committing — the caller folds the
+        removal into its own commit (a seed or a clear landing in
+        the same transaction as the state that justifies it)."""
+        self._conn.execute(
+            "DELETE FROM store_meta WHERE key='chain_cache_untrusted'")
+        self._chain_cache_untrusted = False
+
+    def mark_chain_cache_untrusted(self):
+        """Record, DURABLY, that the chain-verified head cache must
+        not be trusted (round-8 fix spec L3; round-8 attack F3).
+
+        Round-7's K7 kept the distrust on the store instance only,
+        so a fresh Store on the same file — the hook is a fresh
+        process per firing — trusted the stale cache the failed
+        clear had left behind and printed the doctored tier. The
+        record now lives in store_meta (``chain_cache_untrusted``),
+        committed before returning, where every instance's cached
+        verification checks it before trusting the cache
+        (:meth:`chain_cache_untrusted`). A successful clear, seed,
+        or full-walk verification removes it. Called by chain.py on
+        the failed-clear path; the instance flag is set alongside
+        as this instance's fast path.
+        """
+        self._chain_cache_untrusted = True
+        self._meta_set("chain_cache_untrusted", "1")
+        self._conn.commit()
+
+    def chain_cache_untrusted(self):
+        """Whether the chain-verified head cache must be distrusted:
+        this instance's flag (round-7 fix spec K7) OR the durable
+        record any instance may have left in store_meta (round-8
+        fix spec L3). chain.verify_chain_cached consults this —
+        never the flag alone — before trusting the cache."""
+        if self._chain_cache_untrusted:
+            return True
+        return self._meta_get("chain_cache_untrusted") is not None
+
+    def clear_chain_cache_untrusted(self):
+        """Remove the durable cache-distrust record, committed
+        (round-8 fix spec L3): a successful clear, seed, or
+        full-walk verification just re-established what the cache
+        holds, so the distrust every instance was honouring ends.
+        chain.py calls this on its trust-restoring paths that do
+        not themselves write the store."""
+        self._drop_chain_cache_untrusted()
+        self._conn.commit()
 
     @staticmethod
     def _ledger_dict(row):

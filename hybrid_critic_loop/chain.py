@@ -419,31 +419,73 @@ def _walk_records(records, upto_id=None):
 
 
 def _mark_cache_untrusted(store):
-    """Record a failed cache clear on the store instance (round-7
-    fix spec K7; round-7 attack F4).
+    """Record a failed cache clear as cache distrust (round-7 fix
+    spec K7; round-7 attack F4), durably (round-8 fix spec L3;
+    round-8 attack F3).
 
-    ``store._chain_cache_untrusted`` is the marker
-    :func:`verify_chain_cached` reads: while it stands, the cached
-    check distrusts the on-disk cache — which a proven break may
-    have left behind, because the delete that was supposed to drop
-    it just failed — and falls back to the full walk. Best-effort,
-    like every cache interaction: a store that refuses attributes
-    simply keeps the pre-K7 behavior.
+    ``store._chain_cache_untrusted`` is the per-instance marker:
+    while it stands, the cached check distrusts the on-disk cache —
+    which a proven break may have left behind, because the delete
+    that was supposed to drop it just failed — and falls back to
+    the full walk. K7's marker died with the instance, though, and
+    the hook the distrust protects is a fresh process per firing:
+    a fresh instance trusted the stale cache all over again. The
+    store's own durable record (``Store.mark_chain_cache_untrusted``,
+    a store_meta row) is therefore the contract — every instance's
+    cached verification checks it before trusting the cache — and
+    the instance flag remains as a fast path. Best-effort, like
+    every cache interaction: a store that refuses attributes
+    simply keeps the pre-K7 behavior, and a durable write that
+    itself fails leaves the instance flag as the only trace.
     """
     try:
         store._chain_cache_untrusted = True
     except Exception:  # noqa: BLE001 - the cache must never break a walk
         pass
+    mark = getattr(store, "mark_chain_cache_untrusted", None)
+    if callable(mark):
+        try:
+            mark()
+        except Exception:  # noqa: BLE001 - the cache must never break a walk
+            pass
 
 
 def _mark_cache_trusted(store):
-    """Clear the cache-distrust marker (round-7 fix spec K7): a
-    clear or a seed just succeeded, so the cache's state is known
-    again and the cached check may trust it."""
+    """Clear the cache-distrust marker (round-7 fix spec K7) and
+    its durable record (round-8 fix spec L3): a clear or a seed
+    just succeeded, so the cache's state is known again and the
+    cached check may trust it — on this instance and every other.
+    (The store's own seed/clear methods remove the durable record
+    in their own commits; this covers the trust-restoring paths
+    that write nothing themselves, e.g. a walk whose head the
+    cache already holds.)"""
     try:
         store._chain_cache_untrusted = False
     except Exception:  # noqa: BLE001 - the cache must never break a walk
         pass
+    clear = getattr(store, "clear_chain_cache_untrusted", None)
+    if callable(clear):
+        try:
+            clear()
+        except Exception:  # noqa: BLE001 - the cache must never break a walk
+            pass
+
+
+def _cache_distrusted(store):
+    """Whether the verified-head cache must not be trusted for the
+    cached check: this instance's marker (round-7 fix spec K7) or
+    the durable record any instance left in the store's meta
+    (round-8 fix spec L3, :func:`_mark_cache_untrusted`). A store
+    that answers neither keeps the pre-K7 behavior."""
+    if getattr(store, "_chain_cache_untrusted", False):
+        return True
+    check = getattr(store, "chain_cache_untrusted", None)
+    if callable(check):
+        try:
+            return bool(check())
+        except Exception:  # noqa: BLE001 - the cache must never break a walk
+            return False
+    return False
 
 
 def _refresh_verified_head(store, head):
@@ -504,6 +546,12 @@ def _clear_verified_head(store):
     instance until a successful clear or seed. The verdict is still
     never masked; what changed is that the failure is no longer
     invisible to the one instance that knows about it.
+
+    Round-8 fix spec L3 (round-8 attack F3): the record is DURABLE
+    — it lives in the store's own meta, so a fresh instance (the
+    hook is a fresh process per firing) honours the distrust too,
+    until a successful clear, seed, or full-walk verification
+    removes it.
     """
     clear = getattr(store, "clear_chain_verified_head", None)
     if not callable(clear):
@@ -537,8 +585,9 @@ def verify_chain(store, upto_id=None):
     followed by a cached pass. If the delete itself fails, the
     failure is recorded on the store instance and the cached check
     distrusts the cache until a successful clear or seed
-    (round-7 fix spec K7). Operator surfaces use this walk,
-    never the cached check.
+    (round-7 fix spec K7) — durably, in the store's own meta, so
+    fresh instances honour the distrust too (round-8 fix spec L3).
+    Operator surfaces use this walk, never the cached check.
     """
     ok, bad, head = _walk_records(_chain_records(store, upto_id), upto_id)
     if ok:
@@ -635,13 +684,16 @@ def _verify_chain_cached_detail(store):
     full walk produced the verdict (``head_id`` is None then).
 
     Round-7 fix spec K7 (round-7 attack F4): while the store
-    instance carries the cache-distrust marker — a failed walk's
-    attempt to delete the cache itself failed, so the on-disk
-    cache may be the stale head a proven break left behind — the
-    cache is not consulted at all: the full walk answers, until a
-    successful clear or seed clears the marker.
+    carries the cache-distrust marker — a failed walk's attempt to
+    delete the cache itself failed, so the on-disk cache may be
+    the stale head a proven break left behind — the cache is not
+    consulted at all: the full walk answers, until a successful
+    clear or seed clears the marker. Round-8 fix spec L3
+    (round-8 attack F3): the marker is durable — the check reads
+    the store's meta record, not only this instance's flag — so a
+    fresh instance honours a distrust recorded before it opened.
     """
-    if getattr(store, "_chain_cache_untrusted", False):
+    if _cache_distrusted(store):
         return _full_walk_outcome(store)
     get = getattr(store, "get_chain_verified_head", None)
     cache = None
