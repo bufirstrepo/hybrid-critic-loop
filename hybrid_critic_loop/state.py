@@ -220,6 +220,13 @@ CREATE INDEX IF NOT EXISTS idx_ledger_expert_id
     ON ledger (expert_id);
 CREATE INDEX IF NOT EXISTS idx_verdicts_contract_id
     ON verdicts (contract_id);
+-- Round-10 fix spec N3 (lane-6 latent perf): candidates_for filters
+-- on (contract_id, attempt) but candidates had no index, so every
+-- per-verdict read full-scanned the table (~0.09 µs/row, growing
+-- with the book). Same executescript path, so pre-existing books
+-- gain it on open too.
+CREATE INDEX IF NOT EXISTS idx_candidates_contract_attempt
+    ON candidates (contract_id, attempt);
 -- Store meta (round-5 fix spec, pinned interfaces): key/value rows
 -- for facts about the book itself. First tenant: the chain-verified
 -- head cache (chain.verify_chain records the head it last verified

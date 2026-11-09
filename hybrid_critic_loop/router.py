@@ -247,6 +247,18 @@ def apply_lesson_route_change(store, category, route_change, contract_id,
         branch = None
     new_primary = (new_route or {}).get("primary", primary)
     new_compete = (new_route or {}).get("compete_with", compete_with)
+    new_fallback = (new_route or {}).get("fallback") or []
+    # Round-10 fix N4 (lane-4 F-R10-1): the store's defect-2 guard
+    # repairing a legacy route whose primary == compete_with is a
+    # real change the branch templates below misreport — the vacated
+    # duplicate is the one thing that moved, whatever the demotee's
+    # own landing was. Detect it from the before/after routes: the
+    # route entered the call with one expert in both top slots and
+    # left it with the compete seat empty.
+    guard_repaired = (
+        primary is not None and primary == compete_with
+        and new_compete is None
+    )
 
     if not changed:
         if passed is not None and branch in (
@@ -291,11 +303,30 @@ def apply_lesson_route_change(store, category, route_change, contract_id,
         # Round-9 fix M4: a seat displaced to the fallback by the
         # promotion is part of what happened; the record says so.
         note += f"; {displaced_actual} displaced to the fallback order"
+    if guard_repaired:
+        # Round-10 fix N4: the guard's repair is part of what
+        # happened too — without it the record and the stored route
+        # disagree about where the demotee sits.
+        note += "; duplicate compete seat vacated"
     _record_route_ledger(store, demote, contract_id, note)
 
     if promoted_actual:
         line = (
             f"Route for {category}: demoted {demote}, promoted {promoted_actual} "
+            f"(primary is now {new_primary})"
+        )
+    elif guard_repaired and demote == new_primary:
+        # Round-10 fix N4 (lane-4 F-R10-1): the demotee held BOTH
+        # top slots on a legacy route (primary == compete_with, a
+        # shape upsert_route can no longer write). The demotion
+        # moved nothing of the demotee — the guard vacated the
+        # duplicated compete seat and the demotee remains primary.
+        # The old else template called this a fallback landing; the
+        # demotee is not in the fallback at all.
+        line = (
+            f"Route for {category}: demoted {demote} — {demote} held "
+            f"the primary and compete seats; the duplicate compete "
+            f"seat was vacated and {demote} remains primary "
             f"(primary is now {new_primary})"
         )
     elif demote == new_compete:
@@ -307,6 +338,16 @@ def apply_lesson_route_change(store, category, route_change, contract_id,
             f"Route for {category}: demoted {demote} to the compete seat "
             f"(primary is now {new_primary})"
         )
+    elif guard_repaired and demote not in new_fallback:
+        # Round-10 fix N4, sibling shape: the demotee holds no route
+        # position at all (the store's "none" branch) and the ONLY
+        # change is the same duplicate repair — the old template
+        # claimed a fallback landing for an unseated expert.
+        line = (
+            f"Route for {category}: demoted {demote} — {demote} holds "
+            f"no route position; the duplicate compete seat was "
+            f"vacated (primary is now {new_primary})"
+        )
     else:
         line = (
             f"Route for {category}: demoted {demote} within the fallback order "
@@ -314,6 +355,11 @@ def apply_lesson_route_change(store, category, route_change, contract_id,
         )
     if displaced_actual:
         line += f"; {displaced_actual} moved to the fallback order"
+    if guard_repaired and demote in new_fallback:
+        # A fallback demotee on a duplicated-top route: the fallback
+        # landing claimed above is true, and the repair happened
+        # behind it — the line names both (round-10 fix N4).
+        line += "; duplicate compete seat vacated"
     return f"{line} — {reason} (contract {contract_id})"
 
 
