@@ -63,38 +63,38 @@ _FREE_TEXT_CAP = 200
 def _declared_metrics(contract):
     """Metric names the contract itself declares in its acceptance.
 
-    Measured acceptance items carry ``metrics: [{"name": ...}, ...]``
-    (contracts.py normalization); a dict-shaped acceptance may carry a
-    top-level ``metrics`` list.  Collected defensively — the charset
-    rule in sanitize_metric_name is the gate; this set is the
-    operator's own declarations on top of it.
+    Collected ONLY from the shape contracts.validate_contract
+    accepts — the post-normalization measured item:
+    ``acceptance`` is a list of dicts, and a measured item carries
+    ``metrics: [{"name": ...}, ...]`` (round-7 fix spec K8;
+    round-7 security F4).  This collector used to also read shapes
+    the validator never parses — a ``"metric"`` key beside or
+    instead of ``"name"``, string entries in the metrics list, an
+    item-level ``"metric"``, and dict-form acceptance with its own
+    ``metrics``/``items`` — and sanitize_metric_name's declared
+    shortcut returns a set member verbatim, so the wider collector
+    silently widened what the sanitizer trusts.  run_contract
+    performs no validation, so a raw contract dict reaching the
+    loop directly could declare the round-4 attack string through
+    one of those unparsed positions.  Shapes the validator refuses
+    now contribute NO names; the charset rule in
+    sanitize_metric_name remains the gate for everything else.
     """
     names = set()
-
-    def collect(metrics):
-        for entry in metrics or []:
-            if isinstance(entry, dict):
-                for key in ("name", "metric"):
-                    value = entry.get(key)
-                    if isinstance(value, str):
-                        names.add(value)
-            elif isinstance(entry, str):
-                names.add(entry)
-
     acceptance = (contract or {}).get("acceptance")
-    if isinstance(acceptance, list):
-        items = acceptance
-    elif isinstance(acceptance, dict):
-        collect(acceptance.get("metrics"))
-        items = acceptance.get("items") or []
-    else:
-        items = []
-    for item in items:
-        if isinstance(item, dict):
-            collect(item.get("metrics"))
-            single = item.get("metric")
-            if isinstance(single, str):
-                names.add(single)
+    if not isinstance(acceptance, list):
+        return names
+    for item in acceptance:
+        if not isinstance(item, dict):
+            continue
+        metrics = item.get("metrics")
+        if not isinstance(metrics, list):
+            continue
+        for entry in metrics:
+            if isinstance(entry, dict):
+                value = entry.get("name")
+                if isinstance(value, str):
+                    names.add(value)
     return names
 
 
@@ -348,6 +348,35 @@ def write_lesson(store, data_dir, contract, verdict, gate_details):
         "written_to": "plugin_store",
         "provenance": "generated",
     }
+
+
+def sanitize_lesson_row(lesson):
+    """A stored lesson row with every free-text field rendered safe.
+
+    The render-time net for surfaces that hand whole rows to a
+    reader (round-7 fix spec K5; round-7 security F5): rows stored
+    before the write-time nets existed can carry raw multi-line
+    text, and the plugin's ``critic_lessons`` tool returns rows as
+    JSON — so each text field passes through the same
+    :func:`sanitize_free_text` the report renderers use (single
+    line, capped).  Structure is preserved: ids, tags, counts,
+    timestamps and nested mappings keep their shape and values;
+    only string content is collapsed.  The stored row is never
+    mutated — a sanitized copy is returned.
+    """
+    if not isinstance(lesson, dict):
+        return lesson
+
+    def clean(value):
+        if isinstance(value, str):
+            return sanitize_free_text(value)
+        if isinstance(value, (list, tuple)):
+            return [clean(entry) for entry in value]
+        if isinstance(value, dict):
+            return {key: clean(entry) for key, entry in value.items()}
+        return value
+
+    return {key: clean(value) for key, value in lesson.items()}
 
 
 def _lesson_line(lesson):

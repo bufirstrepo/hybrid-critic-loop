@@ -1038,8 +1038,23 @@ def _candidate_eliminated_kind(candidate):
     ``evidence``, which may be a dict (the real Store's shape) or a
     JSON string (duck-typed rows that carry the raw column).
     Returns None when neither place names a kind.
+
+    The resolved kind is canonicalized — stripped and lowercased —
+    in BOTH positions (round-7 fix spec K9; round-7 attack F6):
+    matching used to be exact, so a ``Gate_Error`` or
+    ``" gate_error "`` variant matched nothing and the candidate's
+    negative silently vanished from calibration.  A value that
+    canonicalizes to the empty string names no kind at all, so
+    resolution falls through to the next position (an empty
+    top-level value no longer shadows a real evidence kind); a
+    non-string value passes through untouched, as before.
     """
-    kind = candidate.get("eliminated_kind")
+    def canonical(value):
+        if isinstance(value, str):
+            return value.strip().lower() or None
+        return value
+
+    kind = canonical(candidate.get("eliminated_kind"))
     if kind is not None:
         return kind
     evidence = candidate.get("evidence")
@@ -1049,7 +1064,7 @@ def _candidate_eliminated_kind(candidate):
         except ValueError:
             evidence = None
     if isinstance(evidence, dict):
-        return evidence.get("eliminated_kind")
+        return canonical(evidence.get("eliminated_kind"))
     return None
 
 

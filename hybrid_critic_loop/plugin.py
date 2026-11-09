@@ -478,11 +478,23 @@ def register(ctx):
 
     def critic_lessons_handler(args):
         args = args or {}
-        lessons = store.lessons_for(
+        rows = store.lessons_for(
             domain=args.get("domain"),
             tags=args.get("tags"),
             limit=args.get("limit", 5),
         )
+        # Render-time sanitization (round-7 fix spec K5; round-7
+        # security F5): this tool hands whole stored rows to the
+        # host model as JSON, and rows written before the write-time
+        # nets can carry raw multi-line text — J5 swept
+        # reports.lessons_report (the CLI and slash-command surface)
+        # but this handler dumped the rows verbatim.  Each row now
+        # passes through lessons.sanitize_lesson_row, the same
+        # sanitize_free_text render the report uses: single-line,
+        # capped fields; ids, counts and structure unchanged.
+        from .lessons import sanitize_lesson_row
+
+        lessons = [sanitize_lesson_row(row) for row in rows]
         return json.dumps({"lessons": lessons}, default=str)
 
     def critic_matrix_handler(args):
