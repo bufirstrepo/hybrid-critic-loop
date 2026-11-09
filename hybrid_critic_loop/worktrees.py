@@ -128,6 +128,22 @@ class WorktreeManager:
         result = _git(["-C", str(self.repo), "cat-file", "-e", f"{ref}^{{commit}}"])
         return result.returncode == 0
 
+    def is_ancestor(self, ancestor, descendant) -> bool:
+        """True iff ``ancestor`` is an ancestor of ``descendant`` in
+        this repo — ``git merge-base --is-ancestor``. A commit counts
+        as its own ancestor, which is what lets a fast-forwarded
+        snapshot satisfy the ancestry leg. Either ref failing to
+        resolve answers False (round-8 fix spec L1: convergence
+        validates that a recorded final answer IS the merge it
+        claims to record, not merely a commit that exists)."""
+        if not ancestor or not descendant \
+                or not isinstance(ancestor, str) \
+                or not isinstance(descendant, str):
+            return False
+        result = _git(["-C", str(self.repo), "merge-base",
+                       "--is-ancestor", ancestor, descendant])
+        return result.returncode == 0
+
     def merge_commit_into_main(self, commit) -> str:
         """Merge an existing commit (a verdict-time snapshot) into the
         repo's main checkout — never the live worktree it came from

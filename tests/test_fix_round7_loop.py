@@ -9,7 +9,12 @@ F1, security F1/F2/F3, gate-core F1/F2/F3/F4/F5):
   presentation refuses naming the failed check, records no failure
   state, and does not consume the gate (remove the row and the same
   presentation completes through the real merge); a well-formed
-  row (real commit, matching decision) still converges;
+  row — production form: the merged head a real completion writes,
+  matching decision — still converges (the two fixtures that build
+  "genuine" rows were corrected to that form by round-8 fix spec
+  L1: the round-7 versions planted the bare snapshot commit, a row
+  production never writes and round 8's identity validation
+  refuses — see test_fix_round8_loop.py);
 * death after the final-answer write — verdict decided, answer
   present, terminal status never written — is an interrupted
   completion: the recorded decision converges it (status, ref
@@ -140,14 +145,25 @@ class TestPlantedAnswerRefused(RealGitBase):
         result = self._run_to_gate("ctr_plant3")
         winner = self.store.get_candidate(result["winner"])
         snapshot = winner["payload_hash"]
+        # Production form (round-8 fix spec L1 fixture correction):
+        # a genuine completion merges the snapshot and writes the
+        # MERGED HEAD as the answer's commit. The round-7 fixture
+        # planted the bare snapshot — a row no production completion
+        # ever writes — and round 8's identity validation refuses
+        # exactly that row (see test_fix_round8_loop.py). Perform
+        # the merge the completion would have performed, then plant
+        # its head: the row a real death after the answer write
+        # leaves behind.
+        mgr = WorktreeManager(self.repo)
+        merged = mgr.merge_commit_into_main(snapshot)
         _plant_answer(self.store, "ctr_plant3",
-                      f"git:{snapshot}", "approved")
+                      f"git:{merged}", "approved")
 
         done = loop_mod.record_human_gate(
             self.store, "ctr_plant3", "approved")
         self.assertEqual(done["status"], "completed", done)
         self.assertEqual(done["merge_source"], "already_completed")
-        self.assertEqual(done["commit"], f"git:{snapshot}")
+        self.assertEqual(done["commit"], f"git:{merged}")
         self.assertIn("certificate", done)
         self.assertEqual(_final_answer_count(self.store, "ctr_plant3"), 1)
         self.assertEqual(len(_completions(self.store, "ctr_plant3")), 1)
@@ -165,15 +181,21 @@ class TestPostAnswerDeathConverges(RealGitBase):
         result = self._run_to_gate("ctr_pad")
         winner = self.store.get_candidate(result["winner"])
         verdict = self.store.latest_verdict("ctr_pad")
-        # The completion's durable writes, in order: the claim, then
-        # the final answer with the winner's snapshot commit. Death
-        # lands here — the status write never happens.
+        # The completion's durable writes, in order: the claim, the
+        # merge, then the final answer carrying the MERGED HEAD —
+        # the row production writes (round-8 fix spec L1 fixture
+        # correction: the round-7 fixture planted the bare snapshot
+        # commit, which no production completion ever records and
+        # which round 8's identity validation refuses). Death lands
+        # here — the status write never happens.
         self.assertTrue(
             self.store.claim_human_gate(verdict["id"], "approved"))
+        merged = WorktreeManager(self.repo).merge_commit_into_main(
+            winner["payload_hash"])
         contract = self.store.get_contract("ctr_pad")
         self.store.create_final_answer(
             target_id=contract["target_id"], contract_id="ctr_pad",
-            commit=f"git:{winner['payload_hash']}",
+            commit=f"git:{merged}",
             human_gate="approved")
         self.assertEqual(
             self.store.get_contract("ctr_pad")["status"],

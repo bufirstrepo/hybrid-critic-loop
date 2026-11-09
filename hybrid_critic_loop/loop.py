@@ -239,7 +239,9 @@ class _FinalAnswerMismatch(Exception):
     (round-7 fix spec K1): raised out of completion so the gate
     presentation can refuse WITHOUT recording a failure state or
     writing anything further — the row is the operator's to
-    resolve, and the gate stays unconsumed."""
+    resolve, and the gate stays unconsumed. (The refusal itself
+    leaves one audit observation, kind ``gate_answer_refused`` —
+    round-8 fix spec L4; never a failure state.)"""
 
 
 #: The two interruption windows the detector names (round-7 fix spec
@@ -331,29 +333,96 @@ def _interrupted_completion(store, contract_id, verdict, contract):
     return _INTERRUPTED_AFTER_ANSWER
 
 
-def _validate_final_answer(mgr, answer, decision):
+def _winner_snapshot(mgr, contract_id, winner):
+    """The winner's verdict-time snapshot commit, resolved exactly
+    as the merge path resolves it (round-5 fix spec H6; round-8 fix
+    spec L1): the dedicated snapshot ref first — it survives the
+    winner branch's deletion — then the winner's recorded payload
+    hash. One helper, so the merge and the convergence validation
+    can never resolve the snapshot differently."""
+    if winner is None:
+        return None
+    snapshot = winner.get("payload_hash")
+    ref_getter = getattr(mgr, "snapshot_ref_commit", None)
+    if contract_id is not None and callable(ref_getter):
+        try:
+            ref_commit = ref_getter(contract_id, winner["id"])
+        except Exception:  # noqa: BLE001 - the payload-hash path remains
+            ref_commit = None
+        if ref_commit:
+            snapshot = ref_commit
+    return snapshot
+
+
+def _validate_final_answer(mgr, answer, decision, winner=None,
+                           contract_id=None):
     """Why the final answer on record must not be converged on, or
     None when it checks out (round-7 fix spec K1; round-7 attack F1,
-    security F3).
+    security F3; round-8 fix spec L1; round-8 attack F1, security
+    F1).
 
-    Two checks, mirroring what the normal completion path guarantees
-    about the row IT writes: the row's recorded decision is the
-    decision being completed, and a commit claiming the "git:" form
-    names a real commit in the contract's repository — the is_commit
-    check the merge path applies to the winner's snapshot. A non-git
-    commit string claims no repository form and is accepted as
-    recorded. A manager that cannot answer is_commit (older doubles)
-    skips the second check; the real WorktreeManager always can."""
+    Round 7 checked existence: the row's recorded decision is the
+    decision being completed, and a "git:" commit names a real
+    commit in the contract's repository. Round 8 showed existence
+    is not identity — a plant carrying the winner's own snapshot
+    hash (a real commit, a matching decision) converged and
+    certified while main never received the work. So the row must
+    now be the merge it claims to record:
+
+    * the commit carries the "git:" form — a non-git string is a
+      validation FAILURE, not an accepted-as-recorded form: no
+      legitimate writer produces one (the sole production call
+      site writes the post-merge head as "git:<sha>"), so the
+      round-7 acceptance of non-git forms is withdrawn;
+    * the winner's verdict-time snapshot — resolved exactly as
+      the merge path resolves it — is an ANCESTOR of the answer's
+      commit;
+    * the answer's commit is REACHABLE from the repository's main
+      head.
+
+    A genuine row satisfies both identity legs by construction: a
+    real completion merges the snapshot and writes the resulting
+    head (the snapshot is its ancestor; it IS main's head at write
+    time), and a fast-forward merge writes the snapshot itself,
+    which satisfies both legs once merged. A plant can satisfy
+    neither without actually merging the winner's work — at which
+    point the completion it claims is real. A manager that cannot
+    answer a primitive (older doubles) skips that leg; the real
+    WorktreeManager answers all of them."""
     recorded = answer.get("human_gate")
     if recorded != decision:
         return (f"its recorded decision is {recorded!r}, not the "
                 f"decision being completed ({decision!r})")
     raw = str(answer.get("commit") or "")
-    if raw.startswith("git:"):
-        is_commit = getattr(mgr, "is_commit", None)
-        if callable(is_commit) and not is_commit(raw[len("git:"):]):
-            return (f"its commit {raw!r} is not a commit in this "
-                    f"contract's repository")
+    if not raw.startswith("git:"):
+        return (f"its commit {raw!r} does not carry the 'git:' form "
+                f"— every completion this gate performs records the "
+                f"merged head as 'git:<sha>', so a row in any other "
+                f"form is not a completion of this gate")
+    sha = raw[len("git:"):]
+    is_commit = getattr(mgr, "is_commit", None)
+    if callable(is_commit) and not is_commit(sha):
+        return (f"its commit {raw!r} is not a commit in this "
+                f"contract's repository")
+    is_ancestor = getattr(mgr, "is_ancestor", None)
+    if callable(is_ancestor):
+        snapshot = _winner_snapshot(mgr, contract_id, winner)
+        if snapshot and callable(is_commit) and is_commit(snapshot) \
+                and not is_ancestor(snapshot, sha):
+            return (f"its commit {raw!r} does not descend from the "
+                    f"winner's verdict-time snapshot — the merge it "
+                    f"claims to record never landed")
+        head = None
+        baseline = getattr(mgr, "baseline_hash", None)
+        if callable(baseline):
+            try:
+                head = baseline()
+            except Exception:  # noqa: BLE001 - an unreadable head skips the leg, like an unanswering manager
+                head = None
+        if head and not is_ancestor(sha, head):
+            return (f"its commit {raw!r} is not reachable from the "
+                    f"repository's main head — the merge it claims "
+                    f"to record never landed")
     return None
 
 
@@ -380,8 +449,61 @@ def _append_gate_failure_once(store, contract_id, decision, channel,
         pass
 
 
+#: The observation kind a convergence-validation refusal leaves
+#: behind (round-8 fix spec L4; round-8 attack F4, security F2).
+#: Deliberately NOT a gate_failure: the refusal is a live, designed
+#: outcome, and its record is what lets a later presentation tell
+#: the claim it is recovering from — a refused claim — apart from
+#: a dead process's claim, which is the detector's crash signature
+#: and otherwise indistinguishable from it.
+_ANSWER_REFUSED_KIND = "gate_answer_refused"
+
+
+def _append_answer_refusal_once(store, contract_id, verdict_id,
+                                decision, problem):
+    """Append the refusal's own audit observation unless an
+    identical one (same verdict, decision, failed check) is already
+    on the contract (round-8 fix spec L4): repeated presentations
+    over the same planted row refuse identically, and one refusal
+    must not become a pile of records. Best-effort, like every
+    bookkeeping append — the refusal result stands either way."""
+    contract = store.get_contract(contract_id) or {}
+    for obs in contract.get("observations") or []:
+        if isinstance(obs, dict) \
+                and obs.get("kind") == _ANSWER_REFUSED_KIND \
+                and obs.get("verdict") == verdict_id \
+                and obs.get("decision") == decision \
+                and obs.get("reason") == problem:
+            return
+    try:
+        store.append_observation(contract_id, {
+            "kind": _ANSWER_REFUSED_KIND, "verdict": verdict_id,
+            "decision": decision, "reason": problem,
+        })
+    except Exception:  # noqa: BLE001 - recording must not mask the gate
+        pass
+
+
+def _answer_refusal_on_record(store, contract_id, verdict_id,
+                              decision):
+    """True when this verdict's standing claim was already refused
+    over a final answer that failed validation (round-8 fix spec
+    L4). The detector cannot tell a refused claim from a dead
+    process's — same durable shape — but the refusal was THIS
+    system's own live act, and it is on the book: a recovery from
+    it must not be written up as a process death."""
+    contract = store.get_contract(contract_id) or {}
+    for obs in contract.get("observations") or []:
+        if isinstance(obs, dict) \
+                and obs.get("kind") == _ANSWER_REFUSED_KIND \
+                and obs.get("verdict") == verdict_id \
+                and obs.get("decision") == decision:
+            return True
+    return False
+
+
 def _record_interruption(store, contract_id, verdict, decision,
-                         channel, reason) -> bool:
+                         channel, reason, record=True) -> bool:
     """Record a detected interrupted completion and flip the verdict
     to the failure state — conditionally (round-7 fix spec K3;
     round-7 gate-core F2, security F2).
@@ -396,9 +518,17 @@ def _record_interruption(store, contract_id, verdict, decision,
     and the caller re-reads the gate and answers per the fresh
     state instead of proceeding on a stale one. Stores without the
     conditional setter (older doubles) keep the round-6 behavior:
-    the unconditional flip, and always True."""
-    _append_gate_failure_once(store, contract_id, decision, channel,
-                              reason)
+    the unconditional flip, and always True.
+
+    With ``record=False`` the gate_failure observation is skipped
+    but the conditional flip and the failure-shaped status still
+    land (round-8 fix spec L4): recovering a claim a live refusal
+    left standing must pass through the same claimable state the
+    retry claim fires from, without writing the recovery up as a
+    process death."""
+    if record:
+        _append_gate_failure_once(store, contract_id, decision,
+                                  channel, reason)
     flip = getattr(store, "set_human_gate_if", None)
     if callable(flip):
         try:
@@ -454,12 +584,22 @@ def _answer_for_moved_gate(store, contract_id, decision, _result):
 
 
 def _mismatch_result(store, contract_id, gate_state, _result,
-                     mismatch):
+                     mismatch, decision=None, verdict_id=None):
     """The refusal for a final answer that failed validation
     (round-7 fix spec K1): an error naming the failed check, no
     failure state recorded, no certificate — the gate is not
     consumed and the row is left for the operator, named in the
-    detail."""
+    detail.
+
+    The refusal's one durable write is its own audit observation
+    (round-8 fix spec L4) — kind ``gate_answer_refused``, never a
+    gate_failure: the claim the refusal leaves standing is
+    durably indistinguishable from a dead process's claim, and
+    this record is how a later recovery tells the two apart
+    instead of writing the recovery up as a process death."""
+    if decision is not None and verdict_id is not None:
+        _append_answer_refusal_once(
+            store, contract_id, verdict_id, decision, str(mismatch))
     result = dict(_result or {"contract_id": contract_id})
     try:
         current = store.latest_verdict(contract_id) or {}
@@ -545,17 +685,22 @@ def _finish_from_existing_answer(store, contract_id, decision, reason,
     fix spec K1/K2/K3).
 
     The row is VALIDATED before it is trusted (round-7 attack F1,
-    security F3): its recorded decision must equal the decision
-    being completed, and a "git:" commit must name a real commit in
-    the contract's repository — the checks the normal merge path
-    applies to its own work. A row failing either raises
-    :class:`_FinalAnswerMismatch` before anything is written: a
-    planted row (one raw INSERT, a free-text commit, a merge that
-    never happened) completes nothing. A row passing them IS the
-    completion's durable record: the merge is not repeated, no
-    second answer is written, and the remaining steps (the waiver
-    grant, the merge record, the terminal status, ref cleanup, the
-    certificate) converge idempotently."""
+    security F3; round-8 fix spec L1): its recorded decision must
+    equal the decision being completed, and its commit must be the
+    merge it claims to record — the winner's snapshot descends
+    into it and it is reachable from main's head, the properties
+    the normal merge path guarantees about the row IT writes. A
+    row failing any check raises :class:`_FinalAnswerMismatch`
+    before anything is written: a planted row (one raw INSERT, a
+    free-text commit, a real commit that was never merged)
+    completes nothing. A row passing them IS the completion's
+    durable record: the merge is not repeated, no second answer
+    is written, and the remaining steps (the waiver grant, the
+    merge record, the terminal status, ref cleanup, the
+    certificate) converge idempotently. The result reports the
+    row's commit AS STORED (round-8 fix spec L5) — never stripped
+    and re-prefixed, a construction that once re-issued a plant's
+    free text as a "git:" claim."""
     answer = _final_answer_row(store, contract_id)
     if answer is None:
         # Callers check first; the row vanishing between the check
@@ -563,7 +708,8 @@ def _finish_from_existing_answer(store, contract_id, decision, reason,
         # the caller's failure handling.
         raise RuntimeError(
             "final answer vanished before convergence could read it")
-    problem = _validate_final_answer(mgr, answer, decision)
+    problem = _validate_final_answer(
+        mgr, answer, decision, winner=winner, contract_id=contract_id)
     if problem is not None:
         raise _FinalAnswerMismatch(problem)
     waiver_record = None
@@ -571,9 +717,9 @@ def _finish_from_existing_answer(store, contract_id, decision, reason,
         waiver_record = _grant_waiver(
             store, contract_id, verdict, waiver, winner, reason,
             channel)
-    merged_sha = str(answer.get("commit") or "")
-    if merged_sha.startswith("git:"):
-        merged_sha = merged_sha[len("git:"):]
+    stored_commit = str(answer.get("commit") or "")
+    merged_sha = stored_commit[len("git:"):] \
+        if stored_commit.startswith("git:") else stored_commit
     commit = (winner or {}).get("payload_hash") or merged_sha
     result["merge_source"] = "already_completed"
     note = ("a final answer already exists for this contract; "
@@ -601,7 +747,7 @@ def _finish_from_existing_answer(store, contract_id, decision, reason,
     store.set_contract_status(contract_id, "completed")
     if winner is not None:
         _delete_snapshot_ref(mgr, contract_id, winner["id"])
-    result.update({"status": "completed", "commit": f"git:{merged_sha}",
+    result.update({"status": "completed", "commit": stored_commit,
                    "winner_commit": f"git:{commit}",
                    "waiver": waiver_record})
     _attach_certificate(result, store, contract_id)
@@ -2149,6 +2295,19 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
     racing a live recovery loses cleanly and answers per the fresh
     state; and the verdict's claim — never the failure log — is the
     authority a retry is bound to.
+
+    Round 8 completes the validation (fix spec L1/L4/L5):
+    convergence trusts a row only when it IS the merge it claims
+    to record — the winner's snapshot descends into its commit and
+    the commit is reachable from main's head, and a non-git commit
+    form fails outright. When a final answer exists, that
+    validation runs BEFORE the interruption detector records
+    anything, so a refused plant draws no "process death" record;
+    and the refusal leaves its own audit observation, so the
+    recovery of the claim it left standing is not written up as a
+    death either. The completion result reports the answer row's
+    commit as stored, never re-prefixed into a form the row did
+    not carry.
     """
     if decision not in ("approved", "rejected", "waived"):
         return {"contract_id": contract_id, "status": "error",
@@ -2187,6 +2346,30 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
                         f"decision — a different decision needs an explicit "
                         f"operator reset, not the retry path")}
         if interrupted is not None:
+            if interrupted == _INTERRUPTED_AFTER_ANSWER:
+                # Validation precedes detector recording (round-8
+                # fix spec L4; round-8 attack F4, security F2): a
+                # final answer exists, so validate it BEFORE
+                # anything is recorded. A row that fails refuses
+                # via the mismatch path and this presentation
+                # appends NO interruption record — there was no
+                # completion to interrupt, and at the old order the
+                # detector wrote a "process death" over a live,
+                # designed refusal, then the prescribed recovery
+                # wrote a second one over the refused claim it left
+                # standing. A row that validates is a real
+                # interruption: it records and converges as before.
+                answer = _final_answer_row(store, contract_id)
+                if answer is not None:
+                    problem = _validate_final_answer(
+                        mgr, answer, decision, winner=winner,
+                        contract_id=contract_id)
+                    if problem is not None:
+                        return _mismatch_result(
+                            store, contract_id, gate_state, _result,
+                            _FinalAnswerMismatch(problem),
+                            decision=decision,
+                            verdict_id=verdict["id"])
             # The interruption enters the audit trail exactly as the
             # exception path would have written it, so a reader of
             # the book cannot tell the two apart afterwards. The
@@ -2194,10 +2377,22 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
             # (round-7 fix spec K3): if it loses, the gate moved
             # under this presentation — a concurrent presenter owns
             # it now — and the answer comes from the fresh state,
-            # never from a fabricated failure.
+            # never from a fabricated failure. One exception
+            # (round-8 fix spec L4): a claim this system's own
+            # refusal left standing is recovered WITHOUT the
+            # gate_failure record — the refusal observation is on
+            # the book, the claim is known not to be a dead
+            # process's, and the record is the only part of the
+            # recording that would outlive the recovery as a false
+            # claim about it; the flip and status still land, so
+            # the retry claim below fires from the same state.
+            record = not (
+                interrupted == _INTERRUPTED_AFTER_CLAIM
+                and _answer_refusal_on_record(
+                    store, contract_id, verdict["id"], decision))
             if not _record_interruption(
                     store, contract_id, verdict, decision, channel,
-                    interrupted):
+                    interrupted, record=record):
                 return _answer_for_moved_gate(
                     store, contract_id, decision, _result)
 
@@ -2252,7 +2447,8 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
         # nothing further is written, no certificate, and the gate
         # is not consumed; the row is the operator's to resolve.
         return _mismatch_result(
-            store, contract_id, gate_state, _result, mismatch)
+            store, contract_id, gate_state, _result, mismatch,
+            decision=decision, verdict_id=verdict["id"])
     except Exception as exc:  # noqa: BLE001 - completion failures land in the failure state
         mismatch = None
         if decision != "rejected" \
@@ -2275,7 +2471,8 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
                 pass
         if mismatch is not None:
             return _mismatch_result(
-                store, contract_id, gate_state, _result, mismatch)
+                store, contract_id, gate_state, _result, mismatch,
+                decision=decision, verdict_id=verdict["id"])
         failure = _record_gate_failure(
             store, contract_id, verdict, decision, channel, exc)
         result = dict(_result or {"contract_id": contract_id})
@@ -2388,17 +2585,11 @@ def _complete_human_gate(store, contract_id, decision, reason, contract,
     # The snapshot resolves via its dedicated ref first (round-5 fix
     # spec H6): the ref survives the winner branch's deletion, where
     # the payload-hash string alone would leave the commit one gc
-    # away from unrecoverable.
+    # away from unrecoverable. Convergence validation resolves it
+    # through the same helper (:func:`_winner_snapshot`), so the two
+    # can never disagree about which commit was gated.
     wt = Path(winner["worktree"])
-    snapshot = winner.get("payload_hash")
-    ref_getter = getattr(mgr, "snapshot_ref_commit", None)
-    if callable(ref_getter):
-        try:
-            ref_commit = ref_getter(contract_id, winner["id"])
-        except Exception:  # noqa: BLE001 - the payload-hash path remains
-            ref_commit = None
-        if ref_commit:
-            snapshot = ref_commit
+    snapshot = _winner_snapshot(mgr, contract_id, winner)
     is_commit = getattr(mgr, "is_commit", None)
     merge_commit = getattr(mgr, "merge_commit_into_main", None)
     used_snapshot = bool(
