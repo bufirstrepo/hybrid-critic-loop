@@ -116,6 +116,17 @@ def route_for(store, category) -> dict:
     return copy.deepcopy(fallback)
 
 
+def _route_positions(route):
+    """The fields a demotion can move, as a comparable tuple."""
+    if not isinstance(route, dict):
+        return None
+    return (
+        route.get("primary"),
+        route.get("compete_with"),
+        tuple(route.get("fallback") or ()),
+    )
+
+
 def apply_lesson_route_change(store, category, route_change, contract_id):
     """Apply a lesson's route change. Returns a human line, or None.
 
@@ -123,6 +134,16 @@ def apply_lesson_route_change(store, category, route_change, contract_id):
     promoting ``route_change['promote']`` or — when the demoted expert is
     the current primary — the ``compete_with`` expert, otherwise keeping
     the current primary in place.  A ledger row records the change.
+
+    The line reports what the demotion call's RETURN says actually
+    changed (fix spec G8; round-3 contest-core F5): the store's
+    ``apply_route_demotion`` returns the resulting route plus a
+    ``changed`` flag — when nothing moved (the demoted expert holds no
+    route position), the line says so and NO ledger row is written.
+    Before, most demotions were silent no-ops in the store while this
+    line and a ledger row both claimed they happened. Stores whose
+    demotion returns no ``changed`` flag (older doubles) are read by
+    comparing the route before and after the call.
     """
     if not route_change or not route_change.get("demote"):
         return None
@@ -136,6 +157,7 @@ def apply_lesson_route_change(store, category, route_change, contract_id):
     promote = route_change.get("promote") or (
         primary if demote != primary else compete_with
     )
+    before = _route_positions(current)
 
     result = None
     try:
@@ -143,6 +165,23 @@ def apply_lesson_route_change(store, category, route_change, contract_id):
     except TypeError:
         result = store.apply_route_demotion(
             category, demote=demote, promote=promote, reason=reason
+        )
+
+    if isinstance(result, dict) and "changed" in result:
+        # The store reported the change itself: speak from it exactly.
+        changed = bool(result["changed"])
+        promoted_actual = result.get("promoted")
+        new_route = result
+    else:
+        new_route = result if isinstance(result, dict) and result else route_for(store, category)
+        changed = _route_positions(new_route) != before
+        promoted_actual = promote if changed else None
+    new_primary = (new_route or {}).get("primary", primary)
+
+    if not changed:
+        return (
+            f"Route for {category}: no route change — {demote} holds no "
+            f"route position to demote from — {reason} (contract {contract_id})"
         )
 
     note = f"route_change demote {demote} ({reason}) contract {contract_id}"
@@ -164,9 +203,12 @@ def apply_lesson_route_change(store, category, route_change, contract_id):
     except Exception:
         pass
 
-    new_route = result if isinstance(result, dict) and result else route_for(store, category)
-    new_primary = (new_route or {}).get("primary", promote)
+    if promoted_actual:
+        return (
+            f"Route for {category}: demoted {demote}, promoted {promoted_actual} "
+            f"(primary is now {new_primary}) — {reason} (contract {contract_id})"
+        )
     return (
-        f"Route for {category}: demoted {demote}, promoted {promote} "
+        f"Route for {category}: demoted {demote} within the fallback order "
         f"(primary is now {new_primary}) — {reason} (contract {contract_id})"
     )

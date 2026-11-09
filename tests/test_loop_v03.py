@@ -15,7 +15,7 @@ import unittest
 from hybrid_critic_loop import gates as gates_mod
 from hybrid_critic_loop import loop as loop_mod
 from hybrid_critic_loop.contracts import validate_contract
-from hybrid_critic_loop.errors import ContractError
+from hybrid_critic_loop.errors import ContractError, GateError
 from hybrid_critic_loop.executors import Executor, GenResult
 from hybrid_critic_loop.reports import ledger_report, verdict_report
 from hybrid_critic_loop.state import Store
@@ -743,10 +743,13 @@ class TestMeasuredFailureNeedsAnExplicitWaiver(LoopV03Base):
         verdict = self.store.latest_verdict("ctr_fake")
         self.assertEqual(verdict["human_gate"], "waived")
         self.assertEqual(verdict["waiver"]["status"], "granted")
-        self.assertEqual(verdict["waiver"]["by"], "human")
+        # The recorded channel is the one the decision arrived through
+        # (fix spec G1; round-4 security F7): a direct record_human_gate
+        # call is the CLI channel — never a hardcoded "human".
+        self.assertEqual(verdict["waiver"]["by"], "cli")
         self.assertEqual(verdict["waiver"]["reason"], "bench variance accepted by the operator")
         self.assertEqual(self.store.get_contract("ctr_fake")["status"], "completed")
-        self.assertIn("waiver: measured gate — granted by human", verdict_report(self.store, "ctr_fake"))
+        self.assertIn("waiver: measured gate — granted by cli", verdict_report(self.store, "ctr_fake"))
         replay = loop_mod.record_human_gate(self.store, "ctr_fake", "approved")
         self.assertEqual(replay["status"], "error")
 
@@ -1119,6 +1122,113 @@ class TestLowConfidence(LoopV03Base):
         )
         self.assertEqual(result["status"], "escalated", result)
         self.assertIn("confidence", result["detail"])
+
+
+class TestGateErrorEliminatesOneCandidate(LoopV03Base):
+    """Fix spec G7 tail (round-4 contest-core F3): a candidate whose
+    gates raise GateError — a sensor that produced unparseable output —
+    is eliminated with the reason recorded; the error never propagates
+    out of run_contract and strands the contract at "open"."""
+
+    def setUp(self):
+        super().setUp()
+        base_eval = gates_mod.evaluate_candidate
+        self._base_eval = base_eval
+
+        def eval_with_gate_error(store, contract, candidate, cwd):
+            if candidate["expert_id"] in self._gate_error_experts:
+                raise GateError("sensor ops_bench produced unparseable output")
+            return base_eval(store, contract, candidate, cwd)
+
+        self._gate_error_experts = {"gen-b"}
+        gates_mod.evaluate_candidate = eval_with_gate_error
+        loop_mod.gates_mod.evaluate_candidate = eval_with_gate_error
+        self.markers.update({"gen-a": "m-a", "gen-b": "m-b"})
+
+    def _executors(self):
+        return {
+            "gen-a": FakeGen("gen-a", "fam-a", "m-a"),
+            "gen-b": FakeGen("gen-b", "fam-b", "m-b"),
+            "judge-z": FakeJudge("judge-z", "fam-z", {"m-a": 9.0, "m-b": 8.0}),
+        }
+
+    def test_one_candidates_gate_error_eliminates_only_it(self):
+        self.panel("gen-a", "gen-b", ["judge-z"], ["gen-a", "gen-b"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", self._executors(),
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "completed", result)
+        verdict = self.store.latest_verdict("ctr_fake")
+        losers = [self.store.get_candidate(cid) for cid in verdict["eliminated"]]
+        self.assertIn("gen-b", [c["expert_id"] for c in losers])
+        notes = [r["note"] or "" for r in self.store.ledger_rows()]
+        self.assertTrue(
+            any("gate error eliminated candidate" in n
+                and "unparseable" in n for n in notes), notes)
+        self.assertEqual(
+            self.store.get_contract("ctr_fake")["status"], "completed")
+
+    def test_every_candidate_gate_erroring_escalates_instead_of_raising(self):
+        self._gate_error_experts = {"gen-a", "gen-b"}
+        self.panel("gen-a", "gen-b", ["judge-z"], ["gen-a", "gen-b"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", self._executors(),
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "escalated", result)
+        self.assertIn("retry cap", result["detail"])
+        self.assertEqual(
+            self.store.get_contract("ctr_fake")["status"], "escalated")
+
+
+class TestSlotGuardFiresBeforeTheWave(LoopV03Base):
+    """Fix spec G9 (round-3 contest-core F8): more contestants than
+    slots escalates with the capacity reason BEFORE any dispatch —
+    the old post-wave check could never fire, and the 27th contestant
+    died on an IndexError mid-wave."""
+
+    def test_27_contestants_escalate_with_no_dispatch(self):
+        executors = {
+            f"gen-{i:02d}": FakeGen(f"gen-{i:02d}", f"fam-{i:02d}", f"m-{i:02d}")
+            for i in range(27)
+        }
+        ids = sorted(executors)
+        self.panel(ids[0], ids[1], ids[2:], ids)
+        contract = _contract(acceptance=[
+            {"class": "hard", "cmd": "true", "expect": {"exit": 0}},
+        ])
+        result = loop_mod.run_contract(
+            self.store, contract, "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "escalated", result)
+        self.assertIn("slot capacity", result["detail"])
+        self.assertEqual(self.store.candidates_for("ctr_fake"), [])
+
+
+class TestEscalatedMatrixRunCreditsValidity(LoopV03Base):
+    """Fix spec G8 (round-3 contest-core F7): an escalated matrix run
+    credits the validity it measured — _escalate passes the scored
+    candidate ids to _record_validity instead of an empty list."""
+
+    def test_no_pass_escalation_still_records_medians(self):
+        self.markers.update({"gen-a": "m-a", "gen-b": "m-b"})
+        executors = {
+            "gen-a": FakeGen("gen-a", "fam-a", "m-a"),
+            "gen-b": FakeGen("gen-b", "fam-b", "m-b"),
+            "judge-y": FakeJudge("judge-y", "fam-y", {"m-a": 3.0, "m-b": 3.0}),
+            "judge-z": FakeJudge("judge-z", "fam-z", {"m-a": 3.0, "m-b": 3.0}),
+        }
+        self.panel("gen-a", "gen-b", ["judge-y", "judge-z"], ["gen-a", "gen-b"])
+        result = loop_mod.run_contract(
+            self.store, _contract(), "repo://fake", executors,
+            human_decider=lambda info: "approved",
+        )
+        self.assertEqual(result["status"], "escalated", result)
+        self.assertIn("peer matrix passed no candidate", result["detail"])
+        self.assertEqual(self.store.get_expert("gen-a")["validity_points"], 3.0)
+        self.assertEqual(self.store.get_expert("gen-b")["validity_points"], 3.0)
 
 
 if __name__ == "__main__":

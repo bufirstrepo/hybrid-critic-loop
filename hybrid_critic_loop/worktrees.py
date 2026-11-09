@@ -24,6 +24,96 @@ class WorktreeManager:
     def root(self) -> Path:
         return self.repo / "wt"
 
+    def path_for(self, contract_id, slot) -> Path:
+        """The path ``create`` WOULD give a worktree, without creating
+        it (fix spec G9): the loop names a candidate's worktree before
+        it knows whether the seat is available at all."""
+        return self.repo / "wt" / str(contract_id) / str(slot)
+
+    def claim_run(self, contract_id) -> bool:
+        """Atomically claim a contract's single run (fix spec G9;
+        round-4 contest-core F7).
+
+        An ``O_CREAT | O_EXCL`` file under the contract's worktree
+        directory: exactly one process creates it, every racing second
+        run gets False and answers ``already_run`` instead of fighting
+        over worktree and branch names. The claim is taken before any
+        worktree is created and held for the run's life; it is released
+        only when the run leaves the contract re-runnable (a baseline
+        refusal). A crashed run leaves the claim behind, which matches
+        the one-run doctrine: the contract id is spent either way, and
+        the store's status guard says so.
+        """
+        import os
+
+        claim_dir = self.root / str(contract_id)
+        try:
+            claim_dir.mkdir(parents=True, exist_ok=True)
+            fd = os.open(
+                claim_dir / ".critic-run-claim",
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            )
+        except FileExistsError:
+            return False
+        except OSError:
+            # A filesystem that cannot take the claim must not block the
+            # run: the store's status claim still guards sequentially.
+            return True
+        try:
+            os.write(fd, f"pid {os.getpid()} contract {contract_id}\n".encode())
+        finally:
+            os.close(fd)
+        return True
+
+    def release_run(self, contract_id):
+        """Release a run claim taken by :meth:`claim_run`."""
+        try:
+            (self.root / str(contract_id) / ".critic-run-claim").unlink(
+                missing_ok=True)
+        except OSError:
+            pass
+
+    def is_commit(self, ref) -> bool:
+        """True iff ``ref`` names a commit object in this repo — the
+        discriminator between a verdict-time snapshot commit recorded
+        as a candidate's payload hash and a legacy diff hash (fix spec
+        G1; round-4 contest-core F1)."""
+        if not ref or not isinstance(ref, str):
+            return False
+        result = _git(["-C", str(self.repo), "cat-file", "-e", f"{ref}^{{commit}}"])
+        return result.returncode == 0
+
+    def merge_commit_into_main(self, commit) -> str:
+        """Merge an existing commit (a verdict-time snapshot) into the
+        repo's main checkout — never the live worktree it came from
+        (fix spec G1). Returns the new HEAD sha."""
+        result = _git([
+            "-C", str(self.repo),
+            "-c", "user.email=critic@local",
+            "-c", "user.name=Hybrid Critic Loop",
+            "merge", "--no-ff", str(commit), "-m", f"Merge {commit}",
+        ])
+        if result.returncode != 0:
+            combined = (result.stdout or "") + (result.stderr or "")
+            _git(["-C", str(self.repo), "merge", "--abort"])
+            raise RuntimeError(f"git merge failed: {combined.strip()}")
+        rev = _git(["-C", str(self.repo), "rev-parse", "HEAD"])
+        if rev.returncode != 0:
+            raise RuntimeError(f"git rev-parse HEAD failed after merge: {rev.stderr.strip()}")
+        return rev.stdout.strip()
+
+    def delete_branch(self, branch) -> bool:
+        """Delete a branch (fix spec G9: branches die at terminal
+        states). ``-d`` first; ``-D`` when the branch was never merged
+        (a rejected or escalated field). Returns True iff the branch
+        is gone afterwards."""
+        for flag in ("-d", "-D"):
+            result = _git(["-C", str(self.repo), "branch", flag, str(branch)])
+            if result.returncode == 0:
+                return True
+        check = _git(["-C", str(self.repo), "rev-parse", "--verify", str(branch)])
+        return check.returncode != 0
+
     def baseline_hash(self) -> str:
         # argv list, like every other git call here: a repository path
         # containing whitespace must never be split into two arguments.

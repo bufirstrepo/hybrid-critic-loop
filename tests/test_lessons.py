@@ -366,6 +366,53 @@ class TestRouter(unittest.TestCase):
             [("code", "claude", "codex", "lost on hard gate")],
         )
 
+    def test_demotion_of_a_seat_with_no_route_position_reports_no_change(self):
+        # Fix spec G8 (round-3 contest-core F5): demoting a fallback
+        # member (this double's demotion, like the old store, has no
+        # fallback branch) or an expert absent from the route changes
+        # nothing — the line says so and NO ledger row claims a
+        # route_change that never happened.
+        store = FakeStore()
+        router.ensure_routes(store)
+        line = router.apply_lesson_route_change(
+            store, "code", {"demote": "claude", "reason": "lost on hard gate"},
+            "c9",
+        )
+        self.assertIsNotNone(line)
+        self.assertIn("no route change", line)
+        self.assertIn("claude", line)
+        self.assertEqual(store.add_ledger_calls, [])
+        line = router.apply_lesson_route_change(
+            store, "code", {"demote": "qwen-cli", "reason": "lost again"}, "c9",
+        )
+        self.assertIn("no route change", line)
+        self.assertEqual(store.add_ledger_calls, [])
+
+    def test_demotion_reports_the_stores_own_change_record(self):
+        # Fix spec G8: when apply_route_demotion returns its change
+        # report (changed/branch/promoted), the router speaks from it
+        # exactly — a fallback-branch demotion promotes nobody and the
+        # line must not claim a promotion.
+        store = FakeStore()
+        router.ensure_routes(store)
+        route = store.get_route("code")
+        demote_call = store.apply_route_demotion
+
+        def reporting_demotion(category, demote, promote, reason):
+            demote_call(category, demote, promote, reason)
+            return {**route, "changed": True, "branch": "fallback",
+                    "demoted": demote, "promoted": None}
+
+        store.apply_route_demotion = reporting_demotion
+        line = router.apply_lesson_route_change(
+            store, "code", {"demote": "deepseek", "reason": "lost on measured gate"},
+            "c10",
+        )
+        self.assertIn("demoted deepseek", line)
+        self.assertIn("fallback", line)
+        self.assertNotIn("promoted", line)
+        self.assertEqual(len(store.add_ledger_calls), 1)
+
     def test_no_route_change_returns_none(self):
         store = FakeStore()
         router.ensure_routes(store)

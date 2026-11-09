@@ -46,7 +46,7 @@ from . import lessons as lessons_mod
 from . import matrix as matrix_mod
 from . import router as router_mod
 from .contracts import verify_baseline
-from .errors import PanelError
+from .errors import GateError, PanelError
 from .shellrun import sha256_text
 from .worktrees import WorktreeManager
 
@@ -138,15 +138,85 @@ def _tokens_total(candidate: dict) -> float:
     return float((tin or 0) + (tout or 0))
 
 
+def _claim_gate(store, verdict, decision) -> bool:
+    """Claim a verdict's pending human gate (fix spec G1; round-4
+    security F4, contest-core F2).
+
+    The store's ``claim_human_gate`` is one conditional UPDATE: the
+    claim IS the decision record, taken BEFORE any merge, so two
+    concurrent deciders cannot both complete one gate and a crash can
+    no longer leave a merged winner whose gate still reads pending.
+    Stores without the claim (older test doubles) fall back to the
+    pending check plus an immediate ``set_verdict_human_gate`` — the
+    same ordering, weaker atomicity."""
+    claim = getattr(store, "claim_human_gate", None)
+    if callable(claim):
+        return bool(claim(verdict["id"], decision))
+    if verdict.get("human_gate") != "pending":
+        return False
+    setter = getattr(store, "set_verdict_human_gate", None)
+    if callable(setter):
+        setter(verdict["id"], decision)
+    return True
+
+
+def _branch_for_worktree(wt) -> str:
+    """The branch ``WorktreeManager.create`` made for a worktree path
+    (``wt/<contract>/<slot>`` -> ``critic/<contract>/<slot>``)."""
+    path = Path(wt)
+    return f"critic/{path.parent.name}/{path.name}"
+
+
+def _remove_candidate_worktrees(store, mgr, contract_id, *, delete_branches):
+    """Remove every candidate worktree dir of a contract (fix spec G9;
+    round-4 contest-core F4) — and, at terminal states, the branches
+    behind them plus the baseline branch. Best-effort throughout:
+    cleanup must never break the outcome it follows."""
+    try:
+        candidates = store.candidates_for(contract_id)
+    except Exception:  # noqa: BLE001
+        candidates = []
+    for cand in candidates:
+        wt = cand.get("worktree")
+        if not wt:
+            continue
+        try:
+            mgr.remove(Path(wt))
+        except Exception:  # noqa: BLE001
+            pass
+        if delete_branches:
+            deleter = getattr(mgr, "delete_branch", None)
+            if callable(deleter):
+                try:
+                    deleter(_branch_for_worktree(wt))
+                except Exception:  # noqa: BLE001
+                    pass
+    if delete_branches:
+        deleter = getattr(mgr, "delete_branch", None)
+        if callable(deleter):
+            try:
+                deleter(f"critic/{contract_id}/baseline")
+            except Exception:  # noqa: BLE001
+                pass
+
+
 class _Run:
-    def __init__(self, store, contract, repo_path, executors, human_decider):
+    def __init__(self, store, contract, repo_path, executors, human_decider,
+                 channel="cli"):
         self.store = store
         self.contract = contract
         self.contract_id = contract["id"]
         self.repo_path = Path(repo_path)
         self.executors = executors
         self.human_decider = human_decider
+        # The channel an in-run human decision arrives through (fix
+        # spec G1): the recorded gate decision names it, never a
+        # hardcoded "human" (round-4 security F7).
+        self.channel = channel
         self.mgr = WorktreeManager(self.repo_path)
+        # Candidate id -> the GateError text that eliminated it (fix
+        # spec G7 tail): retry notes and the ledger carry the reason.
+        self.gate_errors: dict[str, str] = {}
         self.events: list[dict] = []
         self.durations: dict[str, int] = {}
         self.target_id = contract.get("target_id")
@@ -226,6 +296,9 @@ class _Run:
                     "not a re-run")
         elif status == "completed":
             hint = "its winner is merged and its verdict recorded"
+        elif status == "running":
+            hint = ("another run of this contract is in progress, or was "
+                    "interrupted mid-run; the contract id is spent either way")
         elif status == "escalated":
             hint = "it escalated to the operator; open a new contract id for another attempt"
         elif status == "rejected":
@@ -255,11 +328,33 @@ class _Run:
             parts.append(retry_notes)
         return "\n\n".join(parts)
 
+    def _planned_worktree(self, slot_name):
+        """Where a candidate's worktree WILL live, without creating it:
+        the manager's own ``path_for`` when it has one, its ``root``
+        layout otherwise, and — for in-memory manager doubles whose
+        ``create`` is side-effect-free naming — ``create`` itself."""
+        path_for = getattr(self.mgr, "path_for", None)
+        if callable(path_for):
+            return path_for(self.contract_id, slot_name)
+        root = getattr(self.mgr, "root", None)
+        if root is not None:
+            return Path(root) / self.contract_id / slot_name
+        return self.mgr.create(self.contract_id, slot_name)
+
     def _dispatch(self, expert_id, slot, attempt, context):
         """Generate one candidate. Returns (candidate_dict, gen_result)."""
         store = self.store
         executor = self.executors[expert_id]
-        wt = self.mgr.create(self.contract_id, f"{slot}{attempt if attempt > 1 else ''}")
+        slot_name = f"{slot}{attempt if attempt > 1 else ''}"
+        # Seat availability is checked BEFORE the worktree exists (fix
+        # spec G9; round-4 contest-core F4): an unavailable seat gets a
+        # candidate row and a ledger row, never a checkout it will not
+        # use (before, it leaked one worktree per seat per attempt).
+        ok, why = executor.available()
+        if ok:
+            wt = self.mgr.create(self.contract_id, slot_name)
+        else:
+            wt = self._planned_worktree(slot_name)
         baseline_hash = self.mgr.baseline_hash()
         cand_id = store.create_candidate(
             contract_id=self.contract_id,
@@ -271,7 +366,6 @@ class _Run:
             worktree=str(wt),
             baseline_hash=baseline_hash,
         )
-        ok, why = executor.available()
         if not ok:
             from .executors import GenResult
 
@@ -323,8 +417,35 @@ class _Run:
             store.record_refusal(expert_id)
         return store.get_candidate(cand_id), gen
 
+    def _cleanup_attempt_worktrees(self, wave):
+        """A failed attempt's worktree dirs go away when the run
+        retries (fix spec G9; round-4 contest-core F4): the next
+        attempt dispatches fresh slot dirs, and the old checkouts
+        would otherwise leak one per seat per attempt. Branches stay
+        until the contract reaches a terminal state."""
+        for cand, _gen in wave:
+            wt = cand.get("worktree")
+            if not wt:
+                continue
+            try:
+                self.mgr.remove(Path(wt))
+            except Exception:  # noqa: BLE001 - cleanup must not break a retry
+                pass
+
     # -- main ----------------------------------------------------------
     def run(self) -> dict:
+        try:
+            return self._run()
+        except Exception:
+            # An error exit removes the run's worktree dirs (fix spec
+            # G9; round-4 contest-core F4) but keeps the branches: the
+            # record of what was attempted survives for inspection, and
+            # the one-run guard answers already_run on any re-run.
+            _remove_candidate_worktrees(
+                self.store, self.mgr, self.contract_id, delete_branches=False)
+            raise
+
+    def _run(self) -> dict:
         store = self.store
         self._ensure_rows()
         contract_row = store.get_contract(self.contract_id)
@@ -336,8 +457,29 @@ class _Run:
         # collide with. Before, the only guard was the baseline row, which
         # a first run had already written.
         status = contract_row.get("status")
-        if status in FINISHED_STATUSES or store.candidates_for(self.contract_id):
+        if status in FINISHED_STATUSES or status == "running" \
+                or store.candidates_for(self.contract_id):
             return self._already_run(status)
+
+        # Claim the run BEFORE any worktree is created (fix spec G9;
+        # round-4 contest-core F7): the worktree manager's claim file
+        # is atomic across processes, and the contract row flips to
+        # "running" so any second run — sequential or racing — answers
+        # already_run instead of colliding on worktree/branch names
+        # (which carry the attempt: a racing run never gets far enough
+        # to mint its own). The claim is released only on a baseline
+        # refusal, the one exit that leaves the contract re-runnable.
+        claimed_file = False
+        claim_run = getattr(self.mgr, "claim_run", None)
+        if callable(claim_run):
+            if not claim_run(self.contract_id):
+                return self._already_run("running")
+            claimed_file = True
+        claimed_status = False
+        set_status = getattr(store, "set_contract_status", None)
+        if callable(set_status):
+            set_status(self.contract_id, "running")
+            claimed_status = True
 
         # Baseline rule (invariant 3): the acceptance suite must have FAILED
         # on the unmodified baseline before any candidate is dispatched.
@@ -355,13 +497,23 @@ class _Run:
                     note="acceptance passed on baseline; contract refused as vacuous",
                     provenance="internal",
                 )
+                # A refused contract is re-verifiable on its next run
+                # (Wave 2.7): the run claim goes back so that run can
+                # take it.
+                if claimed_file:
+                    release_run = getattr(self.mgr, "release_run", None)
+                    if callable(release_run):
+                        release_run(self.contract_id)
                 return {
                     "contract_id": self.contract_id, "status": "refused_baseline",
                     "detail": "acceptance tests pass on the baseline; the contract is vacuous and was refused",
                     "baseline": detail, "events": self.events,
                 }
             if status == "refused":
-                store.set_contract_status(self.contract_id, "open")
+                if not claimed_status:
+                    # With a run claim the row already reads "running"
+                    # and this run owns it; without one, re-open as before.
+                    store.set_contract_status(self.contract_id, "open")
                 store.add_ledger(
                     target_id=self.target_id, contract_id=self.contract_id, candidate_id=None,
                     stage=self.contract["stage"], expert_id="queue", tokens_in=None,
@@ -388,6 +540,17 @@ class _Run:
         last_gate_details: dict = {"measurements": [], "hard_failures": [], "judged": None,
                                    "candidate_experts": {}, "winner_expert": None,
                                    "loser_experts": [], "escalation_reason": None}
+
+        # Slot guard BEFORE the wave (fix spec G9; round-3 contest-core
+        # F8): the check used to sit after dispatch, where it could
+        # never fire — the 27th contestant died on SLOTS[i] with an
+        # IndexError mid-wave and burned the contract id.
+        if len(contestants) > len(SLOTS):
+            return self._escalate(
+                attempt,
+                f"panel field {len(contestants)} exceeds the slot capacity {len(SLOTS)}",
+                last_gate_details,
+            )
 
         while True:
             exhausted = self._budget_exhausted()
@@ -425,20 +588,11 @@ class _Run:
                     last_gate_details,
                 )
 
-            if len(generated) > len(SLOTS):
-                return self._escalate(
-                    attempt,
-                    f"panel field {len(generated)} exceeds the slot capacity {len(SLOTS)}",
-                    last_gate_details,
-                )
-
             # Gates, in rank order, per candidate.
             gate_results: dict[str, gates_mod.CandidateGateResult] = {}
             diffs: dict[str, str] = {}
             for cand, _gen in generated:
-                gr = gates_mod.evaluate_candidate(
-                    store, self.contract, cand, Path(cand["worktree"])
-                )
+                gr = self._evaluate_candidate(cand)
                 gate_results[cand["id"]] = gr
                 diffs[cand["id"]] = self.mgr.diff(cand["worktree"])
                 for mlist in gr.measured:
@@ -540,15 +694,50 @@ class _Run:
                 judged_retries += 1
                 retry_notes = self._failure_notes(attempt, generated, gate_results, judged_map)
                 attempt += 1
+                self._cleanup_attempt_worktrees(wave)
                 continue
             if attempt < MAX_ATTEMPTS:
                 retry_notes = self._failure_notes(attempt, generated, gate_results, judged_map)
                 attempt += 1
+                self._cleanup_attempt_worktrees(wave)
                 continue
             self._emit(
                 "retry_cap", f"retry cap {MAX_ATTEMPTS} reached on attempt {attempt}"
             )
             return self._escalate(attempt, f"retry cap {MAX_ATTEMPTS} reached", last_gate_details)
+
+    # -- gates -----------------------------------------------------------
+    def _evaluate_candidate(self, cand):
+        """Run one candidate's gates. A ``GateError`` — a sensor that
+        produced unparseable output, a metric of an unusable type —
+        eliminates THAT candidate with the reason recorded (fix spec
+        G7 tail; round-4 contest-core F3): the baseline path already
+        treats a broken sensor as data, and a candidate's broken gate
+        must never propagate out of ``run_contract`` and strand the
+        contract at "open" with its id spent."""
+        try:
+            return gates_mod.evaluate_candidate(
+                self.store, self.contract, cand, Path(cand["worktree"])
+            )
+        except GateError as exc:
+            reason = str(exc)
+            self.gate_errors[cand["id"]] = reason
+            try:
+                self.store.add_ledger(
+                    target_id=self.target_id, contract_id=self.contract_id,
+                    candidate_id=cand["id"], stage=self.contract["stage"],
+                    expert_id=cand["expert_id"], tokens_in=None,
+                    tokens_out=None, cost_usd=None, outcome="observed",
+                    note=f"gate error eliminated candidate {cand['id']}: {reason}",
+                    provenance="internal",
+                )
+            except Exception:  # noqa: BLE001 - bookkeeping must not break a run
+                pass
+            return gates_mod.CandidateGateResult(
+                candidate_id=cand["id"], provenance_ok=True,
+                eliminated_at="gate_error", hard=[], measured=[],
+                hard_pass=False, measured_pass=None,
+            )
 
     # -- matrix bracket (v0.3) -------------------------------------------
     def _run_matrix(self, judged_item, field, generated, gate_results, diffs,
@@ -636,9 +825,7 @@ class _Run:
                     cand = by_id.get(cid)
                     if cand is None:
                         continue
-                    new_gr = gates_mod.evaluate_candidate(
-                        store, self.contract, cand, Path(cand["worktree"])
-                    )
+                    new_gr = self._evaluate_candidate(cand)
                     gate_results[cid] = new_gr
                     # The re-run's rows are the deciding evidence from here
                     # (fix pass Wave 2.8, review M5): refresh what the Lesson
@@ -934,6 +1121,11 @@ class _Run:
                             f"- candidate {cand['id']} measured gate: {m['metric']} = {m['value']}, "
                             f"required {m['op']} {m['threshold']}"
                         )
+            elif gr.eliminated_at == "gate_error":
+                lines.append(
+                    f"- candidate {cand['id']} gate error: "
+                    f"{self.gate_errors.get(cand['id'], 'gate execution failed')}"
+                )
             elif judged_map and cand["id"] in judged_map and not judged_map[cand["id"]]["pass"]:
                 lines.append(
                     f"- candidate {cand['id']} judged gate: median {judged_map[cand['id']]['median_mean']} "
@@ -1054,6 +1246,7 @@ class _Run:
             escalated=False, escalation_reason=None, waiver=waiver,
             human_gate="pending", tie_break=tie_break,
         )
+        self._snapshot_winner(winner)
         category = router_mod.category_of(self.contract["domain"])
         store.record_expert_result(winner["expert_id"], category, won=True)
         self._record_validity(winner, eliminated, gate_results, judged_map)
@@ -1085,7 +1278,10 @@ class _Run:
         }
         if self.route_hold is not None:
             result["route_change_hold"] = self.route_hold
-        _attach_certificate(result, store, self.contract_id)
+        # No certificate here (fix spec G1; round-4 regression F1): the
+        # gate has not decided — a pending, refused, or rejected result
+        # carries no stamp and no token. record_human_gate attaches
+        # the certificate only once the decision completes.
         # The gate is pending from here until record_human_gate completes
         # it — whether the decider answers now or an operator does later;
         # a refused decision leaves the contract at its gate (Wave 2.7).
@@ -1097,9 +1293,39 @@ class _Run:
             return self._apply_human_gate(verdict_id, decision, result)
         return result
 
+    def _snapshot_winner(self, winner):
+        """Commit the winner's worktree AT VERDICT TIME and re-point
+        the candidate's payload hash at that commit (fix spec G1;
+        round-4 contest-core F1).
+
+        What merges is what was gated: the human gate merges this
+        snapshot commit, never the live worktree, which sits mutable
+        between verdict and decision (gate-command side effects, stray
+        files, a hand edit). Best-effort — if the snapshot cannot be
+        taken, the gate falls back to the legacy live-tree merge and
+        says so in its result detail."""
+        try:
+            commit = self.mgr.commit_all(
+                Path(winner["worktree"]),
+                f"critic: {self.contract_id} verdict snapshot {winner['id']}",
+            )
+        except Exception:  # noqa: BLE001 - the gate's fallback covers us
+            return
+        if not commit:
+            return
+        setter = getattr(self.store, "set_candidate_payload_hash", None)
+        try:
+            if callable(setter):
+                setter(winner["id"], commit)
+            else:
+                self.store.update_candidate(winner["id"], payload_hash=commit)
+        except Exception:  # noqa: BLE001 - bookkeeping must not break a verdict
+            pass
+
     def _apply_human_gate(self, verdict_id, decision, result):
         return record_human_gate(
-            self.store, self.contract_id, decision, _result=result, _mgr=self.mgr
+            self.store, self.contract_id, decision, _result=result,
+            _mgr=self.mgr, channel=self.channel,
         )
 
     # -- escalation / lesson ---------------------------------------------
@@ -1126,10 +1352,19 @@ class _Run:
             tokens_out=None, cost_usd=None, outcome="escalated", note=reason,
             provenance="internal",
         )
-        self._record_validity(None, [], {}, judged)
+        # Escalated runs credit the validity they measured (fix spec
+        # G8; round-3 contest-core F7): the scored candidates of the
+        # deciding attempt are the recording list — before, an empty
+        # list dropped every median the matrix had recorded.
+        self._record_validity(None, eliminated, {}, judged)
         gate_details["escalation_reason"] = reason
         lesson_id = self._write_lesson(attempt, gate_details)
         store.set_contract_status(self.contract_id, "escalated")
+        # Terminal state: the field's worktree dirs and branches go
+        # away (fix spec G9; round-4 contest-core F4) — an escalated
+        # run used to leave every checkout and branch behind, forever.
+        _remove_candidate_worktrees(
+            store, self.mgr, self.contract_id, delete_branches=True)
         result = {
             "contract_id": self.contract_id, "status": "escalated",
             "detail": reason, "verdict_id": verdict_id, "lesson_id": lesson_id,
@@ -1232,44 +1467,82 @@ def _attach_certificate(result, store, contract_id):
     return result
 
 
-def run_contract(store, contract: dict, repo_path, executors: dict, human_decider=None) -> dict:
+def run_contract(store, contract: dict, repo_path, executors: dict, human_decider=None,
+                 channel: str = "cli") -> dict:
     """Run one contract end-to-end. See module docstring for outcomes."""
-    return _Run(store, contract, repo_path, executors, human_decider).run()
+    return _Run(store, contract, repo_path, executors, human_decider,
+                channel=channel).run()
 
 
 def record_human_gate(store, contract_id: str, decision: str, reason: str | None = None,
-                      _result: dict | None = None, _mgr: WorktreeManager | None = None) -> dict:
+                      _result: dict | None = None, _mgr: WorktreeManager | None = None,
+                      channel: str = "cli") -> dict:
     """Complete a pending human gate: approved merges the winner and
     writes the final answer — refused when the verdict carries an offered
     waiver (the winner failed the measured gate), where only an explicit
     ``waived`` merges and is recorded on the verdict row as granted;
     waived applies only to a measured failure, never a hard one; rejected
-    creates a new contract carrying the rejection."""
+    creates a new contract carrying the rejection.
+
+    The gate is claimed atomically BEFORE anything merges (fix spec G1;
+    round-4 security F4, contest-core F2): the claim IS the decision
+    record, so a concurrent decider gets the no-pending-gate error and
+    exactly one final answer is ever written. The decision's ``by`` is
+    the ``channel`` it arrived through — "cli" by default, "tool" from
+    the plugin's gate tool — never a hardcoded "human" (round-4
+    security F7). The merge takes the verdict-time snapshot commit
+    recorded on the winner, never the live worktree (contest-core F1);
+    verdicts without a snapshot (legacy rows) fall back to merging the
+    live tree, and the result says so. The certificate attaches only
+    once the decision completes — refused, rejected, and error results
+    carry no stamp and no token (round-4 regression F1).
+    """
     if decision not in ("approved", "rejected", "waived"):
         return {"contract_id": contract_id, "status": "error",
                 "detail": f"unknown human-gate decision {decision!r}"}
     verdict = store.latest_verdict(contract_id)
-    if verdict is None or verdict.get("human_gate") != "pending":
+    if verdict is None:
         return {"contract_id": contract_id, "status": "error",
                 "detail": "no pending human gate for this contract"}
     contract = store.get_contract(contract_id)
     mgr = _mgr or WorktreeManager(Path(contract["repo_path"]))
+    winner = store.get_candidate(verdict["winner"]) if verdict.get("winner") else None
+    waiver = verdict.get("waiver") or {}
+    pending = verdict.get("human_gate") == "pending"
+
+    # Refusals that leave the gate pending are decided BEFORE the
+    # claim: they record nothing, consume nothing, and carry no
+    # certificate.
+    if pending and decision == "approved" and waiver and winner is not None:
+        # The winner failed the measured gate (fix pass Wave 2.7, review
+        # H6, invariant 6): the only way past a measured failure is an
+        # explicit waiver, recorded as such. A plain approval would merge
+        # the failure silently with the row still saying "offered".
+        result = dict(_result or {"contract_id": contract_id})
+        result.update({
+            "status": "error", "human_gate": "pending",
+            "detail": (
+                f"approval refused: winner {winner['id']} failed the measured gate and "
+                "the verdict carries an offered waiver; waive it explicitly (decision "
+                "'waived', with a reason) or reject — the gate stays pending"
+            ),
+        })
+        return result
+    if pending and decision == "waived":
+        if waiver.get("gate") != "measured" or winner is None \
+                or waiver.get("candidate") != winner["id"]:
+            return {"contract_id": contract_id, "status": "error",
+                    "detail": "waiver applies only to a measured failure, never a hard one"}
+
+    # The claim IS the decision record — taken before any merge, never
+    # replayable, never swallowed after the fact.
+    if not _claim_gate(store, verdict, decision):
+        return {"contract_id": contract_id, "status": "error",
+                "detail": "no pending human gate for this contract"}
     result = dict(_result or {"contract_id": contract_id})
     result["human_gate"] = decision
-    _attach_certificate(result, store, contract_id)
-
-    def _record_decision(value):
-        # The decision is a verdict-row fact (fix pass Wave 2.6, review H5):
-        # once recorded, the gate is no longer pending and cannot be replayed.
-        setter = getattr(store, "set_verdict_human_gate", None)
-        if callable(setter):
-            try:
-                setter(verdict["id"], value)
-            except Exception:  # noqa: BLE001 - bookkeeping must not undo a decision
-                pass
 
     if decision == "rejected":
-        _record_decision("rejected")
         new_id = f"{contract_id}_rej{verdict['attempt']}"
         if store.get_contract(new_id) is None:
             store.create_contract(
@@ -1289,46 +1562,66 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
              "reason": reason or "rejected at the human gate"},
         )
         store.set_contract_status(contract_id, "rejected")
+        # Terminal state: the field's worktree dirs and branches go
+        # away (fix spec G9; round-4 contest-core F4). No certificate:
+        # a rejected verdict certifies nothing (regression F1).
+        _remove_candidate_worktrees(store, mgr, contract_id, delete_branches=True)
         result.update({"status": "rejected", "new_contract_id": new_id})
         return result
 
-    winner = store.get_candidate(verdict["winner"])
-    waiver = verdict.get("waiver") or {}
-    if decision == "approved" and waiver:
-        # The winner failed the measured gate (fix pass Wave 2.7, review
-        # H6, invariant 6): the only way past a measured failure is an
-        # explicit waiver, recorded as such. A plain approval would merge
-        # the failure silently with the row still saying "offered".
-        result.update({
-            "status": "error", "human_gate": "pending",
-            "detail": (
-                f"approval refused: winner {winner['id']} failed the measured gate and "
-                "the verdict carries an offered waiver; waive it explicitly (decision "
-                "'waived', with a reason) or reject — the gate stays pending"
-            ),
-        })
-        return result
-    if decision == "waived":
-        if waiver.get("gate") != "measured" or waiver.get("candidate") != winner["id"]:
-            return {"contract_id": contract_id, "status": "error",
-                    "detail": "waiver applies only to a measured failure, never a hard one"}
-    # approved (or a valid measured waiver): merge the winner.
+    # approved (or a valid measured waiver): merge the winner's
+    # verdict-time snapshot — what was gated — never the live tree.
     wt = Path(winner["worktree"])
-    commit = mgr.commit_all(wt, f"critic: {contract_id} winner {winner['id']} ({decision})")
-    merged_sha = mgr.merge_into_main(wt)
+    snapshot = winner.get("payload_hash")
+    is_commit = getattr(mgr, "is_commit", None)
+    merge_commit = getattr(mgr, "merge_commit_into_main", None)
+    used_snapshot = bool(
+        snapshot and callable(is_commit) and callable(merge_commit)
+        and is_commit(snapshot)
+    )
+    if used_snapshot:
+        commit = snapshot
+        merged_sha = merge_commit(snapshot)
+        result["merge_source"] = "verdict_snapshot"
+    else:
+        # Legacy verdict (no snapshot on record): merge the live
+        # worktree as it stands, and say so in the result.
+        commit = mgr.commit_all(wt, f"critic: {contract_id} winner {winner['id']} ({decision})")
+        merged_sha = mgr.merge_into_main(wt)
+        result["merge_source"] = "live_worktree_legacy"
+        note = ("no verdict-time snapshot on record for the winner; "
+                "merged the live worktree as it stands (legacy fallback)")
+        result["detail"] = (
+            f"{result['detail']}; {note}" if result.get("detail") else note
+        )
     for loser_id in verdict.get("eliminated", []):
         loser = store.get_candidate(loser_id)
         if loser and Path(loser["worktree"]).exists():
             mgr.keep_as_ref(contract_id, loser["slot"])
     mgr.remove(wt)
+    # Terminal state: the winner's branch is merged and spent, and the
+    # baseline branch dies with the contract (fix spec G9). Loser
+    # branches stay as refs — the keep_as_ref idiom above.
+    deleter = getattr(mgr, "delete_branch", None)
+    if callable(deleter):
+        try:
+            deleter(_branch_for_worktree(wt))
+        except Exception:  # noqa: BLE001 - cleanup must not undo a merge
+            pass
+        try:
+            deleter(f"critic/{contract_id}/baseline")
+        except Exception:  # noqa: BLE001
+            pass
     waiver_record = None
     if decision == "waived":
-        # The waiver is granted, by a human, for a reason — on the verdict
-        # row, not only in the run result (fix pass Wave 2.7, review H6).
+        # The waiver is granted, by the deciding channel, for a reason
+        # — on the verdict row, not only in the run result (fix pass
+        # Wave 2.7, review H6; the channel replaces the old hardcoded
+        # "human", round-4 security F7).
         waiver_record = dict(waiver)
         waiver_record.update({
-            "gate": "measured", "status": "granted", "by": "human",
-            "provenance": "human", "candidate": winner["id"],
+            "gate": "measured", "status": "granted", "by": channel,
+            "provenance": channel, "candidate": winner["id"],
             "reason": reason or "waived at the human gate",
         })
         setter = getattr(store, "set_verdict_waiver", None)
@@ -1342,8 +1635,10 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
         commit=f"git:{merged_sha}",
         intent_check=None, human_gate=decision,
     )
-    _record_decision(decision)
     store.set_contract_status(contract_id, "completed")
     result.update({"status": "completed", "commit": f"git:{merged_sha}",
                    "winner_commit": f"git:{commit}", "waiver": waiver_record})
+    # The certificate attaches ONLY now — a completed, gate-decided
+    # state (fix spec G1; round-4 regression F1).
+    _attach_certificate(result, store, contract_id)
     return result
