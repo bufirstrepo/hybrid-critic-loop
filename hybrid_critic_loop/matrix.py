@@ -1011,6 +1011,14 @@ def _judged_negatives(judged):
     return negatives
 
 
+#: Elimination kinds that ARE decidable negatives (round-5 fix spec
+#: H5, round-5 gate-core F5): the gates or the judging killed the
+#: candidate on evidence a validity score can be graded against.
+#: "bracket_cut" is deliberately absent — a cut passer decided
+#: nothing (see _decidable_outcomes).
+_ELIMINATED_KIND_NEGATIVES = ("hard", "measured", "gate_error", "judged")
+
+
 def _decidable_outcomes(candidates_by_id, verdicts_by_contract):
     """{candidate_id: True (positive) / False (negative)} for candidates
     with a KNOWN decidable outcome; unlisted candidates are unknown.
@@ -1026,6 +1034,16 @@ def _decidable_outcomes(candidates_by_id, verdicts_by_contract):
     so the list itself is never read as ground truth), and ALL
     candidates of an escalated verdict (that contest produced no
     winner; its judged map grades nobody).
+
+    Round-5 fix spec H5 (round-5 gate-core F5): the loop now persists
+    the elimination kind on the candidate row (``eliminated_kind``:
+    hard | measured | gate_error | judged | bracket_cut). A row
+    carrying it is governed by it: the four evidence kinds are
+    negatives — ``gate_error`` included, so a candidate the gates
+    killed on re-check after scoring is graded, not silently dropped
+    — bracket_cut is excluded, and candidates of an escalated verdict
+    stay excluded whole. Rows WITHOUT the field keep the pre-fix
+    ``eliminated_at`` behavior exactly.
     """
     outcomes: dict = {}
     for contract_id, verdict in verdicts_by_contract.items():
@@ -1040,6 +1058,17 @@ def _decidable_outcomes(candidates_by_id, verdicts_by_contract):
             if cid != winner:
                 outcomes[cid] = False
     for cid, candidate in candidates_by_id.items():
+        kind = candidate.get("eliminated_kind")
+        if kind is not None:
+            if kind in _ELIMINATED_KIND_NEGATIVES:
+                verdict = verdicts_by_contract.get(
+                    candidate.get("contract_id"))
+                if isinstance(verdict, dict) and verdict.get("escalated"):
+                    continue  # escalated verdicts stay excluded whole
+                if outcomes.get(cid) is not True:
+                    outcomes[cid] = False
+            # bracket_cut (or an unknown kind): excluded, not decidable.
+            continue
         eliminated_at = candidate.get("eliminated_at")
         if eliminated_at in ("hard", "measured", "provenance"):
             if outcomes.get(cid) is not True:
@@ -1081,8 +1110,11 @@ def _row_round(row):
 
     run_matrix tags each cell's per-row detail dicts with the round
     (round-3 contest-core F6); untagged rows — legacy rows, judged-gate
-    rows, rows from callers that name no round — return None and are
-    each counted on their own, exactly as before the tag existed.
+    rows, rows from callers that name no round — return None.  An
+    untagged row is its (judge, gate) pair's ROUND 0 (round-5 fix spec
+    H5, round-5 gate-core F6): a tagged row for the same pair
+    supersedes the pair's untagged rows in compute_calibration, while
+    a pair with only untagged rows keeps counting them individually.
     """
     details = row.get("details")
     if isinstance(details, dict):
@@ -1097,12 +1129,13 @@ def compute_calibration(store, experts) -> dict:
 
     For each scored candidate with a known decidable outcome (verdict
     winner of a non-escalated verdict = positive; judged-losing or
-    hard/measured/provenance-eliminated = negative; bracket-cut passers
-    and every candidate of an escalated verdict excluded — see
-    _decidable_outcomes), a cell in gate "matrix"/"judged" AGREES if
-    (score >= 5) == positive. A judge–candidate pair's rows are counted
-    once per bracket round, at their latest values (see the supersede
-    pass below).
+    eliminated with kind hard/measured/gate_error/judged = negative;
+    bracket-cut passers and every candidate of an escalated verdict
+    excluded — see _decidable_outcomes), a cell in gate "matrix"/"judged"
+    AGREES if (score >= 5) == positive. A judge–candidate pair's rows
+    are counted once per bracket round, at their latest values (see
+    the supersede pass below); untagged rows are the pair's round 0
+    and are superseded by any tagged row for the pair (round-5 H5).
     calibration = (agree + 2*0.5) / (n + 2) -- Laplace smoothing toward
     the 0.5 prior. ``active`` is True once n >= 5; before that the
     effective weight elsewhere is the prior (see _effective_calibration).
@@ -1150,12 +1183,24 @@ def compute_calibration(store, experts) -> dict:
         # latest row of each (judge, gate, round) counts — each
         # judge–candidate pair contributes its latest row per round
         # exactly once, to agreement and to the bias means alike.
-        # Untagged rows keep their own identity and count individually.
+        # Round 0 (round-5 fix spec H5, round-5 gate-core F6): untagged
+        # rows are the pair's round 0 — when the pair has ANY tagged
+        # row, its untagged rows are superseded wholesale (a pre-fix
+        # book's re-run rows no longer double-count beside their tagged
+        # successors); a pair with only untagged rows keeps counting
+        # them individually, exactly as before.
+        tagged_pairs = {
+            (row.get("judge_id"), row.get("gate"))
+            for row in rows
+            if _row_round(row) is not None
+        }
         latest_by_key: dict = {}
         ordered_keys: list = []
         for position, row in enumerate(rows):
             round_tag = _row_round(row)
             if round_tag is None:
+                if (row.get("judge_id"), row.get("gate")) in tagged_pairs:
+                    continue  # round 0, superseded by the pair's tagged rows
                 key = ("row", position)
             else:
                 key = ("round", row.get("judge_id"), row.get("gate"), round_tag)

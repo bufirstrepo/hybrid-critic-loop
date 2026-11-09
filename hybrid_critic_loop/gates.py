@@ -92,7 +92,24 @@ def exit_matches(exit_code, expected) -> bool:
 
 # ------------------------------------------------------- gate environment
 
-_SECRET_ENV_PATTERNS = ("*_KEY", "*_TOKEN", "*_SECRET", "*PASSWORD*")
+_SECRET_ENV_PATTERNS = (
+    "*_KEY", "*_TOKEN", "*_SECRET", "*PASSWORD*",
+    # Round-5 fix spec H6 (round-5 security F3): suffix carriers the
+    # original four missed — anything ending in credentials or a DSN.
+    "*_CREDENTIALS", "*_DSN",
+)
+
+#: Exact names stripped regardless of suffix shape (round-5 spec H6,
+#: round-5 security F3): standard credential carriers that end in
+#: none of the patterns — a database URL carries an embedded password,
+#: the Google variable points at a credential FILE, and the AWS pair
+#: ends in _ID / is named outright.
+_SECRET_ENV_NAMES = frozenset({
+    "DATABASE_URL",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+})
 
 
 def scrubbed_env_names(env=None) -> list:
@@ -105,11 +122,19 @@ def scrubbed_env_names(env=None) -> list:
     are stripped from the env copy handed to gate commands. Executor
     dispatch (generation) keeps the full environment — only gate and
     sensor commands are scrubbed.
+
+    Round-5 spec H6 (round-5 security F3) adds the *_CREDENTIALS and
+    *_DSN suffixes and the _SECRET_ENV_NAMES exact names.  Honest
+    scope: this scrubs the child's OWN environment — a gate command
+    runs as the operator and can still read the parent process's
+    environment (e.g. /proc), so the scrub is hygiene against casual
+    inheritance; the code-execution disclosure is the real control.
     """
     source = os.environ if env is None else env
     return sorted(
         name for name in source
-        if any(fnmatch.fnmatchcase(name, pattern)
+        if name in _SECRET_ENV_NAMES
+        or any(fnmatch.fnmatchcase(name, pattern)
                for pattern in _SECRET_ENV_PATTERNS)
     )
 
