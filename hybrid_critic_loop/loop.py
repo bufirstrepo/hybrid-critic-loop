@@ -158,6 +158,45 @@ _ELIMINATED_KINDS = {
 # elimination class is a gate failure everywhere by construction.
 _GATE_FAILED_KINDS = frozenset(_ELIMINATED_KINDS.values())
 
+# The persisted elimination kinds that are NOT gate failures: the
+# candidate passed the decidable gates and was eliminated later, by
+# the judged gate ("judged") or by the bracket ("bracket_cut").
+_NON_GATE_ELIMINATION_KINDS = frozenset({"judged", "bracket_cut"})
+
+
+def _elimination_is_gate_failure(kind) -> bool:
+    """Whether a candidate row's persisted elimination kind counts
+    as a GATE failure for the route derivation (round-12 fix spec,
+    Unit L; round-12 attack A4).
+
+    The registered kinds answer from _GATE_FAILED_KINDS. A kind
+    outside every registered class is ALSO a gate failure: the row
+    was eliminated by something, it is not one of the two documented
+    later-stage eliminations, and the burden of proof is on passing
+    — the by-construction claim ("a future gate class is a gate
+    failure everywhere") must not silently invert for a kind string
+    no producer in this tree writes."""
+    if not kind:
+        return False
+    if kind in _GATE_FAILED_KINDS:
+        return True
+    return kind not in _NON_GATE_ELIMINATION_KINDS
+
+
+def _row_evidence(row) -> dict:
+    """A candidate row's evidence as a dict — {} for any other shape
+    (round-12 fix spec, Unit L; round-12 attack A5).
+
+    Evidence is store JSON; a planted or legacy row can carry a
+    non-dict value (a bare string, a list). Readers of the trusted
+    elimination record coerce at the read instead of crashing on the
+    shape — a crash inside _write_lesson would land AFTER the
+    verdict exists and strand the run's bookkeeping."""
+    if not isinstance(row, dict):
+        return {}
+    evidence = row.get("evidence")
+    return evidence if isinstance(evidence, dict) else {}
+
 
 def _measurement_failed(row) -> bool:
     """True when a measurement row records a failure, in either shape
@@ -1329,7 +1368,9 @@ class _Run:
                     # Fall through to the single_passer verdict below.
                     pass
                 else:
-                    outcome = self._run_judged(judged_item, survivors, gate_results, diffs)
+                    outcome = self._run_judged(
+                        judged_item, survivors, gate_results, diffs,
+                        seed=attempt)
                     if outcome is None:  # panel could not be fielded
                         return self._escalate(
                             attempt,
@@ -1395,12 +1436,31 @@ class _Run:
             all_judged_below = bool(judged_items) and all(
                 gate_results[c["id"]].eliminated_at is None for c, _ in generated
             ) and generated
-            if all_judged_below and judged_retries < JUDGED_RETRIES:
+            if (all_judged_below and judged_retries < JUDGED_RETRIES
+                    and attempt < MAX_ATTEMPTS):
                 judged_retries += 1
                 retry_notes = self._failure_notes(attempt, generated, gate_results, judged_map)
                 attempt += 1
                 self._cleanup_attempt_worktrees(wave)
                 continue
+            if all_judged_below and judged_retries < JUDGED_RETRIES:
+                # The judged retry remains but the attempt ceiling
+                # does not: MAX_ATTEMPTS binds every retry path,
+                # including this one (round-12 fix spec, Unit L;
+                # round-12 gatecore G1). A contract STARTING at
+                # attempt >= MAX_ATTEMPTS used to dispatch one more
+                # full generation + judging wave through the judged
+                # branch while the generic hard/measured branch
+                # starting at the same attempt dispatched none — the
+                # ceiling is a property of the contract's attempt
+                # budget, not of the failure class, so the judged
+                # branch escalates on the same retry-cap terms.
+                self._emit(
+                    "retry_cap", f"retry cap {MAX_ATTEMPTS} reached on attempt {attempt}"
+                )
+                return self._escalate(
+                    attempt, f"retry cap {MAX_ATTEMPTS} reached",
+                    last_gate_details, judged=judged_map)
             if all_judged_below:
                 # The legacy judged retry is spent: escalate, as the
                 # queue spec in the module docstring says ("a legacy
@@ -1845,7 +1905,8 @@ class _Run:
         return judged
 
     # -- judged ----------------------------------------------------------
-    def _run_judged(self, judged_item, survivors, gate_results, diffs):
+    def _run_judged(self, judged_item, survivors, gate_results, diffs,
+                    seed=0):
         store = self.store
         category = router_mod.category_of(self.contract["domain"])
         route = router_mod.route_for(store, category)
@@ -1871,9 +1932,15 @@ class _Run:
         except PanelError:
             return None
         judge_executors = {jid: self.executors[jid] for jid in panel}
+        # The gate shuffles under the ATTEMPT seed, exactly as the
+        # matrix path does (round-12 fix spec, Unit L; round-12
+        # gatecore G2): a constant seed made every attempt present
+        # candidates to each judge in the identical order, so the
+        # persisted position_shown evidence could never vary across
+        # a retry — the retry re-judged the same presentation.
         return judges_mod.run_judged_gate(
             store, self.contract, judged_item, survivors, gate_results, diffs,
-            judge_executors, panel,
+            judge_executors, panel, seed=seed,
         )
 
     # -- winner / verdict ------------------------------------------------
@@ -1892,8 +1959,16 @@ class _Run:
         by_tokens = sorted(survivors, key=_tokens_total)
         if _tokens_total(by_tokens[0]) < _tokens_total(by_tokens[-1]):
             return by_tokens[0], "fewer_tokens"
-        by_time = sorted(
-            survivors, key=lambda c: self.durations.get(c["id"], float("inf")))
+        def _duration(candidate):
+            # A recorded None is no measurement (round-12 fix spec,
+            # Unit L; round-12 gatecore G3): it sorts slowest, like
+            # a missing entry — never a TypeError against a real
+            # duration. Shape hardening: no in-tree executor records
+            # None today (_dispatch stores duration_ms uncoerced).
+            recorded = self.durations.get(candidate["id"])
+            return float("inf") if recorded is None else recorded
+
+        by_time = sorted(survivors, key=_duration)
         return by_time[0], "wall_clock_ms"
 
     def _failure_notes(self, attempt, generated, gate_results, judged_map) -> str:
@@ -2272,8 +2347,16 @@ class _Run:
                 ]
                 # The rows' elimination records are the source of
                 # truth for the remaining gate classes (and for any
-                # future one — _GATE_FAILED_KINDS derives from
-                # _ELIMINATED_KINDS, not from an enumeration here).
+                # future one): _elimination_is_gate_failure answers
+                # the registered kinds from _GATE_FAILED_KINDS and
+                # treats any OTHER non-empty kind as a gate failure
+                # too — only "judged" and "bracket_cut", the two
+                # documented later-stage eliminations, keep a row in
+                # the passed set (round-12 attack A4). The evidence
+                # read is shape-coerced (_row_evidence): a non-dict
+                # evidence value on a deciding row must not crash
+                # this derivation after the verdict exists
+                # (round-12 attack A5).
                 # This also covers dissent re-run eliminations: the
                 # re-run refresh path marks the same rows via
                 # _mark_eliminated, so the complete derivation applies
@@ -2281,8 +2364,8 @@ class _Run:
                 failed_cids |= {
                     c["id"]
                     for c in deciding_rows
-                    if (c.get("evidence") or {}).get("eliminated_kind")
-                    in _GATE_FAILED_KINDS
+                    if _elimination_is_gate_failure(
+                        _row_evidence(c).get("eliminated_kind"))
                 }
                 deciding_cids = {c["id"] for c in deciding_rows}
                 gate_passed = {

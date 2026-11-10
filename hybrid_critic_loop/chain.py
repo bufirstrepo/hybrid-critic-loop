@@ -1234,11 +1234,18 @@ def _normalized_commit(value):
     spec, Unit B; round-11 attack F7): whitespace stripped, the
     ``git:`` prefix stripped, the sha lowercased. Applied to BOTH
     sides of a comparison — a baseline recorded in ``git:`` form
-    or uppercase is still the baseline."""
+    or uppercase is still the baseline. The prefix is recognized
+    case-insensitively (round-12 fix spec, Unit L; round-12 store
+    S3): a baseline stored ``GIT:``/``Git:``-prefixed used to
+    normalize to ``git:<sha>`` and never equal the bare sha,
+    slipping the verdict leg's baseline exclusion. This widens
+    only the prefix recognition — the documented N1 residual
+    (a lowercase ``git:``-form fabricated commit on an unsettled
+    book) is untouched and still completes."""
     if not isinstance(value, str):
         return value
     text = value.strip()
-    if text.startswith("git:"):
+    if text[:4].lower() == "git:":
         text = text[len("git:"):]
     return text.lower()
 
@@ -1786,6 +1793,22 @@ def verify_certificate(store, token):
     upto = payload["ledger_upto"]
     ok, bad_id = verify_chain(store, upto_id=upto)
     if not ok:
+        # Older-form wording (round-12 fix spec, Unit L; round-12
+        # store S5): a first bad row sealed under a historical
+        # canonical form is an older-form book, not a broken one —
+        # the same discrimination every standing/report surface
+        # makes (round-7 fix spec K9; round-11 store F1). The
+        # verification outcome is unchanged; only the reason names
+        # the state correctly.
+        try:
+            from .standing import _bad_row_older_form
+
+            older_form = _bad_row_older_form(store, bad_id)
+        except Exception:  # noqa: BLE001 - wording never breaks verify
+            older_form = False
+        if older_form:
+            return False, (
+                f"ledger sealed under an older form at row {bad_id}")
         return False, f"ledger chain broken at row {bad_id}"
     totals = run_totals(store, contract_id, upto_id=upto)
     if payload["tokens"] != totals["tokens"]:

@@ -96,7 +96,10 @@ def rank_candidates(candidates, validity: dict, durations: dict | None = None) -
     tokens -> +inf, and no recorded duration -> +inf (slowest) — a
     missing duration is not a 0 ms generation (round-11 gatecore F3;
     the same convention as ``loop._tokens_total``'s missing tokens).
-    Pure function of the recorded values — no store access.
+    A recorded None duration is no measurement either and sorts the
+    same way (round-12 gatecore G3) — shape hardening: no in-tree
+    executor records one today. Pure function of the recorded
+    values — no store access.
     """
     durations = durations or {}
 
@@ -106,12 +109,16 @@ def rank_candidates(candidates, validity: dict, durations: dict | None = None) -
             return float("inf")
         return float((tin or 0) + (tout or 0))
 
+    def _duration(candidate):
+        recorded = durations.get(candidate["id"])
+        return float("inf") if recorded is None else recorded
+
     return sorted(
         candidates,
         key=lambda c: (
             -(validity.get(c["id"]) if validity.get(c["id"]) is not None else -1.0),
             _tokens(c),
-            durations.get(c["id"], float("inf")),
+            _duration(c),
         ),
     )
 
