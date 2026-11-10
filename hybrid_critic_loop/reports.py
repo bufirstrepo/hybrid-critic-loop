@@ -747,7 +747,7 @@ def verdict_report(store, contract_id) -> str:
         else:
             from .standing import _unavailable_line
 
-            unavailable = _unavailable_line(_gate_bad)
+            unavailable = _unavailable_line(_gate_bad, store)
     except Exception:
         unavailable = None
     if unavailable is not None:

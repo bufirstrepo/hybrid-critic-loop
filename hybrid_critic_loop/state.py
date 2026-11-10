@@ -1753,7 +1753,11 @@ class Store:
         a vacated seat, else None), and ``displaced`` (a seat that
         lost a top slot to the promotion and was placed in the
         fallback, else None). When nothing changed the route
-        row is not rewritten at all.
+        row is not rewritten at all. In passed mode the report also
+        carries ``no_change_cause`` ("no_passer" / "already_lawful"
+        / None) distinguishing a demotion that could not move for
+        want of a gate-passing seat in the route from one that was
+        already satisfied (round-11 store F3).
         """
         route = self.get_route(category)
         if route is None:
@@ -1765,6 +1769,7 @@ class Store:
         branch = "none"
         promoted = None
         displaced = None
+        passed_order = []
         if promote_expert == demote_expert:
             promote_expert = None
         if passed_experts is not None:
@@ -1878,6 +1883,23 @@ class Store:
         result["demoted"] = demote_expert
         result["promoted"] = promoted if changed else None
         result["displaced"] = displaced if changed else None
+        if passed_experts is not None:
+            # Why a passed-mode demotion moved nothing (round-11
+            # store F3): "no_passer" — no gate-passing seat sits in
+            # the route to move the loser behind; "already_lawful" —
+            # gate-passing seats ARE in the route and the loser
+            # already sits behind every one of them, so the rebuilt
+            # order is the existing order. Callers must not record
+            # the second case as "no seat passed the deciding gate":
+            # a passer exists; there was simply nothing to promote
+            # it into. None when the route changed or the demotee
+            # holds no position.
+            if changed or branch not in ("primary", "compete_with", "fallback"):
+                result["no_change_cause"] = None
+            elif passed_order:
+                result["no_change_cause"] = "already_lawful"
+            else:
+                result["no_change_cause"] = "no_passer"
         return result
 
     # -- ledger --------------------------------------------------------------------
@@ -2307,6 +2329,21 @@ class Store:
         (``code.web`` for ``code.game``) and unrelated domains do not match.
         ``domain=None`` matches everything. ``limit=None`` returns every
         match; otherwise the top ``limit`` after ranking.
+
+        Named residual (round-11 performance F1): this reads and
+        ranks the WHOLE lessons table on every call — the limit is
+        applied after the full rank + sort — so the call is priced by
+        total lesson count, not by matches, on the per-hook path
+        (hooks -> lessons_context -> here). Measured trajectory
+        (medians, round-11 lane, this machine): 4,000 lessons ~36 ms
+        at limit 5; 20,000 ~254-274 ms; 50,000 ~745-809 ms (and
+        ~1.2-1.5 s at limit=None, the hook's shape). Immaterial at
+        the graded scale; unbounded as the append-only book grows.
+        The ranking (dotted-path domain family, JSON tag overlap,
+        newest) cannot be pushed into SQL without re-implementing it
+        there, and a domain index alone would not move the measured
+        trajectory (the graded books are single-domain) — documented
+        here and in the README rather than half-fixed.
         """
         rows = self._all("SELECT * FROM lessons")
         wanted = set(tags or [])

@@ -1392,6 +1392,30 @@ class _Run:
                 attempt += 1
                 self._cleanup_attempt_worktrees(wave)
                 continue
+            if all_judged_below:
+                # The legacy judged retry is spent: escalate, as the
+                # queue spec in the module docstring says ("a legacy
+                # rubric retries once, then escalates"). Falling
+                # through to the generic retry below silently granted
+                # a pure judged failure the full hard/measured attempt
+                # cap — a second full generation + judging wave — and
+                # made JUDGED_RETRIES dead weight: it never caused an
+                # earlier escalation (round-11 gatecore F2; the CODE
+                # was corrected to the docstring, not the reverse —
+                # the docstring is the spec text and the constant
+                # exists for exactly this branch).
+                self._emit(
+                    "retry_cap",
+                    f"legacy judged retry cap {JUDGED_RETRIES} reached "
+                    f"on attempt {attempt}",
+                )
+                return self._escalate(
+                    attempt,
+                    f"legacy judged gate below the minimum after "
+                    f"{JUDGED_RETRIES} "
+                    f"{'retry' if JUDGED_RETRIES == 1 else 'retries'}",
+                    last_gate_details, judged=judged_map,
+                )
             if attempt < MAX_ATTEMPTS:
                 retry_notes = self._failure_notes(attempt, generated, gate_results, judged_map)
                 attempt += 1
@@ -1848,7 +1872,8 @@ class _Run:
         by_tokens = sorted(survivors, key=_tokens_total)
         if _tokens_total(by_tokens[0]) < _tokens_total(by_tokens[-1]):
             return by_tokens[0], "fewer_tokens"
-        by_time = sorted(survivors, key=lambda c: self.durations.get(c["id"], 0))
+        by_time = sorted(
+            survivors, key=lambda c: self.durations.get(c["id"], float("inf")))
         return by_time[0], "wall_clock_ms"
 
     def _failure_notes(self, attempt, generated, gate_results, judged_map) -> str:

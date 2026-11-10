@@ -77,13 +77,12 @@ agreement-only calibration, penalty named as a gap, never faked.
 from __future__ import annotations
 
 import json
-import random
 import re
 import statistics
 import string
 from dataclasses import dataclass, field
 
-from .judges import _measured_summary_for_labels, blind_text
+from .judges import _measured_summary_for_labels, blind_text, seeded_shuffle_rng
 
 VALIDITY_ROWS = (
     "question_fidelity",
@@ -563,7 +562,7 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
             continue  # cannot verify the family -> cannot strip self-cells
         eligible_ids = set(eligible_by_family.get(judge_family, []))
         order = [c for c in candidates if _candidate_id(c) in eligible_ids]
-        rng = random.Random(hash((seed, judge_id)) & 0xFFFFFFFF)
+        rng = seeded_shuffle_rng(seed, judge_id)
         rng.shuffle(order)
         labels = _labels(len(order))
         labelled_diffs = {}

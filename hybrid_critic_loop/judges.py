@@ -20,6 +20,7 @@ The protocol, enforced in code rather than by convention:
 
 from __future__ import annotations
 
+import hashlib
 import random
 import re
 import statistics
@@ -35,6 +36,24 @@ _ABS_PATH_RE = re.compile(r"/(home|Users)/\S+")
 
 
 # ---------------------------------------------------------------- panel
+
+def seeded_shuffle_rng(seed, judge_id) -> random.Random:
+    """The per-judge presentation shuffle's RNG, seeded from
+    ``(seed, judge_id)``.
+
+    The seed is a STABLE hash — SHA-256 over the string form — not the
+    builtin ``hash()``: Python randomises string hashing per process
+    (PYTHONHASHSEED), so ``hash((seed, judge_id))`` gave every process
+    a different shuffle for the same recorded seed, and the blind
+    label assignment / ``position_shown`` evidence could never be
+    reproduced from the seed the loop passes (round-11 gatecore F4).
+    Shared by the legacy judged gate (here) and the peer matrix
+    (matrix.py imports it) so both shuffles mean the same seed the
+    same way.
+    """
+    digest = hashlib.sha256(f"{seed}:{judge_id}".encode("utf-8")).digest()
+    return random.Random(int.from_bytes(digest[:4], "big"))
+
 
 def select_panel(route_judges: list, experts: dict, contest_families: set,
                  count: int, available: set | None = None) -> list:
@@ -341,7 +360,7 @@ def run_judged_gate(store, contract: dict, judged_item: dict, candidates: list,
     for judge_id in panel:
         executor = judge_executors[judge_id]
         judge_family = getattr(executor, "family", None)
-        rng = random.Random(hash((seed, judge_id)) & 0xFFFFFFFF)
+        rng = seeded_shuffle_rng(seed, judge_id)
         order = list(candidates)
         rng.shuffle(order)
         labels = labels_pool[: len(order)]

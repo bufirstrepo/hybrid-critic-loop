@@ -238,6 +238,7 @@ def apply_lesson_route_change(store, category, route_change, contract_id,
         promoted_actual = result.get("promoted")
         displaced_actual = result.get("displaced")
         branch = result.get("branch")
+        no_change_cause = result.get("no_change_cause")
         new_route = result
     else:
         new_route = result if isinstance(result, dict) and result else route_for(store, category)
@@ -245,6 +246,24 @@ def apply_lesson_route_change(store, category, route_change, contract_id,
         promoted_actual = promote if changed else None
         displaced_actual = None
         branch = None
+        no_change_cause = None
+    if no_change_cause is None and passed is not None and not changed:
+        # A store that does not report the cause (older doubles):
+        # derive it from the route the call started from — a
+        # gate-passing seat in the route with the demotee already
+        # behind every such seat is the already-lawful case; no
+        # gate-passing seat in the route at all is the no-passer
+        # case (round-11 store F3).
+        _order = [
+            s for s in (primary, compete_with, *(current.get("fallback") or []))
+            if s is not None
+        ]
+        _passers = [s for s in _order if s in passed and s != demote]
+        if _passers and demote in _order and all(
+                _order.index(s) < _order.index(demote) for s in _passers):
+            no_change_cause = "already_lawful"
+        elif demote in _order:
+            no_change_cause = "no_passer"
     new_primary = (new_route or {}).get("primary", primary)
     new_compete = (new_route or {}).get("compete_with", compete_with)
     new_fallback = (new_route or {}).get("fallback") or []
@@ -263,15 +282,33 @@ def apply_lesson_route_change(store, category, route_change, contract_id,
     if not changed:
         if passed is not None and branch in (
                 "primary", "compete_with", "fallback"):
-            # The demoted seat holds a position, but no gate-passing
-            # seat exists to move it behind (owner ruling, Item 1 =
-            # A): record the demotion honestly — no unqualified
-            # promotion, no claimed reshuffle. Round-9 fix M4: the
-            # fallback branch belongs here too — a fallback demotee
-            # with zero passers DOES hold a route position, and the
-            # old primary/compete-only condition let it fall through
-            # to the false "holds no route position" line with no
-            # ledger row at all.
+            # The demoted seat holds a position and the route did not
+            # move. Two different causes, two different records
+            # (round-11 store F3): either no gate-passing seat sits
+            # in the route to move it behind (owner ruling, Item 1 =
+            # A — record the demotion honestly, no unqualified
+            # promotion, no claimed reshuffle), or gate-passing seats
+            # ARE in the route and the demotee already sits behind
+            # every one of them — the order is already lawful, and
+            # claiming "no seat passed the deciding gate" would put
+            # a false reason in the book's durable record. Round-9
+            # fix M4: the fallback branch belongs here too — a
+            # fallback demotee with zero passers DOES hold a route
+            # position, and the old primary/compete-only condition
+            # let it fall through to the false "holds no route
+            # position" line with no ledger row at all.
+            if no_change_cause == "already_lawful":
+                note = (
+                    f"route_change demote {demote} ({reason}) contract "
+                    f"{contract_id}: already behind every seat that "
+                    f"passed the deciding gate; route unchanged"
+                )
+                _record_route_ledger(store, demote, contract_id, note)
+                return (
+                    f"Route for {category}: demoted {demote} — already "
+                    f"behind every seat that passed the deciding gate; "
+                    f"route unchanged — {reason} (contract {contract_id})"
+                )
             note = (
                 f"route_change demote {demote} ({reason}) contract "
                 f"{contract_id}: no seat that passed the deciding gate "

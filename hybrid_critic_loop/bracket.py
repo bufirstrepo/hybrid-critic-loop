@@ -88,10 +88,14 @@ def next_field_size(current: int, config: dict) -> int:
 
 def rank_candidates(candidates, validity: dict, durations: dict | None = None) -> list:
     """Order candidates for a cut: validity desc, then fewer tokens,
-    then earlier completion (shorter recorded duration).
+    then shorter recorded generation duration.
 
     ``validity`` maps candidate id -> matrix validity score
     (median_mean). A candidate with no recorded validity sorts last.
+    Missing data sorts last on every key: no validity -> last, no
+    tokens -> +inf, and no recorded duration -> +inf (slowest) — a
+    missing duration is not a 0 ms generation (round-11 gatecore F3;
+    the same convention as ``loop._tokens_total``'s missing tokens).
     Pure function of the recorded values — no store access.
     """
     durations = durations or {}
@@ -107,7 +111,7 @@ def rank_candidates(candidates, validity: dict, durations: dict | None = None) -
         key=lambda c: (
             -(validity.get(c["id"]) if validity.get(c["id"]) is not None else -1.0),
             _tokens(c),
-            durations.get(c["id"], 0),
+            durations.get(c["id"], float("inf")),
         ),
     )
 
