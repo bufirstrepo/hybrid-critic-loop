@@ -36,7 +36,9 @@ rubrics keep the v0.2 judge-panel path below, unchanged.
 
 from __future__ import annotations
 
+import contextvars
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from . import bracket as bracket_mod
@@ -44,6 +46,7 @@ from . import gates as gates_mod
 from . import judges as judges_mod
 from . import lessons as lessons_mod
 from . import matrix as matrix_mod
+from . import progress as progress_mod
 from . import router as router_mod
 from .contracts import verify_baseline
 from .errors import GateError, PanelError
@@ -69,6 +72,14 @@ KNOWN_FAMILIES = {
     "qwen-cli": "alibaba",
     "kimi": "moonshot",
     "deepseek": "deepseek",
+    "mm-openai": "openai",
+    "mm-anthropic": "anthropic",
+    "mm-xai": "xai",
+    "mm-google": "google",
+    "mm-alibaba": "alibaba",
+    "mm-moonshot": "moonshot",
+    "mm-deepseek": "deepseek",
+    "mm-zai": "zai",
     "solver-naive": "local-naive",
     "solver-ring": "local-ring",
     "solver-balanced": "local-balanced",
@@ -815,7 +826,40 @@ def _finish_from_existing_answer(store, contract_id, decision, reason,
                    "winner_commit": f"git:{commit}",
                    "waiver": waiver_record})
     _attach_certificate(result, store, contract_id)
+    _update_gate_run_status(
+        store,
+        contract_id,
+        "completed",
+        f"Merged ({decision}) into main ({stored_commit})",
+        certificate_stamp=(result.get("certificate") or {}).get("stamp"),
+    )
     return result
+
+
+def _update_gate_run_status(
+    store,
+    contract_id: str,
+    phase: str,
+    message: str,
+    certificate_stamp: str | None = None,
+) -> None:
+    """Best-effort update to ``run_status.json`` when a human gate settles."""
+    try:
+        data_dir = progress_mod.store_data_dir(store)
+        current = progress_mod.read_run_status(data_dir)
+        if current.get("active") and current.get("contract_id") != contract_id:
+            return
+        snap = dict(current)
+        snap["active"] = False
+        snap["contract_id"] = contract_id
+        snap["phase"] = phase
+        snap["message"] = message
+        snap["updated_at"] = progress_mod._utc_iso()
+        if certificate_stamp:
+            snap["certificate_stamp"] = certificate_stamp
+        progress_mod.write_run_status(data_dir, snap)
+    except Exception:  # noqa: BLE001 - telemetry must never affect gate completion
+        pass
 
 
 def _delete_snapshot_ref(mgr, contract_id, candidate_id):
@@ -908,6 +952,7 @@ class _Run:
         # for it in the final attempt's bracket (fix pass Wave 2.7, review
         # H3): the only source of validity points.
         self.matrix_validity: dict[str, float] = {}
+        self.progress: progress_mod.RunProgressTracker | None = None
 
     # -- events ---------------------------------------------------------
     def _emit(self, type_: str, detail: str):
@@ -949,7 +994,8 @@ class _Run:
         for eid, ex in self.executors.items():
             if store.get_expert(eid) is None:
                 tier = "free" if ex.family == "local" else "subscription"
-                store.upsert_expert(eid, ex.family, access="cli", cost_tier=tier)
+                access = "hermes" if getattr(ex, "parallel_safe", False) else "cli"
+                store.upsert_expert(eid, ex.family, access=access, cost_tier=tier)
         router_mod.ensure_routes(store)
 
     def _budget_exhausted(self) -> str | None:
@@ -1032,8 +1078,8 @@ class _Run:
             return Path(root) / self.contract_id / slot_name
         return self.mgr.create(self.contract_id, slot_name)
 
-    def _dispatch(self, expert_id, slot, attempt, context):
-        """Generate one candidate. Returns (candidate_dict, gen_result)."""
+    def _prepare_dispatch(self, expert_id, slot, attempt):
+        """Main-thread setup for one candidate seat: availability check, worktree, DB row."""
         store = self.store
         executor = self.executors[expert_id]
         slot_name = f"{slot}{attempt if attempt > 1 else ''}"
@@ -1057,17 +1103,11 @@ class _Run:
             worktree=str(wt),
             baseline_hash=baseline_hash,
         )
-        if not ok:
-            from .executors import GenResult
+        return cand_id, executor, wt, ok, why
 
-            gen = GenResult(
-                status="unavailable",
-                log=f"executor {expert_id} unavailable: {why}",
-                tokens_in=None, tokens_out=None,
-                cost_usd=None, request_ids=[], duration_ms=0, detail=why,
-            )
-        else:
-            gen = executor.generate(wt, self.contract, context)
+    def _finalize_dispatch(self, expert_id, executor, cand_id, wt, gen):
+        """Main-thread persistence for one finished candidate generation."""
+        store = self.store
         self.durations[cand_id] = gen.duration_ms
         evidence = {
             "log_hash": sha256_text(gen.log) if gen.log else None,
@@ -1106,7 +1146,112 @@ class _Run:
             store.update_candidate(cand_id, payload_hash=sha256_text(diff))
         elif gen.status == "refused":
             store.record_refusal(expert_id)
+        if self.progress is not None:
+            self.progress.seat_finished(
+                expert_id,
+                gen.status,
+                duration_ms=gen.duration_ms or 0,
+                model=getattr(executor, "last_model", None),
+            )
         return store.get_candidate(cand_id), gen
+
+    def _dispatch(self, expert_id, slot, attempt, context):
+        """Generate one candidate. Returns (candidate_dict, gen_result)."""
+        cand_id, executor, wt, ok, why = self._prepare_dispatch(expert_id, slot, attempt)
+        if not ok:
+            from .executors import GenResult
+
+            gen = GenResult(
+                status="unavailable",
+                log=f"executor {expert_id} unavailable: {why}",
+                tokens_in=None, tokens_out=None,
+                cost_usd=None, request_ids=[], duration_ms=0, detail=why,
+            )
+        else:
+            if self.progress is not None:
+                self.progress.seat_started(expert_id, attempt)
+            gen = executor.generate(wt, self.contract, context)
+        return self._finalize_dispatch(expert_id, executor, cand_id, wt, gen)
+
+    def _dispatch_wave(self, contestants, attempt, context):
+        """Dispatch a generation wave, parallelizing ``generate()`` only when all seats opt in."""
+        active_seats = [
+            (i, eid) for i, eid in enumerate(contestants)
+            if eid in self.executors
+        ]
+        all_parallel = (
+            len(active_seats) > 1
+            and all(
+                getattr(self.executors[eid], "parallel_safe", False) is True
+                for _, eid in active_seats
+            )
+        )
+        if not all_parallel:
+            wave = []
+            for i, eid in active_seats:
+                cand, gen = self._dispatch(eid, SLOTS[i], attempt, context)
+                wave.append((cand, gen))
+            return wave
+
+        from .executors import GenResult
+
+        prepared = []
+        runnable = []
+        for idx, (slot_idx, eid) in enumerate(active_seats):
+            cand_id, executor, wt, ok, why = self._prepare_dispatch(
+                eid, SLOTS[slot_idx], attempt
+            )
+            prepared.append((eid, executor, cand_id, wt, ok, why))
+            if ok:
+                runnable.append((idx, eid, executor, wt))
+
+        gen_results: dict[int, object] = {}
+        first_exc: BaseException | None = None
+        if runnable:
+            def _run_seat(eid, executor, wt):
+                if self.progress is not None:
+                    self.progress.seat_started(eid, attempt)
+                res = executor.generate(wt, self.contract, context)
+                if self.progress is not None:
+                    self.progress.seat_finished(
+                        eid,
+                        res.status,
+                        duration_ms=res.duration_ms or 0,
+                        model=getattr(executor, "last_model", None),
+                    )
+                return res
+
+            with ThreadPoolExecutor(max_workers=min(4, len(runnable))) as pool:
+                fut_map = {}
+                for idx, eid, executor, wt in runnable:
+                    ctx_copy = contextvars.copy_context()
+                    fut = pool.submit(ctx_copy.run, _run_seat, eid, executor, wt)
+                    fut_map[fut] = idx
+                for fut in as_completed(fut_map):
+                    idx = fut_map[fut]
+                    try:
+                        gen_results[idx] = fut.result()
+                    except BaseException as exc:  # noqa: BLE001 - re-raise in seat order
+                        if first_exc is None:
+                            first_exc = exc
+
+        if first_exc is not None:
+            raise first_exc
+
+        wave = []
+        for idx, (eid, executor, cand_id, wt, ok, why) in enumerate(prepared):
+            if not ok:
+                gen = GenResult(
+                    status="unavailable",
+                    log=f"executor {eid} unavailable: {why}",
+                    tokens_in=None, tokens_out=None,
+                    cost_usd=None, request_ids=[], duration_ms=0, detail=why,
+                )
+            else:
+                gen = gen_results[idx]
+            cand, gen = self._finalize_dispatch(eid, executor, cand_id, wt, gen)
+            wave.append((cand, gen))
+        return wave
 
     def _cleanup_attempt_worktrees(self, wave):
         """A failed attempt's worktree dirs go away when the run
@@ -1143,7 +1288,9 @@ class _Run:
     def run(self) -> dict:
         try:
             result = self._run()
-        except Exception:
+        except Exception as exc:
+            if self.progress is not None:
+                self.progress.finish("error", f"Run aborted with error: {exc}")
             # An error exit removes the run's worktree dirs (fix spec
             # G9; round-4 contest-core F4) but keeps the branches: the
             # record of what was attempted survives for inspection, and
@@ -1220,21 +1367,45 @@ class _Run:
             set_status(self.contract_id, "running")
             claimed_status = True
 
-        # Baseline rule (invariant 3): the acceptance suite must have FAILED
-        # on the unmodified baseline before any candidate is dispatched.
-        # Only a recorded failing baseline skips the check; a refused
-        # contract (its row says "pass") is re-verified against the current
-        # tree on its next run instead of slipping past the rule.
-        if contract_row.get("acceptance_baseline_run") != "fail":
+        # Baseline rule (invariant 3): in fix mode, the acceptance suite must
+        # have FAILED on the unmodified baseline before any candidate is
+        # dispatched; in improve mode, the acceptance suite must PASS on the
+        # baseline and every surviving candidate must produce a non-empty diff.
+        mode = self.contract.get("mode", "fix")
+        expected_baseline = "pass_improve" if mode == "improve" else "fail"
+        if contract_row.get("acceptance_baseline_run") != expected_baseline:
             proceed, detail = verify_baseline(store, self.contract, self.repo_path, self.mgr)
             if not proceed:
                 store.set_contract_status(self.contract_id, "refused")
+                refusal_note = (
+                    "baseline acceptance failed in improve mode; fix broken tests first or use mode='fix'"
+                    if mode == "improve"
+                    else "acceptance passed on baseline; contract refused as vacuous"
+                )
+                refusal_detail = (
+                    "baseline acceptance tests failed in improve mode; improve mode requires a passing baseline"
+                    if mode == "improve"
+                    else "acceptance tests pass on the baseline; the contract is vacuous and was refused"
+                )
                 store.add_ledger(
                     target_id=self.target_id, contract_id=self.contract_id, candidate_id=None,
                     stage=self.contract["stage"], expert_id="queue", tokens_in=None,
                     tokens_out=None, cost_usd=None, outcome="escalated",
-                    note="acceptance passed on baseline; contract refused as vacuous",
+                    note=refusal_note,
                     provenance="internal",
+                )
+                progress_mod.write_run_status(
+                    progress_mod.store_data_dir(store),
+                    {
+                        "active": False,
+                        "phase": "refused_baseline",
+                        "contract_id": self.contract_id,
+                        "mode": mode,
+                        "message": refusal_detail,
+                        "seats": {},
+                        "bracket": {"rounds": [], "ladder": []},
+                        "updated_at": progress_mod._utc_iso(),
+                    },
                 )
                 # A refused contract is re-verifiable on its next run
                 # (Wave 2.7): the run claim goes back so that run can
@@ -1243,7 +1414,7 @@ class _Run:
                 self._release_run_claim()
                 return {
                     "contract_id": self.contract_id, "status": "refused_baseline",
-                    "detail": "acceptance tests pass on the baseline; the contract is vacuous and was refused",
+                    "detail": refusal_detail,
                     "baseline": detail, "events": self.events,
                 }
             if status == "refused":
@@ -1251,12 +1422,18 @@ class _Run:
                     # With a run claim the row already reads "running"
                     # and this run owns it; without one, re-open as before.
                     store.set_contract_status(self.contract_id, "open")
+                reopen_note = (
+                    "baseline re-verified on re-run: acceptance now passes on the "
+                    "baseline (improve mode); contract reopened"
+                    if mode == "improve"
+                    else "baseline re-verified on re-run: acceptance now fails on the "
+                         "baseline; contract reopened"
+                )
                 store.add_ledger(
                     target_id=self.target_id, contract_id=self.contract_id, candidate_id=None,
                     stage=self.contract["stage"], expert_id="queue", tokens_in=None,
                     tokens_out=None, cost_usd=None, outcome="observed",
-                    note=("baseline re-verified on re-run: acceptance now fails on the "
-                          "baseline; contract reopened"),
+                    note=reopen_note,
                     provenance="internal",
                 )
 
@@ -1270,6 +1447,13 @@ class _Run:
         ordered += list(route.get("fallback", []))
         ordered += sorted(self.executors)
         contestants = [c for c in dict.fromkeys(ordered) if c and c in self.executors]
+        self.progress = progress_mod.RunProgressTracker(
+            store, self.contract, self.repo_path, contestants, self.executors
+        )
+        self.progress.emit(
+            "starting",
+            f"Fielding {len(contestants)} panel seats ({mode} mode) for {self.contract_id}",
+        )
 
         retry_notes = ""
         judged_retries = 0
@@ -1305,13 +1489,9 @@ class _Run:
 
             # Generation wave: identical inputs, isolated worktrees.
             context = self._context_for(retry_notes)
-            wave = []  # (candidate, gen)
-            for i, expert_id in enumerate(contestants):
-                if expert_id not in self.executors:
-                    continue
-                cand, gen = self._dispatch(expert_id, SLOTS[i], attempt, context)
-                wave.append((cand, gen))
-                last_gate_details["candidate_experts"][cand["id"]] = expert_id
+            wave = self._dispatch_wave(contestants, attempt, context)
+            for cand, _gen in wave:
+                last_gate_details["candidate_experts"][cand["id"]] = cand["expert_id"]
 
             generated = [(c, g) for c, g in wave if g.status == "completed"]
             if not generated:
@@ -1329,14 +1509,40 @@ class _Run:
             gate_results: dict[str, gates_mod.CandidateGateResult] = {}
             diffs: dict[str, str] = {}
             for cand, _gen in generated:
-                gr = self._evaluate_candidate(cand)
+                diffs[cand["id"]] = self.mgr.diff(cand["worktree"])
+                if (
+                    mode == "improve"
+                    and gates_mod.check_provenance(cand)
+                    and not (diffs[cand["id"]] or "").strip()
+                ):
+                    gr = gates_mod.CandidateGateResult(
+                        candidate_id=cand["id"],
+                        provenance_ok=True,
+                        eliminated_at="hard",
+                        hard=[
+                            gates_mod.HardResult(
+                                cmd="git diff (non-empty change required in improve mode)",
+                                expected_exit=0,
+                                exit_code=1,
+                                passed=False,
+                                stdout_tail="",
+                                stderr_tail="candidate made zero file changes in improve mode",
+                            )
+                        ],
+                        measured=[],
+                        hard_pass=False,
+                        measured_pass=None,
+                    )
+                else:
+                    gr = self._evaluate_candidate(cand)
                 gate_results[cand["id"]] = gr
                 if gr.eliminated_at is not None:
                     self._mark_eliminated(
                         cand,
                         _ELIMINATED_KINDS.get(gr.eliminated_at,
                                               gr.eliminated_at))
-                diffs[cand["id"]] = self.mgr.diff(cand["worktree"])
+                if self.progress is not None:
+                    self.progress.gate_result(cand["expert_id"], gr.eliminated_at)
                 for mlist in gr.measured:
                     pass  # measurements already stored by the gate runner
                 last_gate_details["measurements"] = [
@@ -1622,6 +1828,8 @@ class _Run:
             # A dissent re-run repeats the matrix for the SAME round; the
             # round number advances only when a round is recorded.
             round_no = len(rounds) + 1
+            if self.progress is not None:
+                self.progress.matrix_round_start(round_no, len(field), len(peer_executors))
             outcome = matrix_mod.run_matrix(
                 store, self.contract, field, gate_results, diffs,
                 peer_executors,
@@ -1631,6 +1839,11 @@ class _Run:
                 calibrations=calibrations,
                 seed=attempt,
                 round_no=round_no,
+                on_judge_done=(
+                    (lambda jid, r=round_no: self.progress.matrix_judge_done(r, jid))
+                    if self.progress is not None
+                    else None
+                ),
             )
             # Every recorded median is a measured validity score (fix pass
             # Wave 2.7, review H3): keep the last one per candidate, so a
@@ -1775,6 +1988,19 @@ class _Run:
             for cand in cut["eliminated"]:
                 self._mark_eliminated(cand, "bracket_cut")
             cut_out = cut["eliminated"] + failers
+            if self.progress is not None:
+                scores_by_expert = {
+                    by_id[cid]["expert_id"]: entry.get("median_mean")
+                    for cid, entry in outcome.per_candidate.items()
+                    if cid in by_id and isinstance(entry, dict)
+                }
+                self.progress.bracket_step(
+                    round_no,
+                    field_in,
+                    len(advanced),
+                    scores_by_expert,
+                    [c["expert_id"] for c in cut_out],
+                )
             rounds.append({
                 "round": round_no,
                 "field_in": field_in,
@@ -2177,6 +2403,13 @@ class _Run:
         # it — whether the decider answers now or an operator does later;
         # a refused decision leaves the contract at its gate (Wave 2.7).
         store.set_contract_status(self.contract_id, "awaiting_human_gate")
+        if self.progress is not None:
+            self.progress.finish(
+                "awaiting_human_gate",
+                f"Winner {winner['expert_id']} ({winner['family']}) awaits human gate approval",
+                winner_expert=winner["expert_id"],
+                winner_family=winner["family"],
+            )
         if self.human_decider is not None:
             decision = self.human_decider(
                 {"winner": winner["id"], "waiver_offered": is_waiver, "verdict_id": verdict_id}
@@ -2269,6 +2502,8 @@ class _Run:
         # run used to leave every checkout and branch behind, forever.
         _remove_candidate_worktrees(
             store, self.mgr, self.contract_id, delete_branches=True)
+        if self.progress is not None:
+            self.progress.finish("escalated", f"Escalated: {reason}")
         result = {
             "contract_id": self.contract_id, "status": "escalated",
             "detail": reason, "verdict_id": verdict_id, "lesson_id": lesson_id,
@@ -2760,6 +2995,12 @@ def _complete_human_gate(store, contract_id, decision, reason, contract,
         # a rejected verdict certifies nothing (regression F1).
         _remove_candidate_worktrees(store, mgr, contract_id, delete_branches=True)
         result.update({"status": "rejected", "new_contract_id": new_id})
+        _update_gate_run_status(
+            store,
+            contract_id,
+            "rejected",
+            f"Rejected at human gate; opened follow-up contract {new_id}",
+        )
         return result
 
     # A final answer already on the book means a previous attempt
@@ -2887,4 +3128,11 @@ def _complete_human_gate(store, contract_id, decision, reason, contract,
     # The certificate attaches ONLY now — a completed, gate-decided
     # state (fix spec G1; round-4 regression F1).
     _attach_certificate(result, store, contract_id)
+    _update_gate_run_status(
+        store,
+        contract_id,
+        "completed",
+        f"Merged ({decision}) into main (git:{merged_sha})",
+        certificate_stamp=(result.get("certificate") or {}).get("stamp"),
+    )
     return result

@@ -14,9 +14,12 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import time
+import uuid
 from pathlib import Path
 
 from . import hooks as hooks_mod
+from .progress import format_status_report, read_run_status
 from .reports import build_matrix_view, ledger_report, lessons_report
 from .router import ensure_routes
 
@@ -26,6 +29,24 @@ REGISTRATION_NOTES = []
 # and for the CLI handler bound to the same registration).
 ACTIVE_STORE = None
 ACTIVE_DATA_DIR = None
+ACTIVE_CTX = None
+
+_SYSTEM_PROMPT_GUIDANCE = (
+    "## The Millionaire Matrix (8-to-1 Multi-Family Critic Loop)\n"
+    "When the user asks to run, inspect, fix, or improve code using **Millionaire Matrix** "
+    "(or `/mm` / `/critic`):\n"
+    "- **Improve / refactor passing code**: call `critic_run` with `repo_path`, `task`, "
+    "`mode='improve'`, a single-command `test_cmd` (executed directly with `shell=False`, "
+    "e.g. `'pytest -q'` or `'python3 -m unittest'` — never shell `&&` or `|`), and "
+    "`target_files` listing the repo-relative files to improve.\n"
+    "- **Fix failing tests**: call `critic_run` with `mode='fix'` so the baseline failure "
+    "is verified before the 8 model families compete.\n"
+    "- **Live status / 'is it running?'**: inspect `active_run` via `critic_ledger`, or point "
+    "the user to `/mm status`, `/mm panel`, `hermes critic status`, or the Desktop "
+    "**Millionaire Matrix** status-bar chip and right-side pane.\n"
+    "- **Human gate**: `critic_run` stops at `awaiting_human_gate`. Show the winning seat, "
+    "summary diff/scores (`critic_matrix`), and ask the user before calling `critic_gate`."
+)
 
 
 # --------------------------------------------------------------------------
@@ -259,6 +280,65 @@ def _open_store(data_dir):
 # Contract / executor helpers (lazy imports live here)
 # --------------------------------------------------------------------------
 
+def _infer_test_cmd(repo_path: str | Path | None) -> str:
+    """Detect a safe single-executable hard gate command when shorthand ``test_cmd`` is omitted."""
+    if repo_path:
+        root = Path(repo_path)
+        if (root / "Cargo.toml").is_file():
+            return "cargo test"
+        if (root / "go.mod").is_file():
+            return "go test ./..."
+        if (root / "package.json").is_file():
+            return "npm test"
+        has_py_tests = (
+            (root / "tests").is_dir()
+            or any(root.glob("test_*.py"))
+            or any(root.glob("*_test.py"))
+        )
+        if has_py_tests:
+            return "python3 -m unittest"
+        if any(root.rglob("*.py")):
+            return "python3 -m compileall -q ."
+    raise ValueError(
+        "test_cmd is required for shorthand task runs when no standard test suite is detected in repo_path"
+    )
+
+
+def _build_shorthand_contract(args: dict) -> dict:
+    """Synthesize a Millionaire Matrix contract from shorthand ``critic_run`` arguments."""
+    task = str(args.get("task") or "").strip()
+    mode = str(args.get("mode") or "improve").strip().lower()
+    contract_id = str(
+        args.get("contract_id") or f"mm_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    ).strip()
+    domain = str(args.get("domain") or "code").strip()
+    test_cmd = str(args.get("test_cmd") or "").strip() or _infer_test_cmd(args.get("repo_path"))
+    min_score = float(args.get("min_score", 6.0))
+    judges = int(args.get("judges", 8))
+    raw: dict = {
+        "id": contract_id,
+        "mode": mode,
+        "stage": str(args.get("stage") or "implement"),
+        "task": task,
+        "domain": domain,
+        "tags": list(args.get("tags") or [mode, "millionaire-matrix"]),
+        "acceptance": [
+            {"class": "hard", "cmd": test_cmd, "expect_exit": 0},
+            {
+                "class": "judged",
+                "rubric": "validity_matrix_v1",
+                "min": min_score,
+                "judges": judges,
+            },
+        ],
+    }
+    if args.get("target_file"):
+        raw["target_file"] = args["target_file"]
+    if args.get("target_files"):
+        raw["target_files"] = list(args["target_files"])
+    return raw
+
+
 def _load_contract(args):
     """Return a contract dict from tool/CLI args, validating if possible."""
     raw = None
@@ -272,6 +352,8 @@ def _load_contract(args):
             return contracts_mod.load_contract_file(path)
         except ImportError:
             raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    elif args.get("task"):
+        raw = _build_shorthand_contract(args)
     if raw is None:
         return None
     try:
@@ -282,8 +364,8 @@ def _load_contract(args):
         return raw
 
 
-def _build_executors(spec):
-    """Resolve the executors argument: 'live' (default), 'local', or a dict."""
+def _build_executors(spec, ctx=None):
+    """Resolve the executors argument: 'live' (default), 'hermes', 'cli', 'local', or a dict."""
     if isinstance(spec, dict):
         return spec
     if spec == "local":
@@ -293,6 +375,21 @@ def _build_executors(spec):
             "solver-naive": LocalSolverExecutor("solver-naive", "naive"),
             "solver-ring": LocalSolverExecutor("solver-ring", "ring"),
         }
+    target_ctx = ctx if ctx is not None else ACTIVE_CTX
+    if spec == "hermes":
+        from .executors_hermes import build_hermes_executors
+
+        return build_hermes_executors(target_ctx)
+    if spec == "cli":
+        from .executors import default_executors
+
+        return default_executors()
+    if target_ctx is not None and getattr(target_ctx, "llm", None) is not None:
+        from .executors_hermes import build_hermes_executors
+
+        hermes_seats = build_hermes_executors(target_ctx)
+        if hermes_seats and any(ex.available()[0] for ex in hermes_seats.values()):
+            return hermes_seats
     from .executors import default_executors
 
     return default_executors()
@@ -313,19 +410,22 @@ def _is_awaiting(result):
 
 _CRITIC_RUN_SCHEMA = {
     "description": (
-        "Run one Hybrid Critic Loop contract: competing experts implement "
-        "the task in isolated worktrees, hard/measured/judged gates pick a "
-        "winner, and the result ends at the human gate — this tool cannot "
-        "decide the gate; complete it with critic_gate or the CLI. A "
-        "contract's gate commands execute on the operator's machine, "
-        "starting with the baseline run: author contracts only from "
-        "parties trusted to run code. Returns the run result as JSON."
+        "Run one Millionaire Matrix / Hybrid Critic Loop contract: 8 model "
+        "families implement or improve the task in isolated git worktrees, "
+        "hard/measured gates plus the blind 8->6->4->2->1 peer validity matrix "
+        "pick one winner, and the result stops at the human gate — complete it "
+        "with critic_gate or the CLI after user confirmation. Accepts either a "
+        "full contract/contract_path OR shorthand task + mode ('improve' for "
+        "passing repos, 'fix' for failing tests) + test_cmd + target_files. "
+        "Gate commands execute on the operator's machine, starting with the "
+        "baseline run: author contracts only from parties trusted to run code. "
+        "Returns the run result as JSON."
     ),
     "type": "object",
     "properties": {
         "contract": {
             "type": "object",
-            "description": "Contract object (task, domain, tags, structured acceptance items).",
+            "description": "Full contract object (task, domain, tags, mode, structured acceptance items).",
         },
         "contract_path": {
             "type": "string",
@@ -333,12 +433,46 @@ _CRITIC_RUN_SCHEMA = {
         },
         "repo_path": {
             "type": "string",
-            "description": "Path to the repository the candidates work against.",
+            "description": "Path to the git repository the candidates work against.",
+        },
+        "task": {
+            "type": "string",
+            "description": "Shorthand task description when contract/contract_path is omitted.",
+        },
+        "mode": {
+            "type": "string",
+            "enum": ["improve", "fix"],
+            "description": "'improve' (shorthand default) requires baseline tests to pass and non-empty code changes; 'fix' requires baseline tests to fail first.",
+        },
+        "test_cmd": {
+            "type": "string",
+            "description": "Single executable test command for shorthand runs (run with shell=False, e.g. 'pytest -q' or 'python3 -m unittest').",
+        },
+        "target_file": {
+            "type": "string",
+            "description": "Repo-relative file path for the 8-family panel to inspect and edit.",
+        },
+        "target_files": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Repo-relative file paths for the 8-family panel to inspect and edit.",
+        },
+        "domain": {
+            "type": "string",
+            "description": "Task domain for routing and lessons (default 'code').",
+        },
+        "min_score": {
+            "type": "number",
+            "description": "Minimum peer validity score on the 0-10 rubric (default 6.0).",
+        },
+        "contract_id": {
+            "type": "string",
+            "description": "Optional contract id for shorthand runs (auto-generated when omitted).",
         },
         "executors": {
             "type": "string",
-            "enum": ["live", "local"],
-            "description": "'live' uses the configured expert CLIs (default); 'local' uses the two built-in local solvers for demos/tests.",
+            "enum": ["live", "hermes", "cli", "local"],
+            "description": "'live' uses the 8-family Hermes panel when available (falling back to expert CLIs); 'hermes' forces Hermes 8-family seats; 'cli' forces local expert CLIs; 'local' uses the two built-in demo solvers.",
         },
     },
     "required": ["repo_path"],
@@ -433,14 +567,29 @@ def _tool_schema(name: str, raw: dict) -> dict:
 
 
 def register(ctx):
-    """Register tools, the /critic command, the `hermes critic` CLI, hooks."""
-    global ACTIVE_STORE, ACTIVE_DATA_DIR
+    """Register tools, the /critic & /mm commands, the `hermes critic` CLI, hooks."""
+    global ACTIVE_STORE, ACTIVE_DATA_DIR, ACTIVE_CTX
     data_dir = resolve_data_dir(ctx)
     data_dir.mkdir(parents=True, exist_ok=True)
     store = _open_store(data_dir)
     ACTIVE_STORE = store
     ACTIVE_DATA_DIR = data_dir
+    ACTIVE_CTX = ctx
     ensure_routes(store)
+
+    try:
+        from .executors_hermes import register_auxiliary_tasks
+
+        register_auxiliary_tasks(ctx)
+    except Exception:
+        pass
+
+    reg_prompt = getattr(ctx, "register_system_prompt_section", None)
+    if callable(reg_prompt):
+        try:
+            reg_prompt("millionaire_matrix", _SYSTEM_PROMPT_GUIDANCE)
+        except Exception:
+            pass
 
     # -- tools -------------------------------------------------------------
     def critic_run_handler(args):
@@ -453,7 +602,7 @@ def register(ctx):
         except Exception as exc:  # contract load/validation failure
             return json.dumps({"error": f"contract load failed: {exc}"})
         if contract is None:
-            return json.dumps({"error": "contract or contract_path is required"})
+            return json.dumps({"error": "contract, contract_path, or task is required"})
         try:
             from . import loop as loop_mod
         except Exception as exc:
@@ -467,7 +616,7 @@ def register(ctx):
         # the handler's {"error": …} JSON instead of raising into the
         # host, exactly as the CLI's dispatch boundary contains it.
         try:
-            executors = _build_executors(args.get("executors", "live"))
+            executors = _build_executors(args.get("executors", "live"), ctx=ctx)
         except Exception as exc:
             return json.dumps({"error": f"executors not available: {exc}"})
         try:
@@ -509,6 +658,7 @@ def register(ctx):
         payload = {
             "summary": store.ledger_summary(),
             "report": ledger_report(store),
+            "active_run": read_run_status(data_dir),
         }
         # Events surface (owner review item 8): present only when the
         # store records events (events_for lands in a sibling
@@ -575,14 +725,24 @@ def register(ctx):
             parts = text.split()
         if not parts or parts[0] in ("help", "--help", "-h"):
             return (
-                "critic — Hybrid Critic Loop\n"
+                "critic / mm — The Millionaire Matrix (Hybrid Critic Loop)\n"
                 "  critic run <contract.json> [repo_path]\n"
+                "  critic status\n"
+                "  critic panel\n"
                 "  critic gate <contract_id> approve|reject|waive [reason]\n"
                 "  critic lessons [domain]\n"
                 "  critic ledger\n"
                 "  critic standing"
             )
         sub = parts[0]
+        if sub == "status":
+            return format_status_report(data_dir)
+        if sub == "panel":
+            try:
+                panel_execs = _build_executors("live", ctx=ctx)
+            except Exception:
+                panel_execs = None
+            return format_status_report(data_dir, panel_executors=panel_execs)
         if sub == "run":
             if len(parts) < 2:
                 return "usage: critic run <contract.json> [repo_path]"
@@ -633,12 +793,17 @@ def register(ctx):
             except ImportError:
                 return "standing unavailable (the standing module failed to load)"
             return standing_report(store)
-        return f"unknown critic subcommand: {sub} (try: run, gate, lessons, ledger, standing)"
+        return f"unknown critic subcommand: {sub} (try: run, status, panel, gate, lessons, ledger, standing)"
 
     ctx.register_command(
         "critic",
         critic_command,
-        "Hybrid Critic Loop: run <contract.json> [repo_path] | lessons [domain] | ledger | standing",
+        "Hybrid Critic Loop: run <contract.json> [repo_path] | status | panel | lessons [domain] | ledger | standing",
+    )
+    ctx.register_command(
+        "mm",
+        critic_command,
+        "The Millionaire Matrix: status | panel | run <contract.json> [repo_path] | gate | ledger | standing",
     )
 
     # -- CLI command -----------------------------------------------------------

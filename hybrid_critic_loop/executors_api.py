@@ -140,33 +140,17 @@ def _extract_code_block(text: str) -> str | None:
 def _write_target_file(
     worktree: Path, contract: dict, reply_text: str
 ) -> tuple[bool, str]:
-    """Write the reply's fenced code block to the contract target file.
+    """Write the reply's fenced code block(s) to the contract target file(s).
 
     Returns (handled, detail). ``handled`` is False when the contract
-    names no target_file (nothing to write — the reply itself is the
-    result). When a target_file IS named but no code block can be
+    names no target_file / target_files (nothing to write — the reply itself
+    is the result). When a target_file IS named but no code block can be
     extracted, returns (True, error-detail) with an ``error:`` prefix
     so the caller can fail the generation honestly.
     """
-    target = contract.get("target_file") if isinstance(contract, dict) else None
-    if not target:
-        return False, ""
-    code = _extract_code_block(reply_text)
-    if code is None:
-        return True, (
-            f"error: no fenced code block found in model reply; "
-            f"could not write target_file {target}"
-        )
-    root = Path(worktree).resolve()
-    dest = (root / str(target)).resolve()
-    if dest != root and root not in dest.parents:
-        return True, f"error: target_file {target} escapes the worktree; not written"
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(code, encoding="utf-8")
-    except Exception as exc:
-        return True, f"error: writing target_file {target} failed: {exc}"
-    return True, f"wrote {target} from fenced code block in model reply"
+    from .file_edits import apply_reply_edits
+
+    return apply_reply_edits(Path(worktree), contract, reply_text)
 
 
 def _judge_prompt(packet: str, rubric: dict) -> str:
@@ -196,11 +180,12 @@ def _is_timeout(err: str | None) -> bool:
 
 def _declined_without_target_file(contract, seat: str) -> GenResult | None:
     """An API seat can only place its reply in the worktree through the
-    contract's ``target_file``; without one it declines BEFORE any request
-    (fix pass Wave 2.9, review M8 / 1D-12) instead of spending tokens and
-    reporting ``completed`` with nothing written."""
-    target = contract.get("target_file") if isinstance(contract, dict) else None
-    if target:
+    contract's ``target_file`` or ``target_files``; without one it declines
+    BEFORE any request (fix pass Wave 2.9, review M8 / 1D-12) instead of
+    spending tokens and reporting ``completed`` with nothing written."""
+    from .file_edits import contract_target_files
+
+    if contract_target_files(contract if isinstance(contract, dict) else None):
         return None
     return GenResult(
         status="unavailable", log="", duration_ms=0,
@@ -290,7 +275,9 @@ class OllamaQwenExecutor(Executor):
         if declined is not None:
             return declined
         try:
-            prompt = build_prompt(contract, context)
+            from .file_edits import build_prompt_with_files
+
+            prompt = build_prompt_with_files(Path(worktree), contract, context)
             obj, err = self._generate_text(prompt, timeout=_GENERATE_TIMEOUT_S)
             duration_ms = int((time.monotonic() - start) * 1000)
             if err is not None or obj is None:
@@ -372,6 +359,14 @@ class DeepSeekExecutor(Executor):
     family = "deepseek"
 
     def _api_key(self) -> str:
+        try:
+            from agent.secret_scope import get_secret
+
+            scoped = get_secret("DEEPSEEK_API_KEY")
+            if scoped is not None:
+                return str(scoped)
+        except Exception:
+            pass
         return os.environ.get("DEEPSEEK_API_KEY") or ""
 
     def _model(self) -> str:
@@ -432,7 +427,9 @@ class DeepSeekExecutor(Executor):
         if declined is not None:
             return declined
         try:
-            prompt = build_prompt(contract, context)
+            from .file_edits import build_prompt_with_files
+
+            prompt = build_prompt_with_files(Path(worktree), contract, context)
             obj, err = self._chat(prompt, timeout=_GENERATE_TIMEOUT_S)
             duration_ms = int((time.monotonic() - start) * 1000)
             if err is not None or obj is None:

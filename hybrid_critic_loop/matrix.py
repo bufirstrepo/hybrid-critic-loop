@@ -498,7 +498,7 @@ class MatrixOutcome:
 def run_matrix(store, contract, candidates, gate_results, diffs,
                peer_executors, *, min_score, dissent_threshold=3.0,
                spread_threshold=2.0, calibrations=None, seed=0,
-               round_no=None) -> MatrixOutcome:
+               round_no=None, on_judge_done=None) -> MatrixOutcome:
     """Run the peer validity matrix over hard/measured survivors.
 
     ``peer_executors`` maps expert_id -> executor (``.family`` and
@@ -556,6 +556,7 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
     collected: dict = {_candidate_id(c): [] for c in candidates}
     peers_used: list = []
 
+    prepared_peers: list = []
     for judge_id, executor in peer_executors.items():
         judge_family = getattr(executor, "family", None)
         if judge_family is None:
@@ -571,10 +572,40 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
             labelled_diffs[label] = blind_text((diffs or {}).get(cid, ""), strip_terms)
         summary = _measured_summary_for_labels(order, labels, gate_results)
         packet = build_matrix_packet(labelled_diffs, contract, summary, rubric)
+        prepared_peers.append((judge_id, executor, judge_family, order, labels, packet))
+
+    def _call_peer_judge(jid: str, ex, pkt: str):
         try:
-            raw = executor.judge(packet, rubric)
+            res = ex.judge(pkt, rubric)
         except Exception:  # noqa: BLE001 - a failing peer yields no cells
-            raw = None
+            res = None
+        if callable(on_judge_done):
+            try:
+                on_judge_done(jid)
+            except Exception:
+                pass
+        return res
+
+    raw_by_judge: dict[str, object] = {}
+    if len(prepared_peers) > 1 and all(
+        getattr(ex, "parallel_safe", False) is True for _jid, ex, *_ in prepared_peers
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+        import contextvars
+
+        futs = {}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for jid, ex, _jfam, _ord, _lbls, pkt in prepared_peers:
+                ctx_copy = contextvars.copy_context()
+                futs[jid] = pool.submit(ctx_copy.run, _call_peer_judge, jid, ex, pkt)
+            for jid, *_ in prepared_peers:
+                raw_by_judge[jid] = futs[jid].result()
+    else:
+        for jid, ex, _jfam, _ord, _lbls, pkt in prepared_peers:
+            raw_by_judge[jid] = _call_peer_judge(jid, ex, pkt)
+
+    for judge_id, _executor, judge_family, order, labels, _packet in prepared_peers:
+        raw = raw_by_judge.get(judge_id)
         if not isinstance(raw, dict):
             continue
         peer_scored_any = False

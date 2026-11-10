@@ -35,6 +35,7 @@ from .lessons import METRIC_NAME_RE
 
 _OPS = {"==", "!=", "<", "<=", ">", ">="}
 _STAGES = {"spec", "decompose", "implement", "integrate"}
+_MODES = {"fix", "improve"}
 
 # Contract ids become store keys, branch-name components, and worktree
 # path segments (fix pass round 4, spec G7, round-4 security F6): a
@@ -153,8 +154,10 @@ def _validated_expect_exit(item, index):
 def _validated_judges(item, index) -> int:
     """A judged item's judge count: an integer >= 1 when present
     (round-4 contest-core F11 — ``judges: 0`` used to validate cleanly
-    and only fail downstream in panel seating)."""
-    raw = item.get("judges", 3)
+    and only fail downstream in panel seating). Defaults to 8 for
+    ``validity_matrix_v1`` (the 8-family peer panel) and 3 for legacy rubrics."""
+    default_count = 8 if item.get("rubric") == "validity_matrix_v1" else 3
+    raw = item.get("judges", default_count)
     if isinstance(raw, bool) or not isinstance(raw, int):
         raise ContractError(
             f"acceptance[{index}] judged item 'judges' must be an integer, "
@@ -165,6 +168,15 @@ def _validated_judges(item, index) -> int:
             f"acceptance[{index}] judged item 'judges' must be >= 1, got {raw}"
         )
     return raw
+
+
+def _validated_relpath(path_val, field_name: str) -> str:
+    if not isinstance(path_val, str) or not path_val.strip():
+        raise ContractError(f"{field_name} must be a non-empty relative path string, got {path_val!r}")
+    cleaned = path_val.strip()
+    if cleaned.startswith("/") or ".." in Path(cleaned).parts or ".git" in Path(cleaned).parts:
+        raise ContractError(f"{field_name} must stay inside the repository without '..' or '.git': got {path_val!r}")
+    return cleaned
 
 
 def load_contract_file(path) -> dict:
@@ -189,6 +201,18 @@ def validate_contract(raw: dict) -> dict:
     stage = raw.get("stage", "implement")
     if stage not in _STAGES:
         raise ContractError(f"contract.stage must be one of {sorted(_STAGES)}")
+    mode = raw.get("mode", "fix")
+    if mode not in _MODES:
+        raise ContractError(f"contract.mode must be one of {sorted(_MODES)}, got {mode!r}")
+    raw_target_files = raw.get("target_files")
+    norm_target_files = None
+    if raw_target_files is not None:
+        if not isinstance(raw_target_files, list) or not raw_target_files:
+            raise ContractError("contract.target_files must be a non-empty list of relative paths when present")
+        norm_target_files = [
+            _validated_relpath(p, f"target_files[{idx}]")
+            for idx, p in enumerate(raw_target_files)
+        ]
     acceptance = raw.get("acceptance")
     if not isinstance(acceptance, list) or not acceptance:
         raise ContractError("contract.acceptance must be a non-empty list")
@@ -307,6 +331,7 @@ def validate_contract(raw: dict) -> dict:
         "id": contract_id,
         "target_id": raw.get("target_id"),
         "stage": stage,
+        "mode": mode,
         "attempt": _validated_attempt(raw),
         "task": task,
         "domain": domain,
@@ -315,6 +340,7 @@ def validate_contract(raw: dict) -> dict:
         "acceptance": normalized,
         "test_author_family": raw.get("test_author_family"),
         "target_file": raw.get("target_file"),
+        "target_files": norm_target_files,
         "ask": raw.get("ask"),
         "constraints": list(raw.get("constraints", [])),
         "budget": raw.get("budget"),
@@ -395,7 +421,11 @@ def verify_baseline(store, contract: dict, repo_path, worktree_mgr) -> tuple[boo
                 )
         detail["measured"].append(entry)
 
-    proceed = hard_failed or measured_failed
-    store.set_baseline_run(contract_id, "fail" if proceed else "pass")
+    if contract.get("mode", "fix") == "improve":
+        proceed = not (hard_failed or measured_failed)
+        store.set_baseline_run(contract_id, "pass_improve" if proceed else "fail_improve")
+    else:
+        proceed = hard_failed or measured_failed
+        store.set_baseline_run(contract_id, "fail" if proceed else "pass")
     worktree_mgr.remove(baseline_wt)
     return proceed, detail

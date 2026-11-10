@@ -17,6 +17,8 @@ provides_tools:
 provides_hooks:
   - on_session_start
   - pre_llm_call
+emits:
+  - run.progress
 # python_dependencies: stdlib only — the plugin builds on the Hermes ctx
 # surface plus the Python standard library, so there is nothing to install.
 python_dependencies: []

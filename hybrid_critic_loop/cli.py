@@ -314,6 +314,22 @@ def _cmd_standing(data_dir) -> int:
     return 0
 
 
+def _cmd_status(data_dir) -> int:
+    from .progress import format_status_report
+
+    print(format_status_report(data_dir))
+    return 0
+
+
+def _cmd_panel(executors_spec, data_dir) -> int:
+    from .plugin import _build_executors
+    from .progress import format_status_report
+
+    execs = _build_executors(executors_spec or "live")
+    print(format_status_report(data_dir, panel_executors=execs))
+    return 0
+
+
 def _cmd_session_start(domain, data_dir) -> int:
     from . import hooks as hooks_mod
     from .standing import has_standing, standing_line
@@ -349,8 +365,8 @@ def _add_subcommands(subparsers):
     run_p.add_argument("contract", help="path to a contract JSON file")
     run_p.add_argument("--repo", default=".", help="repository path (default: .)")
     run_p.add_argument(
-        "--executors", choices=["live", "local"], default="live",
-        help="'live' expert CLIs (default) or 'local' built-in solvers",
+        "--executors", choices=["live", "hermes", "cli", "local"], default="live",
+        help="'live' panel (default), 'hermes' 8-family seats, 'cli' local expert CLIs, or 'local' built-in solvers",
     )
     gate = run_p.add_mutually_exclusive_group()
     gate.add_argument("--approve", dest="gate", action="store_const",
@@ -382,6 +398,20 @@ def _add_subcommands(subparsers):
         "standing", help="show the client book: lifetime tier and spend"
     )
     standing_p.add_argument("--data-dir", default=None)
+
+    status_p = subparsers.add_parser(
+        "status", help="show live or most recent Millionaire Matrix run progress"
+    )
+    status_p.add_argument("--data-dir", default=None)
+
+    panel_p = subparsers.add_parser(
+        "panel", help="show 8-family Millionaire Matrix panel readiness"
+    )
+    panel_p.add_argument(
+        "--executors", choices=["live", "hermes", "cli", "local"], default="live",
+        help="panel backend to inspect (default: live)",
+    )
+    panel_p.add_argument("--data-dir", default=None)
 
     cert_p = subparsers.add_parser(
         "verify-cert",
@@ -436,6 +466,10 @@ def dispatch(args, data_dir=None) -> int:
             return _cmd_ledger(effective_dir)
         if sub == "standing":
             return _cmd_standing(effective_dir)
+        if sub == "status":
+            return _cmd_status(effective_dir)
+        if sub == "panel":
+            return _cmd_panel(getattr(args, "executors", "live"), effective_dir)
         if sub == "verify-cert":
             return _cmd_verify_cert(args.token, effective_dir)
         if sub == "session-start":

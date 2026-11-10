@@ -455,12 +455,19 @@ class GrokExecutor(Executor):
         ok, _ = self.available()
         if not ok:
             return GenResult(status="unavailable", detail="grok binary not found on PATH", log="", duration_ms=0)
-        prompt = build_prompt(contract, context)
+        from .file_edits import apply_reply_edits, build_prompt_with_files, contract_target_files
+
+        targets = contract_target_files(contract)
+        before_snapshots = _snapshot_targets(Path(worktree), targets) if targets else {}
+        prompt = build_prompt_with_files(Path(worktree), contract, context) if targets else build_prompt(contract, context)
         cmd = f"grok -p {shlex.quote(prompt)} --cwd {shlex.quote(str(worktree))}"
         result = run_command(cmd, cwd=worktree, timeout_s=300)
         combined = (result.stdout or "") + "\n" + (result.stderr or "")
         tokens_in, tokens_out, request_ids, cost = _parse_jsonl_usage(result.stdout or "")
-        return _cli_result("grok", result, combined, tokens_in, tokens_out, cost, request_ids)
+        gen = _cli_result("grok", result, combined, tokens_in, tokens_out, cost, request_ids)
+        if gen.status == "completed" and targets and _targets_unchanged(Path(worktree), before_snapshots):
+            _apply_cli_stdout_edits(Path(worktree), contract, result.stdout or "", gen)
+        return gen
 
     def judge(self, packet: str, rubric: dict) -> dict | None:
         ok, _ = self.available()
@@ -486,7 +493,52 @@ BEAM_DETAIL = (
 )
 
 
-def _cli_generate(binary_label: str, cmd: str, worktree: Path) -> GenResult:
+def _snapshot_targets(worktree: Path, targets: list[str]) -> dict[str, bytes | None]:
+    from .file_edits import resolve_confined_path
+
+    snap: dict[str, bytes | None] = {}
+    for rel in targets:
+        p = resolve_confined_path(worktree, rel)
+        if p is not None and p.is_file():
+            try:
+                snap[rel] = p.read_bytes()
+            except Exception:
+                snap[rel] = None
+        else:
+            snap[rel] = None
+    return snap
+
+
+def _targets_unchanged(worktree: Path, before: dict[str, bytes | None]) -> bool:
+    return _snapshot_targets(worktree, list(before.keys())) == before
+
+
+def _unwrap_cli_text(stdout: str) -> str:
+    """Extract model text from a JSON envelope (e.g. claude --output-format json) or return stdout."""
+    if not stdout:
+        return ""
+    try:
+        obj = json.loads(stdout)
+        if isinstance(obj, dict):
+            for k in ("result", "text", "content", "response"):
+                val = obj.get(k)
+                if isinstance(val, str) and val.strip():
+                    return val
+    except Exception:
+        pass
+    return stdout
+
+
+def _apply_cli_stdout_edits(worktree: Path, contract: dict, stdout: str, gen: GenResult) -> None:
+    from .file_edits import apply_reply_edits
+
+    reply_text = _unwrap_cli_text(stdout)
+    handled, detail = apply_reply_edits(worktree, contract, reply_text)
+    if handled and not detail.startswith("error: "):
+        gen.detail = f"{gen.detail}; {detail}".strip("; ")
+
+
+def _cli_generate(binary_label: str, cmd: str, worktree: Path) -> tuple[GenResult, str]:
     """Shared generate() body for simple ``<cli> -p <prompt>`` adapters.
 
     Mirrors the Codex/Grok adapters: JSON usage parse, then the one
@@ -498,7 +550,7 @@ def _cli_generate(binary_label: str, cmd: str, worktree: Path) -> GenResult:
     if not request_ids:
         _, _, rids2, _ = _parse_jsonl_usage(result.stderr or "")
         request_ids = rids2
-    return _cli_result(binary_label, result, combined, tokens_in, tokens_out, cost, request_ids)
+    return _cli_result(binary_label, result, combined, tokens_in, tokens_out, cost, request_ids), (result.stdout or "")
 
 
 def _cli_judge(cmd: str, cwd: Path) -> dict | None:
@@ -538,9 +590,16 @@ class _PromptCliExecutor(Executor):
         ok, detail_avail = self.available()
         if not ok:
             return GenResult(status="unavailable", log="", detail=detail_avail, duration_ms=0)
-        prompt = build_prompt(contract, context)
+        from .file_edits import build_prompt_with_files, contract_target_files
+
+        targets = contract_target_files(contract)
+        before_snapshots = _snapshot_targets(Path(worktree), targets) if targets else {}
+        prompt = build_prompt_with_files(Path(worktree), contract, context) if targets else build_prompt(contract, context)
         cmd = f"{self.binary} {self._prompt_args(prompt)}"
-        return _cli_generate(self.binary, cmd, worktree)
+        gen, stdout = _cli_generate(self.binary, cmd, worktree)
+        if gen.status == "completed" and targets and _targets_unchanged(Path(worktree), before_snapshots):
+            _apply_cli_stdout_edits(Path(worktree), contract, stdout, gen)
+        return gen
 
     def judge(self, packet: str, rubric: dict) -> dict | None:
         ok, _ = self.available()

@@ -22,19 +22,27 @@ import copy
 #: families score a candidate) live in the matrix engine.
 PANEL_FAMILIES = [
     "anthropic", "openai", "xai", "google",
-    "reflection", "alibaba", "moonshot", "deepseek",
+    "alibaba", "moonshot", "deepseek", "zai",
 ]
 
 DEFAULT_ROUTES = {
     "code": {
         "primary": "codex",
         "compete_with": "grok",
-        "fallback": ["claude", "agy", "qwen-local", "kimi", "deepseek",
-                     "beam", "local-solver"],
-        # The google seat is `agy` (no executor is called `gemini`; fix pass
+        "fallback": [
+            "claude", "agy", "qwen-local", "kimi", "deepseek",
+            "beam", "local-solver",
+            "mm-openai", "mm-anthropic", "mm-xai", "mm-google",
+            "mm-alibaba", "mm-moonshot", "mm-deepseek", "mm-zai",
+        ],
+        # The google CLI seat is `agy` (no executor is called `gemini`; fix pass
         # Wave 2.10, review 1D-17). The matrix seats peers from the live
         # executors anyway; this list serves the legacy judge path.
-        "judges": ["agy", "beam", "grok", "qwen-local", "claude", "codex"],
+        "judges": [
+            "agy", "beam", "grok", "qwen-local", "claude", "codex",
+            "mm-google", "mm-zai", "mm-xai", "mm-alibaba",
+            "mm-anthropic", "mm-openai", "mm-moonshot", "mm-deepseek",
+        ],
         "rule": "judge.family not in contest.families; panel recomputed on fallback",
         "panel": list(PANEL_FAMILIES),
         "scoring": "peer_matrix; no self-scoring; blind",
