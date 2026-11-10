@@ -19,7 +19,7 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
   hermes plugins validate
   ```
 
-  Status: **PASSED on the operator's machine for the v0.3 tree** (2026-11-07, Hermes v0.21.5: all 13 checks, security scan safe, both the plain and the `--install-deps` form — see BUILD-LOG.md, parent verification). Capabilities in the YAML mirror `plugin.yaml` exactly (5 tools, 2 hooks) because the validator checks them against what the code registers. The release commit will differ from that validated tree — it stands 51 commits after the validated v0.3 tree (3923dad..e12c59c).
+  Status: **PASSED on the operator's machine for the v0.3 tree** (2026-11-07, Hermes v0.21.5: all 13 checks, security scan safe, both the plain and the `--install-deps` form — see BUILD-LOG.md, parent verification). Capabilities in the YAML mirror `plugin.yaml` exactly (5 tools, 2 hooks) because the validator checks them against what the code registers. The release commit will differ from that validated tree — it stands 56 commits after the validated v0.3 tree, through 73f96c1.
 - [ ] Re-run `hermes plugins validate` on the exact release commit and record the result here.
 - [ ] PR description must carry the Rule 13 disclosure — the same five bullets that open the README ("Disclosures (read first)"), copied verbatim:
 
@@ -31,7 +31,7 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
 
 ## Step 2 — Demo video
 
-- [ ] Record the demo (under 90 seconds). Suggested beats, from `demo/run_demo.py` (the Python fixture; the C# fixture is not run by this script and no contest has been run against it): baseline tests fail on the stubs → the panel generates in separate worktrees → hard gate passes, measured gate kills the naive and balanced candidates (ops_per_tick 120.0 vs threshold <= 8; the ring candidate scores 1.0) → the peer validity matrix fills in on screen → the bracket steps the field down round by round with the cut line visible → the final two are scored head-to-head → verdict + human approval + merge → the Lesson prints and the route table shows the demotion → the verdict report prints the MM CERTIFIED stamp → run 2 starts with the standing line and the Lesson in context.
+- [ ] Record the demo (under 90 seconds). Suggested beats, from `demo/run_demo.py` (the Python fixture; the C# fixture is not run by this script and no contest has been run against it): run 1 — baseline tests fail on the stubs → the panel generates in separate worktrees → hard gate passes, measured gate kills the naive and balanced candidates (ops_per_tick 120.0 vs threshold <= 8; the ring candidate scores 1.0) → a single survivor stands, so the anchor alone decides (no matrix in run 1): verdict + human approval + merge → the run prints its MM CERTIFIED stamp → the Lesson prints and the route table shows the demotion → a fresh session starts with the standing line and the Lesson in context → run 2 — the panel generates again, now lesson-conditioned → the peer validity matrix fills in on screen → the bracket steps the field down round by round with the cut line visible → the final two are scored head-to-head → one answer walks out.
 - [ ] Post the video on X, tagging **@NousResearch**.
 
 ## Step 3 — Official submission form (owner's final action)

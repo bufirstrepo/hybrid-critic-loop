@@ -33,7 +33,7 @@ Rules that never bend:
 * Cuts are pure functions of recorded scores (matrix validity +
   gate results). Nothing is regenerated between rounds; a candidate's
   artifact never changes (no revision round in the entry).
-* Tie at the cut line: fewer tokens wins, then earlier completion
+* Tie at the cut line: fewer tokens wins, then shorter generation duration
   (the Phase-0 tie rule).
 * Every round records round number, field in, field out, and the cut
   line score (the validity score of the last candidate to advance;
