@@ -1221,7 +1221,7 @@ class _Run:
                     )
                 return res
 
-            with ThreadPoolExecutor(max_workers=min(4, len(runnable))) as pool:
+            with ThreadPoolExecutor(max_workers=min(8, len(runnable))) as pool:
                 fut_map = {}
                 for idx, eid, executor, wt in runnable:
                     ctx_copy = contextvars.copy_context()

@@ -1,7 +1,6 @@
 manifest_version: 2
 api_version: 1
 name: the-millionaire-matrix
-display_name: "The Millionaire Matrix"
 version: "0.4.0"
 description: "The Millionaire Matrix (package: Hybrid Critic Loop) — every model family you have a seat for generates, all of them blind-score each other on a validity matrix anchored by real tests, and verified lessons carry into your next session."
 author: "Dino Silvestri"

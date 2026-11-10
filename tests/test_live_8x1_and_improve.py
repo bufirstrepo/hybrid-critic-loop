@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from hybrid_critic_loop import cli, contracts, loop, plugin, progress, router
+from hybrid_critic_loop import cli, contracts, loop, matrix, plugin, progress, router
 from hybrid_critic_loop.executors import Executor, GenResult
 from hybrid_critic_loop.executors_hermes import (
     HERMES_FAMILY_SLOTS,
@@ -469,6 +469,7 @@ class TestPluginSurfacesAndDashboardApi(unittest.TestCase):
         self.assertEqual(shorthand["target_files"], ["app.py"])
         self.assertEqual(shorthand["acceptance"][1]["rubric"], "validity_matrix_v1")
         self.assertEqual(shorthand["acceptance"][1]["judges"], 8)
+        self.assertEqual(shorthand["acceptance"][1]["spread_threshold"], 3.5)
 
         mm_handler = ctx.commands["mm"]["handler"]
         self.assertIn("Millionaire Matrix status:", mm_handler("status"))
@@ -478,6 +479,83 @@ class TestPluginSurfacesAndDashboardApi(unittest.TestCase):
         self.assertIn("active_run", ledger_out)
         plugin.ACTIVE_STORE.close()
         plugin.ACTIVE_CTX = None
+
+    def test_8_family_trimmed_spread_tolerates_single_outlier_and_escalates_split_panel(self):
+        families = ["openai", "anthropic", "xai", "google", "alibaba", "moonshot", "deepseek", "zai"]
+        cands = [{"id": f"c_{f}", "expert_id": f"mm-{f}", "family": f} for f in families]
+        diffs = {c["id"]: f"+# {c['id']}" for c in cands}
+
+        class _Peer(Executor):
+            can_judge = True
+
+            def __init__(self, eid, fam, scores_by_marker):
+                self.expert_id = eid
+                self.family = fam
+                self._scores = scores_by_marker
+
+            def available(self):
+                return True, "ok"
+
+            def judge(self, packet, rubric):
+                import re
+
+                out = {}
+                sections = re.split(r"===\s*CANDIDATE\s+([A-Z0-9_]+)\s*===\n", packet)
+                for i in range(1, len(sections), 2):
+                    lbl = sections[i].strip()
+                    body = sections[i + 1] if i + 1 < len(sections) else ""
+                    val = 8.5
+                    for cid, sc in self._scores.items():
+                        if cid in body:
+                            val = sc
+                            break
+                    out[lbl] = {
+                        "items": {
+                            r: {"score": val, "confidence": 0.9, "evidence": "f.py:1", "rationale": "ok"}
+                            for r in matrix.VALIDITY_ROWS
+                        }
+                    }
+                return out
+
+        store = Store(self.data_dir / "trim.db")
+        self.addCleanup(store.close)
+        # 1 harsh outlier (moonshot gives c_openai 3.5) while 6 peers give 8.5 -> dissent flagged, NOT escalated
+        peers = {
+            f"mm-{f}": _Peer(f"mm-{f}", f, {"c_openai": 3.5} if f == "moonshot" else {})
+            for f in families
+        }
+        out_ok = matrix.run_matrix(
+            store,
+            {"id": "ctr_trim", "task": "Improve code", "acceptance": []},
+            cands,
+            {},
+            diffs,
+            peers,
+            min_score=6.0,
+            spread_threshold=2.0,
+        )
+        self.assertFalse(out_ok.escalated)
+        self.assertEqual(out_ok.per_candidate["c_openai"]["spread"], 0.0)
+        self.assertTrue(any(d["candidate_id"] == "c_openai" and d["judge_family"] == "moonshot" for d in out_ok.dissent))
+
+        # Genuine 4-vs-3 polarized panel on c_openai (3 peers give 4.0, 4 peers give 9.0) -> trimmed spread 5.0 -> escalates!
+        low_fams = {"xai", "google", "alibaba"}
+        split_peers = {
+            f"mm-{f}": _Peer(f"mm-{f}", f, {"c_openai": 4.0 if f in low_fams else 9.0})
+            for f in families
+        }
+        out_split = matrix.run_matrix(
+            store,
+            {"id": "ctr_split", "task": "Improve code", "acceptance": []},
+            cands,
+            {},
+            diffs,
+            split_peers,
+            min_score=6.0,
+            spread_threshold=2.0,
+        )
+        self.assertTrue(out_split.escalated)
+        self.assertEqual(out_split.per_candidate["c_openai"]["spread"], 5.0)
 
 
 if __name__ == "__main__":

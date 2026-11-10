@@ -315,6 +315,7 @@ def _build_shorthand_contract(args: dict) -> dict:
     test_cmd = str(args.get("test_cmd") or "").strip() or _infer_test_cmd(args.get("repo_path"))
     min_score = float(args.get("min_score", 6.0))
     judges = int(args.get("judges", 8))
+    spread_threshold = float(args.get("spread_threshold", 3.5))
     raw: dict = {
         "id": contract_id,
         "mode": mode,
@@ -329,6 +330,7 @@ def _build_shorthand_contract(args: dict) -> dict:
                 "rubric": "validity_matrix_v1",
                 "min": min_score,
                 "judges": judges,
+                "spread_threshold": spread_threshold,
             },
         ],
     }
@@ -464,6 +466,10 @@ _CRITIC_RUN_SCHEMA = {
         "min_score": {
             "type": "number",
             "description": "Minimum peer validity score on the 0-10 rubric (default 6.0).",
+        },
+        "spread_threshold": {
+            "type": "number",
+            "description": "Maximum inner peer-mean spread before escalating for panel split (shorthand default 3.5).",
         },
         "contract_id": {
             "type": "string",

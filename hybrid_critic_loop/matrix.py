@@ -594,7 +594,7 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
         import contextvars
 
         futs = {}
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=min(8, len(prepared_peers))) as pool:
             for jid, ex, _jfam, _ord, _lbls, pkt in prepared_peers:
                 ctx_copy = contextvars.copy_context()
                 futs[jid] = pool.submit(ctx_copy.run, _call_peer_judge, jid, ex, pkt)
@@ -697,7 +697,16 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
         ]
         median_mean = _weighted_or_plain(peer_mean_pairs)
         peer_means = [cell["mean"] for cell in cells]
-        spread = (max(peer_means) - min(peer_means)) if len(peer_means) >= 2 else 0.0
+        if len(peer_means) >= 5:
+            # With 5-7 independent model families, a single harsh or generous
+            # outlier peer is handled by the dissent detector below; measure
+            # panel polarization across the inner (N-2) peers (1-trimmed range).
+            trimmed_means = sorted(peer_means)[1:-1]
+            spread = max(trimmed_means) - min(trimmed_means)
+        elif len(peer_means) >= 2:
+            spread = max(peer_means) - min(peer_means)
+        else:
+            spread = 0.0
         all_confidences = [
             conf for cell in cells for conf in cell["confidences"].values()
         ]

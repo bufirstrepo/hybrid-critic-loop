@@ -210,7 +210,8 @@ class HermesAuxExecutor(Executor):
                     {"role": "user", "content": prompt},
                 ],
                 task=self.task_key,
-                timeout=180,
+                max_tokens=4096,
+                timeout=90,
                 purpose=f"mm.generate.{self.family}",
             )
             duration_ms = int((time.monotonic() - start) * 1000)
@@ -295,8 +296,9 @@ class HermesAuxExecutor(Executor):
                     {"role": "user", "content": prompt},
                 ],
                 task=self.task_key,
+                max_tokens=4096,
                 temperature=0.0,
-                timeout=180,
+                timeout=90,
                 purpose=f"mm.judge.{self.family}",
             )
         except Exception:
