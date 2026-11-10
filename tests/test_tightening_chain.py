@@ -1045,6 +1045,21 @@ class TestVerifyReasonsWithFigures(TighteningTestCase):
                     conn.commit()
                 finally:
                     conn.close()
+                # Round-11 re-base (fix spec, Unit B / MEDIUM-3):
+                # verify_certificate now requires the contract to
+                # read completed under _contract_completed before
+                # the totals check is reached, so the twin book is
+                # completed in production form (the _complete
+                # writes) — the refusal under test stays the totals
+                # mismatch with figures.
+                twin.create_final_answer(
+                    tid, cid, f"git:{self._COMPLETE_SHA}",
+                    human_gate="approved")
+                twin.append_observation(cid, {
+                    "kind": "gate_completion", "decision": "approved",
+                    "merge_source": "fixture",
+                    "commit": self._COMPLETE_SHA, "channel": "fixture"})
+                twin.set_contract_status(cid, "completed")
                 ok, reason = chain.verify_certificate(twin, cert["cert"])
             finally:
                 twin.close()
@@ -1508,6 +1523,21 @@ class TestBehindBookReason(TighteningTestCase):
                     conn.commit()
                 finally:
                     conn.close()
+                # Round-11 re-base (fix spec, Unit B / MEDIUM-3):
+                # verify_certificate now requires the contract to
+                # read completed under _contract_completed before
+                # the totals check is reached, so the short book is
+                # completed in production form (the _complete
+                # writes) — the refusal under test stays the
+                # behind-book totals mismatch.
+                short.create_final_answer(
+                    tid, cid, f"git:{self._COMPLETE_SHA}",
+                    human_gate="approved")
+                short.append_observation(cid, {
+                    "kind": "gate_completion", "decision": "approved",
+                    "merge_source": "fixture",
+                    "commit": self._COMPLETE_SHA, "channel": "fixture"})
+                short.set_contract_status(cid, "completed")
                 ok, reason = chain.verify_certificate(short, cert["cert"])
             finally:
                 short.close()

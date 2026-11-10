@@ -1023,7 +1023,24 @@ class Store:
             raise KeyError(f"unknown contract: {contract_id}")
         observations = _loads(row["observations_json"], [])
         observations.append(obs)
-        observations = observations[-50:]
+        # The 50-entry FIFO trim — with one exemption (round-11
+        # fix spec, Unit B; round-11 attack F2): gate_completion
+        # records are never trimmed. They are the gate's durable
+        # merge record — the evidence chain._contract_completed's
+        # gate-record leg reads — so the trim drops the oldest
+        # NON-gate_completion entries until the cap holds again;
+        # 50 front-door appends of bookkeeping noise cannot revoke
+        # a genuine completion (and the certificate issued over
+        # it). A log consisting solely of gate records is left
+        # whole rather than trimmed of its evidence.
+        while len(observations) > 50:
+            for index, existing in enumerate(observations):
+                if not (isinstance(existing, dict)
+                        and existing.get("kind") == "gate_completion"):
+                    del observations[index]
+                    break
+            else:
+                break
         self._conn.execute(
             "UPDATE contracts SET observations_json=? WHERE id=?",
             (_dumps(observations), contract_id),

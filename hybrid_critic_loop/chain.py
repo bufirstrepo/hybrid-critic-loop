@@ -1212,6 +1212,73 @@ _GATE_SETTLED_STATUSES = frozenset(
     {"completed", "rejected", "escalated", "refused"})
 
 
+def _full_sha(value) -> bool:
+    """Whether ``value`` is a full-length lowercase hex sha — the
+    only form a merge commit is ever recorded in."""
+    return isinstance(value, str) and len(value) == 40 \
+        and all(ch in "0123456789abcdef" for ch in value)
+
+
+def _normalized_status(status):
+    """A contract status normalized for guard comparisons
+    (round-11 fix spec, Unit B; round-11 attack F5): stripped and
+    lowercased, so a status written as ``"escalated "`` or
+    ``"ESCALATED"`` — ``set_contract_status`` validates nothing —
+    cannot slip a settled book past a guard comparing the raw
+    string."""
+    return status.strip().lower() if isinstance(status, str) else status
+
+
+def _normalized_commit(value):
+    """A commit reference normalized for comparison (round-11 fix
+    spec, Unit B; round-11 attack F7): whitespace stripped, the
+    ``git:`` prefix stripped, the sha lowercased. Applied to BOTH
+    sides of a comparison — a baseline recorded in ``git:`` form
+    or uppercase is still the baseline."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if text.startswith("git:"):
+        text = text[len("git:"):]
+    return text.lower()
+
+
+def _read_latest_final_answer(store, contract_id):
+    """The contract's LATEST ``final_answers`` row — the one read
+    every completion surface governs on (round-11 fix spec, Unit
+    B; round-11 attack F6).
+
+    Returns ``(readable, row)``. ``readable`` is False when the
+    store exposes no connection or the read itself failed — the
+    caller decides what an unreadable row means
+    (:func:`_contract_completed`: not completed; the loop's gate
+    reader: no answer on record). ``row`` is None when the read
+    succeeded and no row exists, else a dict with
+    ``contract_id`` / ``commit`` / ``human_gate``.
+
+    Latest by rowid, and the ONLY implementation of the read:
+    ``loop._final_answer_row`` delegates here, so the gate and
+    the chain can never again govern on different rows of a
+    multi-row book (round 10 made the chain read the latest
+    while the loop still read whichever row an unordered
+    ``LIMIT 1`` returned — the first).
+    """
+    conn = getattr(store, "_conn", None)
+    if conn is None:
+        return False, None
+    try:
+        row = conn.execute(
+            "SELECT contract_id, \"commit\", human_gate FROM final_answers"
+            " WHERE contract_id=? ORDER BY rowid DESC LIMIT 1",
+            (contract_id,)).fetchone()
+    except Exception:  # noqa: BLE001 - unreadable is a verdict, not a crash
+        return False, None
+    if row is None:
+        return True, None
+    return True, {
+        "contract_id": row[0], "commit": row[1], "human_gate": row[2]}
+
+
 def _contract_completed(store, contract_id) -> bool:
     """Whether the contract's run COMPLETED (round-5 fix spec H1;
     round-5 gate-core F2; round-9 fix spec M3; round-10 fix spec
@@ -1247,6 +1314,10 @@ def _contract_completed(store, contract_id) -> bool:
         ``git:<sha>``). Every genuine fresh or converged
         completion carries one, so the terminal-status path is
         subsumed: a bare status flip has no row and no record.
+        Round 11 adds the verdict leg's discipline to this leg:
+        the shared decision must be answer-producing, the sha
+        must be full-length lowercase hex, and the contract's
+        status must read settled-completed (see below).
       - **Verdict leg (the crash window).** The contract's status
         is NOT one of the gate-settled statuses, no gate record
         matches, and the latest verdict's ``human_gate`` is an
@@ -1275,40 +1346,54 @@ def _contract_completed(store, contract_id) -> bool:
     this fix removes is completion with no answer at all, and
     completion by agreement between any two plantable rows.
 
+    Round 11 (fix spec, Unit B; round-11 attack F1, gate-core /
+    testaudit findings) held the gate-record leg to the verdict
+    leg's discipline — it had none of it: a ``rejected`` / ``None``
+    / ``"banana"`` decision pair, on a book in ANY status, with a
+    non-sha commit, completed and certified through leg 1 alone.
+    Leg 1 now requires the row's decision to be answer-producing
+    (:data:`_ANSWER_PRODUCING_DECISIONS`), the row's commit to be
+    a full-length lowercase hex sha EQUAL to the record's bare
+    sha (the equality is HIGH-3's pin), and the contract status
+    to read settled-completed — leg 1 exists to corroborate the
+    loop's own completed writes, and every genuine one carries
+    all three. The same pass: the settled-status guard compares
+    the NORMALIZED status (attack F5 — ``"escalated "`` /
+    ``"ESCALATED"`` no longer slip a settled book into the crash
+    window); the verdict leg's baseline exclusion compares
+    normalized commits on both sides (attack F7 — a baseline
+    stored ``git:``-prefixed or uppercase is still the baseline);
+    the row read is the shared latest-by-rowid read the loop's
+    gate reader also uses (attack F6); and a store whose
+    connection EXISTS but whose row read FAILS degrades to NOT
+    completed, never to the status leg (attack F4 — the duck
+    fallback below now governs only stores with no connection
+    surface at all). The residual above is unchanged: leg 1's
+    new discipline does not close the verdict leg's documented
+    plant, and nothing here claims otherwise.
+
     Surfaces, in order: the store's connection (the real Store has
     no final-answer getter, so the lookup is SQL), then
     ``get_contract`` for the status and the observation log, then
     ``latest_verdict`` / ``get_candidate`` for the verdict leg.
-    Duck-typed degradation is preserved exactly: where the row
-    cannot be read at all (no connection surface), the pre-N1
-    fallbacks govern — the terminal status answers, and a store
-    exposing NO completion surface at all degrades to the pre-fix
-    behavior (issuance proceeds), because such stores are test
-    doubles whose verdict rows are their whole world. Where the
-    status surface exists but errors and no row was found, not
-    completed, as before. The real Store exposes every surface,
-    so production issuance is always gated by the rule above.
+    Duck-typed degradation: where the store has NO connection
+    surface at all, the pre-N1 fallbacks govern — the terminal
+    status answers, and a store exposing NO completion surface
+    at all degrades to the pre-fix behavior (issuance proceeds),
+    because such stores are test doubles whose verdict rows are
+    their whole world. Where a connection surface EXISTS but the
+    row read fails, the answer is NOT completed (round-11 attack
+    F4): the error path must never resurrect the abolished
+    status-only leg — on the real Store that shape is a dropped
+    ``final_answers`` table over a genuinely completed book, and
+    it read completed before this fix. Where the status surface
+    exists but errors and no row was found, not completed, as
+    before. The real Store exposes every surface, so production
+    issuance is always gated by the rule above.
     """
-    surface = False
-    row_readable = False
-    row_found = False
-    row_commit = None
-    row_decision = None
-    conn = getattr(store, "_conn", None)
-    if conn is not None:
-        try:
-            row = conn.execute(
-                "SELECT \"commit\", human_gate FROM final_answers"
-                " WHERE contract_id=? ORDER BY rowid DESC LIMIT 1",
-                (contract_id,)).fetchone()
-            surface = True
-            row_readable = True
-            if row is not None:
-                row_found = True
-                row_commit = row[0]
-                row_decision = row[1]
-        except Exception:  # noqa: BLE001 - try the status surface
-            pass
+    has_conn = getattr(store, "_conn", None) is not None
+    surface = has_conn
+    row_readable, row = _read_latest_final_answer(store, contract_id)
     contract = None
     get_contract = getattr(store, "get_contract", None)
     if callable(get_contract):
@@ -1317,25 +1402,44 @@ def _contract_completed(store, contract_id) -> bool:
             contract = get_contract(contract_id)
         except Exception:  # noqa: BLE001 - the legs may still answer
             contract = None
-            if not row_found:
-                # No row to corroborate and the status is
-                # unprovable: not completed (the pre-M3 answer).
-                return False
     if not row_readable:
-        # The row cannot be read at all on this store: the pre-N1
+        if has_conn:
+            # A connection surface EXISTS but the row read failed
+            # (round-11 attack F4): the error path degrades to NOT
+            # completed — never to the status leg, which would
+            # resurrect status-only completion on exactly the
+            # books (a dropped table, a locked read) where the
+            # answer's existence is unprovable.
+            return False
+        # No connection surface at all on this store: the pre-N1
         # partial-surface fallbacks govern (see the docstring).
         if isinstance(contract, dict) and contract.get(
                 "status") in _TERMINAL_COMPLETED_STATUSES:
             return True
         return not surface
-    if not row_found:
+    if row is None:
         # A row is required; the status alone completes nothing.
         return False
+    row_commit = row["commit"]
+    row_decision = row["human_gate"]
     bare_commit = None
     if isinstance(row_commit, str) and row_commit.startswith("git:"):
         bare_commit = row_commit[len("git:"):]
-    # Leg 1 — the gate's own durable merge record.
-    if bare_commit is not None and isinstance(contract, dict):
+    status = contract.get("status") if isinstance(contract, dict) \
+        else None
+    # Leg 1 — the gate's own durable merge record, held to the
+    # verdict leg's discipline (round-11 fix spec, Unit B; HIGH-3;
+    # round-11 attack F1): the shared decision must be one a gate
+    # actually produces an answer under, the row's commit must be
+    # a full-length lowercase hex sha EQUAL to the record's bare
+    # sha, and the contract must read settled-completed — leg 1
+    # exists to corroborate the loop's own completed writes, and
+    # the "banana" / rejected / None / non-sha plants fail each
+    # conjunct in turn.
+    if row_decision in _ANSWER_PRODUCING_DECISIONS \
+            and _full_sha(bare_commit) \
+            and _normalized_status(status) == "completed" \
+            and isinstance(contract, dict):
         observations = contract.get("observations")
         if isinstance(observations, list):
             for obs in observations:
@@ -1345,10 +1449,10 @@ def _contract_completed(store, contract_id) -> bool:
                         and obs.get("commit") == bare_commit:
                     return True
     # Leg 2 — the crash window: a decided verdict over a contract
-    # whose gate never settled, the row bound to its winner.
-    status = contract.get("status") if isinstance(contract, dict) \
-        else None
-    if status in _GATE_SETTLED_STATUSES:
+    # whose gate never settled, the row bound to its winner. The
+    # settled comparison is on the NORMALIZED status (round-11
+    # attack F5).
+    if _normalized_status(status) in _GATE_SETTLED_STATUSES:
         return False
     latest_verdict = getattr(store, "latest_verdict", None)
     if not callable(latest_verdict):
@@ -1376,11 +1480,10 @@ def _contract_completed(store, contract_id) -> bool:
     if not isinstance(winner, dict) \
             or winner.get("contract_id") != contract_id:
         return False
-    if bare_commit is None or len(bare_commit) != 40 \
-            or any(ch not in "0123456789abcdef" for ch in bare_commit):
+    if not _full_sha(bare_commit):
         return False
     baseline = winner.get("baseline_hash")
-    if baseline and bare_commit == baseline:
+    if baseline and _normalized_commit(baseline) == bare_commit:
         return False
     return True
 
@@ -1596,7 +1699,12 @@ def verify_certificate(store, token):
     id, ``created_at``, gate outcome (``measured`` / ``waived``) and a
     winner, NOT the contract's latest verdict (a certificate for a
     contract with no such verdict is a forgery, security F3; the
-    named-verdict rule is round-4 fix spec G4); the chain prefix up to
+    named-verdict rule is round-4 fix spec G4); the contract's
+    COMPLETION at verify time under :func:`_contract_completed`
+    (round-11 fix spec, Unit B — issuance gated on completion
+    since round 5, but verification never re-checked it, so a
+    certificate outlived the deletion of the very answer it
+    certifies); the chain prefix up to
     ``ledger_upto``; the run totals and chain head recomputed over
     that prefix (totals failures name the sealed and recomputed
     figures and the prefix bound against the book's own high-water
@@ -1663,6 +1771,18 @@ def verify_certificate(store, token):
         or (verdict.get("human_gate") == "waived") != payload["waived"]
     ):
         return False, "verdict does not match the certificate"
+    if not _contract_completed(store, contract_id):
+        # Round-11 fix spec, Unit B (round-11 attack F3):
+        # verification consults completion at verify time, exactly
+        # as issuance does — a book whose final answer (or the
+        # gate record corroborating it) was deleted after issuance
+        # no longer verifies, however intact its chain and totals.
+        return False, (
+            "contract does not read completed under "
+            "_contract_completed: the final answer the certificate "
+            "was issued over is missing or no longer corroborated "
+            "by the gate's record"
+        )
     upto = payload["ledger_upto"]
     ok, bad_id = verify_chain(store, upto_id=upto)
     if not ok:

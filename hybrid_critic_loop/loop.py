@@ -282,25 +282,19 @@ def _final_answer_row(store, contract_id):
 
     The final answer is the completion's durable record — the same
     existence question chain._contract_completed asks — so completion
-    idempotence and failure-state honesty key on it. Read through the
-    store's connection when one exists (the real Store has no
-    final-answer getter); the ``"commit"`` column is quoted because
-    COMMIT is a SQL keyword. A store with no readable surface answers
-    None: such stores are doubles whose verdict rows are their whole
-    world, and the pre-J1 behavior (completion proceeds) is correct
-    there."""
-    conn = getattr(store, "_conn", None)
-    if conn is None:
-        return None
-    try:
-        row = conn.execute(
-            "SELECT contract_id, \"commit\", human_gate FROM final_answers"
-            " WHERE contract_id=? LIMIT 1", (contract_id,)).fetchone()
-    except Exception:  # noqa: BLE001 - unprovable is not existing
-        return None
-    if row is None:
-        return None
-    return {"contract_id": row[0], "commit": row[1], "human_gate": row[2]}
+    idempotence and failure-state honesty key on it. The read itself
+    is chain's (:func:`hybrid_critic_loop.chain._read_latest_final_answer`;
+    round-11 fix spec, Unit B; round-11 attack F6): the LATEST row
+    by rowid, the same row the chain governs on — round 10 left this
+    reader on an unordered ``LIMIT 1`` (the FIRST row) while the
+    chain read the latest, so on a multi-row book the gate converged
+    on a row issuance never saw, and vice versa. A store with no
+    readable surface answers None: such stores are doubles whose
+    verdict rows are their whole world, and the pre-J1 behavior
+    (completion proceeds) is correct there."""
+    from . import chain as _chain
+    _readable, row = _chain._read_latest_final_answer(store, contract_id)
+    return row
 
 
 def _recorded_gate_decision(store, contract_id, verdict):
