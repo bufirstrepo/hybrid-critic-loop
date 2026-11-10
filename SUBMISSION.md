@@ -19,7 +19,8 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
   hermes plugins validate
   ```
 
-  Status: **PASSED on the operator's machine for the v0.3 tree** (2026-11-07, Hermes v0.21.5: all 13 checks, security scan safe, both the plain and the `--install-deps` form — see BUILD-LOG.md, parent verification). Capabilities in the YAML mirror `plugin.yaml` exactly (5 tools, 2 hooks) because the validator checks them against what the code registers. The release commit will differ from that validated tree (two post-validation passes landed after it: the fix pass, and the standing/certificates rework), so re-run validate on the exact release commit before opening the PR and record the result here.
+  Status: **PASSED on the operator's machine for the v0.3 tree** (2026-11-07, Hermes v0.21.5: all 13 checks, security scan safe, both the plain and the `--install-deps` form — see BUILD-LOG.md, parent verification). Capabilities in the YAML mirror `plugin.yaml` exactly (5 tools, 2 hooks) because the validator checks them against what the code registers. The release commit will differ from that validated tree — it stands 51 commits after the validated v0.3 tree (3923dad..e12c59c).
+- [ ] Re-run `hermes plugins validate` on the exact release commit and record the result here.
 - [ ] PR description must carry the Rule 13 disclosure — the same five bullets that open the README ("Disclosures (read first)"), copied verbatim:
 
   > - **Executes shell commands.** It runs the model CLIs (`codex exec`, `grok -p`, and the other family adapters below), the acceptance commands written into each contract (unit tests, build commands), the sensor commands that produce measured-gate metrics, and `git` (worktree, diff, merge, branch). Contract acceptance commands are operator-authored; the plugin runs them as written, in the candidate's worktree.
@@ -30,7 +31,7 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
 
 ## Step 2 — Demo video
 
-- [ ] Record the demo (under 90 seconds). Suggested beats, from `demo/run_demo.py` (the Python fixture; the C# fixture is not run by this script and no contest has been run against it): baseline tests fail on the stubs → the panel generates in separate worktrees → hard gate passes, measured gate kills the naive and balanced candidates (ops_per_tick 120.0 vs threshold <= 8; the ring candidate scores 1.0) → the peer validity matrix fills in on screen (one column marked down by every peer = drift; one lone low score = a dissent flag) → the bracket steps the field down round by round with the cut line visible → the final two are scored head-to-head → verdict + human approval + merge → the Lesson prints and the route table shows the demotion → the verdict report prints the MM CERTIFIED stamp → run 2 starts with the standing line and the Lesson in context.
+- [ ] Record the demo (under 90 seconds). Suggested beats, from `demo/run_demo.py` (the Python fixture; the C# fixture is not run by this script and no contest has been run against it): baseline tests fail on the stubs → the panel generates in separate worktrees → hard gate passes, measured gate kills the naive and balanced candidates (ops_per_tick 120.0 vs threshold <= 8; the ring candidate scores 1.0) → the peer validity matrix fills in on screen → the bracket steps the field down round by round with the cut line visible → the final two are scored head-to-head → verdict + human approval + merge → the Lesson prints and the route table shows the demotion → the verdict report prints the MM CERTIFIED stamp → run 2 starts with the standing line and the Lesson in context.
 - [ ] Post the video on X, tagging **@NousResearch**.
 
 ## Step 3 — Official submission form (owner's final action)

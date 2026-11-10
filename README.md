@@ -85,7 +85,7 @@ Standing appears wherever the operator already looks:
 
 A standing is only worth flexing if it cannot be rewritten after the fact, so the book seals itself. Every ledger row carries a hash chain: `row_hash = sha256(prev_hash + the row's canonical form)`, each row sealing the one before it back to a genesis hash. Rows written before the chain existed are backfilled in id order on first open (a store meta flag records that the backfill has run); every new row is hashed as it is appended, under the store's lock. Edit any stored row — inflate a token count, invent spend — and the chain no longer recomputes: `chain.verify_chain` names the first row that fails to seal. The chain detects any edit *that does not also recompute the chain* — whoever holds the store's files can recompute it — so verification gains its meaning against a chain head or certificate exported earlier, not against the store alone. And pre-chain builds must not append to a chained store: their unhashed rows break the seal for every reader (an unsealed suffix is re-sealed on open and reported as a repair; an unsealed row in the middle is corruption).
 
-A run that reached a verdict with a winner is issued a **certificate**, printed in its run result and at the foot of its verdict report. The demo's own stamp — the local solvers report tokens but no cost — is the honest shape of it:
+A run that reached a verdict with a winner is issued a **certificate**, printed in its run result and at the foot of its verdict report. The demo's own stamp — the local solvers report neither tokens nor cost — is the honest shape of it:
 
 ```
 MM CERTIFIED · TOKENS NOT REPORTED · ONE ANSWER
