@@ -746,10 +746,19 @@ def _finish_from_existing_answer(store, contract_id, decision, reason,
     )
     # The gate_completion observation is the durable merge record —
     # append it only if the first attempt died before writing it,
-    # so a converged book carries exactly one.
+    # so a converged book carries exactly one. The dedupe is on
+    # CONTENT, not kind alone (round-12 fix spec, Unit F; round-12
+    # attack F3): a prior record suppresses the write only when it
+    # records THIS merge — the same commit and the same decision.
+    # A stray gate_completion with a different commit (or a
+    # different decision) is not this merge's record, and must not
+    # suppress the genuine one chain._contract_completed's
+    # gate-record leg looks for.
     prior = store.get_contract(contract_id) or {}
     already_noted = any(
         isinstance(obs, dict) and obs.get("kind") == "gate_completion"
+        and obs.get("commit") == merged_sha
+        and obs.get("decision") == decision
         for obs in prior.get("observations") or [])
     if not already_noted:
         try:
@@ -1451,7 +1460,18 @@ class _Run:
         evidence = dict(row.get("evidence") or {})
         evidence["eliminated_kind"] = kind
         try:
-            self.store.update_candidate(cid, evidence=evidence)
+            # The elimination record is loop-only (round-12 fix
+            # spec, Unit F): the real store refuses evidence writes
+            # through update_candidate that set or clear the kind,
+            # so the marking goes through its dedicated channel.
+            # Stores without that channel (older doubles) keep the
+            # original evidence write.
+            setter = getattr(
+                self.store, "set_candidate_eliminated_kind", None)
+            if callable(setter):
+                setter(cid, kind)
+            else:
+                self.store.update_candidate(cid, evidence=evidence)
         except Exception:  # noqa: BLE001
             pass
         if isinstance(cand, dict):
@@ -2029,8 +2049,17 @@ class _Run:
             wrow = store.get_candidate(winner["id"]) or {}
             wev = dict(wrow.get("evidence") or {})
             if "eliminated_kind" in wev:
-                del wev["eliminated_kind"]
-                store.update_candidate(winner["id"], evidence=wev)
+                # Clearing the winner's kind is the loop's own
+                # write (round-12 fix spec, Unit F): through the
+                # dedicated channel where the store has one —
+                # update_candidate refuses to clear the key.
+                setter = getattr(
+                    store, "set_candidate_eliminated_kind", None)
+                if callable(setter):
+                    setter(winner["id"], None)
+                else:
+                    del wev["eliminated_kind"]
+                    store.update_candidate(winner["id"], evidence=wev)
         except Exception:  # noqa: BLE001 - bookkeeping must not break a verdict
             pass
         self._snapshot_winner(winner)

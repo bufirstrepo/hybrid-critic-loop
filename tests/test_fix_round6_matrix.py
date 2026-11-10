@@ -1,8 +1,9 @@
 """Round-6 fix pass, Unit 2 (matrix) — spec J2 (round-6 gate-core F2).
 
 The seam this file pins: the loop persists a candidate's elimination
-kind INSIDE its evidence (``loop._mark_eliminated`` writes
-``evidence["eliminated_kind"]`` via ``update_candidate``), and the
+kind INSIDE its evidence (``loop._mark_eliminated`` persists
+``evidence["eliminated_kind"]`` through the store's loop-only
+channel, ``set_candidate_eliminated_kind``), and the
 real Store's candidate dict carries ``evidence`` as a nested dict
 with NO top-level ``eliminated_kind``. Round 5's calibration read
 site looked only at the top level, so on the production wiring a
@@ -11,9 +12,10 @@ as a negative — the two halves were each tested against different
 shapes and never met.
 
 The seam test below persists rows through the REAL write shape —
-candidates created on a real Store, kinds set via ``update_candidate``
-with the loop's evidence payload, scores via ``add_score``, the
-verdict via ``create_verdict`` — and grades with
+candidates created on a real Store, kinds set via the loop's
+protected channel (``set_candidate_eliminated_kind``; round-12
+Unit F — ``update_candidate`` no longer moves the kind), scores
+via ``add_score``, the verdict via ``create_verdict`` — and grades with
 ``compute_calibration`` against that store. No fake-store dicts.
 The dict-level resolver controls (evidence as a JSON string,
 top-level precedence, the pre-fix ``eliminated_at`` shape) live in
@@ -35,13 +37,13 @@ FAMILY = "fam-x"
 
 
 def _mark_eliminated_like_the_loop(store, candidate_id, kind):
-    """The loop's exact write shape (loop._mark_eliminated): read the
-    candidate's current evidence, set the kind inside it, write the
-    evidence back with update_candidate."""
-    row = store.get_candidate(candidate_id) or {}
-    evidence = dict(row.get("evidence") or {})
-    evidence["eliminated_kind"] = kind
-    store.update_candidate(candidate_id, evidence=evidence)
+    """The loop's exact write shape (loop._mark_eliminated): the kind
+    is set inside the candidate's evidence through the store's
+    loop-only channel (round-12 Unit F re-base: update_candidate
+    now refuses to set or clear the kind, so the fixture writes
+    through set_candidate_eliminated_kind — the production path
+    loop._mark_eliminated itself uses)."""
+    store.set_candidate_eliminated_kind(candidate_id, kind)
 
 
 class TestCalibrationSeamRealStore(unittest.TestCase):

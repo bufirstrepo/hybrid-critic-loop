@@ -41,6 +41,21 @@ _CANDIDATE_UPDATE_FIELDS = {
     "status",
 }
 
+#: Observation kinds that are GATE RECORDS (round-12 fix spec, Unit F;
+#: round-12 attack F2 / store F1): the records chain/loop gate logic
+#: reads as evidence — the durable merge record, the recorded
+#: post-claim failure (the retry decision's surviving record), and
+#: the convergence-refusal audit record. The observation FIFO trim
+#: exempts this family, capped like everything else (see
+#: :meth:`Store.append_observation`).
+_GATE_RECORD_KINDS = frozenset({
+    "gate_completion", "gate_failure", "gate_answer_refused",
+})
+
+#: The observation log's per-contract cap (the FIFO's 50): it bounds
+#: the log as a whole AND the gate-record family inside it.
+_OBSERVATION_CAP = 50
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS targets (
     id TEXT PRIMARY KEY,
@@ -1023,24 +1038,43 @@ class Store:
             raise KeyError(f"unknown contract: {contract_id}")
         observations = _loads(row["observations_json"], [])
         observations.append(obs)
-        # The 50-entry FIFO trim — with one exemption (round-11
-        # fix spec, Unit B; round-11 attack F2): gate_completion
-        # records are never trimmed. They are the gate's durable
-        # merge record — the evidence chain._contract_completed's
-        # gate-record leg reads — so the trim drops the oldest
-        # NON-gate_completion entries until the cap holds again;
-        # 50 front-door appends of bookkeeping noise cannot revoke
-        # a genuine completion (and the certificate issued over
-        # it). A log consisting solely of gate records is left
-        # whole rather than trimmed of its evidence.
-        while len(observations) > 50:
+        # The 50-entry FIFO trim — with one exemption, bound on
+        # both sides (round-11 fix spec, Unit B; round-12 fix spec,
+        # Unit F; round-11 attack F2; round-12 attack F2 / store
+        # F1). GATE RECORDS (:data:`_GATE_RECORD_KINDS` — the
+        # durable merge record, the gate_failure a retry decision
+        # is read back from, the gate_answer_refused audit record)
+        # are trimmed only after every non-gate record: 50
+        # front-door appends of bookkeeping noise cannot evict one
+        # (evicting a gate_failure flipped _recorded_gate_decision
+        # to None and silently defeated the retry refusal). But
+        # the exemption keys on the bare kind string, so it is
+        # itself capped at the same 50: once gate records alone
+        # exceed the cap, the OLDEST gate record trims — genuine
+        # gate records are written once per gate by construction,
+        # so a >50 gate-record log is a plant by definition, and
+        # planted records cannot grow the log without bound or
+        # freeze out a genuine gate_failure appended after them.
+        while len(observations) > _OBSERVATION_CAP:
+            exempt = [
+                index for index, existing in enumerate(observations)
+                if isinstance(existing, dict)
+                and existing.get("kind") in _GATE_RECORD_KINDS
+            ]
+            if len(exempt) > _OBSERVATION_CAP:
+                del observations[exempt[0]]
+                continue
             for index, existing in enumerate(observations):
                 if not (isinstance(existing, dict)
-                        and existing.get("kind") == "gate_completion"):
+                        and existing.get("kind") in _GATE_RECORD_KINDS):
                     del observations[index]
                     break
             else:
-                break
+                # Every record is a gate record yet the cap is
+                # exceeded — the exempt-count branch above covers
+                # this; keep a defensive oldest-first trim so the
+                # loop can never spin.
+                del observations[0]
         self._conn.execute(
             "UPDATE contracts SET observations_json=? WHERE id=?",
             (_dumps(observations), contract_id),
@@ -1083,6 +1117,41 @@ class Store:
                 f"unsupported candidate fields: {sorted(unknown)}")
         if not fields:
             return
+        if "evidence" in fields:
+            # Round-12 fix spec, Unit F (round-12 attack F1): the
+            # elimination record inside a candidate's evidence is
+            # LOOP-ONLY. The Item 1 = A route derivation reads
+            # evidence["eliminated_kind"] as a trusted gate input,
+            # so the public candidate write must not be able to SET
+            # it (forging kind="hard" on the sole passer) or CLEAR
+            # it (reviving a gate-killed seat with evidence={}) —
+            # the same class of protection candidate provenance
+            # got in round 5. Any evidence write that carries the
+            # key, or that would drop the key a row already
+            # carries, is refused; evidence writes that never touch
+            # the key on a row that does not carry it (the dispatch
+            # path's own write) are unaffected. The loop's marking
+            # and winner-clearing paths go through the dedicated
+            # channel, :meth:`set_candidate_eliminated_kind`.
+            new_evidence = fields["evidence"]
+            current = self._one(
+                "SELECT evidence_json FROM candidates WHERE id=?",
+                (candidate_id,))
+            current_evidence = (
+                _loads(current["evidence_json"], {})
+                if current is not None else {})
+            current_kind = (
+                current_evidence.get("eliminated_kind")
+                if isinstance(current_evidence, dict) else None)
+            carries_key = (
+                isinstance(new_evidence, dict)
+                and "eliminated_kind" in new_evidence)
+            if carries_key or current_kind is not None:
+                raise ValueError(
+                    f"candidate {candidate_id!r}: the elimination"
+                    " kind in a candidate's evidence is written"
+                    " only by the loop (set_candidate_eliminated_"
+                    "kind); update_candidate cannot set or clear it")
         if "provenance" in fields:
             # Round-5 fix spec H2 (round-5 attack F4): candidate
             # provenance is WRITE-ONCE once the candidate has ledger
@@ -1125,6 +1194,39 @@ class Store:
         self._conn.execute(
             "UPDATE candidates SET payload_hash=? WHERE id=?",
             (payload_hash, candidate_id))
+        self._conn.commit()
+
+    def set_candidate_eliminated_kind(self, candidate_id, kind):
+        """Set (or, with ``kind=None``, clear) a candidate's
+        elimination kind — the LOOP-ONLY write channel for the
+        elimination record (round-12 fix spec, Unit F; round-12
+        attack F1).
+
+        The kind rides inside the candidate's evidence under
+        ``eliminated_kind``, exactly where ``loop._mark_eliminated``
+        has always persisted it, and the rest of the evidence is
+        preserved. :meth:`update_candidate` refuses any evidence
+        write that sets or clears the key, so this dedicated
+        setter — the channel the loop's marking path and its
+        winner-clearing path use, like
+        :meth:`set_candidate_payload_hash` for the verdict-time
+        snapshot — is the only store write that moves it.
+        Committed before returning."""
+        row = self._one(
+            "SELECT evidence_json FROM candidates WHERE id=?",
+            (candidate_id,))
+        if row is None:
+            raise KeyError(f"unknown candidate: {candidate_id}")
+        evidence = _loads(row["evidence_json"], {})
+        if not isinstance(evidence, dict):
+            evidence = {}
+        if kind is None:
+            evidence.pop("eliminated_kind", None)
+        else:
+            evidence["eliminated_kind"] = kind
+        self._conn.execute(
+            "UPDATE candidates SET evidence_json=? WHERE id=?",
+            (_dumps(evidence), candidate_id))
         self._conn.commit()
 
     def get_candidate(self, candidate_id):

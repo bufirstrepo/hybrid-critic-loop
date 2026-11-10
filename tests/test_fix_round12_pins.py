@@ -251,10 +251,11 @@ class TestAttemptScopingDirectDrive(LoopV03Base):
                 slot, f"wt://{eid}", "basehash")
             store.update_candidate(cid, status="completed")
             if kind:
-                row = store.get_candidate(cid)
-                ev = dict(row.get("evidence") or {})
-                ev["eliminated_kind"] = kind
-                store.update_candidate(cid, evidence=ev)
+                # Re-based to production form (round-12 Unit F):
+                # the kind is loop-only — update_candidate refuses
+                # to set it, so the fixture writes through the
+                # channel loop._mark_eliminated uses.
+                store.set_candidate_eliminated_kind(cid, kind)
             cids[(attempt, eid)] = cid
         store.upsert_route("code", route[0], route[1], route[2], [],
                            "seed")

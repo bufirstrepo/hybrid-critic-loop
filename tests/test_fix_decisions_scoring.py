@@ -116,12 +116,11 @@ FAMILY = "fam-x"
 
 def _mark_eliminated_like_the_loop(store, candidate_id, kind):
     """The loop's exact write shape (loop._mark_eliminated): the kind
-    rides inside the candidate's evidence, written via
-    update_candidate — the round-6 seam's persisted shape."""
-    row = store.get_candidate(candidate_id) or {}
-    evidence = dict(row.get("evidence") or {})
-    evidence["eliminated_kind"] = kind
-    store.update_candidate(candidate_id, evidence=evidence)
+    rides inside the candidate's evidence — the round-6 seam's
+    persisted shape, written since round-12 Unit F through the
+    store's loop-only channel (set_candidate_eliminated_kind;
+    update_candidate now refuses to set or clear the kind)."""
+    store.set_candidate_eliminated_kind(candidate_id, kind)
 
 
 class TestBracketCutPassersAreNotCalibrationNegatives(unittest.TestCase):
