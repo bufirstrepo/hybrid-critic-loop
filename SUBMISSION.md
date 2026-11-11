@@ -6,10 +6,10 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
 
 ## Current local build state (pre-push)
 
-- **Branch & commits:** `feat/live-8x1-and-ui` (code anchored at `c911fe5`, sitting 3 feature commits ahead of `master` at `1483c10` and `61` commits after the earlier validated v0.3 tree `3923dad`, plus this submission-docs reconciliation commit). **Nothing has been pushed to GitHub yet.**
+- **Branch & commits:** `feat/live-8x1-and-ui` (5 commits ahead of `master` at `1483c10` and `63` commits after the earlier validated v0.3 tree `3923dad`). **Nothing has been pushed to GitHub yet.**
 - **Release version:** `v0.4` (`0.4.0` across `pyproject.toml`, `plugin.yaml`, and `the-millionaire-matrix.yaml`).
 - **Automated verification (`2026-11-10`):**
-  - `867/867` unit tests passing (`skipped=1`) under both Python `3.14.7` and the Hermes venv Python `3.11.15`.
+  - `868/868` unit tests passing (`skipped=1`) under both Python `3.14.7` and the Hermes venv Python `3.11.15`.
   - `hermes plugins validate` — **PASSED** (`16/16` checks green, `0` errors, `0` warnings, security scan safe, desktop surface inside SDK bounds).
   - `hermes plugins doctor` — **PASSED** (`manifest: the-millionaire-matrix 0.4.0 (standalone)`, `registrations: 5 tool(s), 2 hook(s)`).
   - `tools/check_repo_hygiene.py` — **PASSED** (zero untracked files, zero tracked runtime artifacts).
@@ -34,7 +34,7 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
   hermes plugins doctor /path/to/hybrid-critic-loop
   ```
 
-  Status: **PASSED on the operator's machine on `feat/live-8x1-and-ui` at `c911fe5` (2026-11-10)**: all 16 `hermes plugins validate` checks (`0` errors, `0` warnings, security scan safe, desktop surface verified) plus `hermes plugins doctor` (`OK: runtime discovery, manifest parsing, import, and registration passed`). Capabilities in `the-millionaire-matrix.yaml` mirror `plugin.yaml` `(5 tools, 2 hooks)` (`plugin.yaml` also declares `emits: [run.progress]` and ships `dashboard/plugin_api.py` + `desktop/plugin.js` for the host UI).
+  Status: **PASSED on the operator's machine on `feat/live-8x1-and-ui` (2026-11-10)**: all 16 `hermes plugins validate` checks (`0` errors, `0` warnings, security scan safe, desktop surface verified) plus `hermes plugins doctor` (`OK: runtime discovery, manifest parsing, import, and registration passed`). Capabilities in `the-millionaire-matrix.yaml` mirror `plugin.yaml` `(5 tools, 2 hooks)` (`plugin.yaml` also declares `emits: [run.progress]` and ships `dashboard/plugin_api.py` + `desktop/plugin.js` for the host UI).
 - [ ] Re-run `hermes plugins validate` on the exact pushed release SHA and confirm `0` warnings / `0` errors.
 - [ ] PR description must carry the Rule 13 disclosure — the same five bullets that open `README.md` ("Disclosures (read first)"), copied verbatim:
 

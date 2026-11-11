@@ -557,6 +557,51 @@ class TestPluginSurfacesAndDashboardApi(unittest.TestCase):
         self.assertTrue(out_split.escalated)
         self.assertEqual(out_split.per_candidate["c_openai"]["spread"], 5.0)
 
+    def test_contracts_docstring_matrix_placeholder_and_registration_blurbs(self):
+        # 1. contracts.py module docstring + verify_baseline docstring describe both fix and improve
+        for doc in (contracts.__doc__ or "", contracts.verify_baseline.__doc__ or ""):
+            self.assertIn('mode="fix"', doc)
+            self.assertIn('mode="improve"', doc)
+            self.assertIn("pass_improve", doc)
+
+        # 2. dashboard/plugin_api.py get_matrix() empty-store placeholder returns real VALIDITY_ROWS
+        api_path = Path(__file__).resolve().parent.parent / "dashboard" / "plugin_api.py"
+        spec = importlib.util.spec_from_file_location("mm_plugin_api_rows_test", api_path)
+        api_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(api_mod)
+        mat_empty = asyncio.run(api_mod.get_matrix())
+        self.assertEqual(mat_empty["rows"], list(matrix.VALIDITY_ROWS))
+        mat_missing_cid = asyncio.run(api_mod.get_matrix(contract_id="ctr_missing"))
+        self.assertEqual(mat_missing_cid["rows"], list(matrix.VALIDITY_ROWS))
+        self.assertFalse((self.data_dir / "data.db").exists())
+
+        # 3. plugin.py slash & CLI registration blurbs + cli.py docstring carry full subcommand sets
+        task_models = {task_key: default_model for _, _, task_key, _, default_model in HERMES_FAMILY_SLOTS}
+        ctx = _FakeHermesCtx(_FakePluginLlm(task_models))
+
+        def _cleanup_plugin_globals():
+            if plugin.ACTIVE_STORE is not None:
+                try:
+                    plugin.ACTIVE_STORE.close()
+                except Exception:
+                    pass
+                plugin.ACTIVE_STORE = None
+            plugin.ACTIVE_CTX = None
+
+        self.addCleanup(_cleanup_plugin_globals)
+        plugin.register(ctx)
+        for cmd_name in ("critic", "mm"):
+            desc = ctx.commands[cmd_name]["description"]
+            for sub in ("run", "status", "panel", "usage", "gate", "lessons", "ledger", "standing"):
+                self.assertIn(sub, desc)
+        cli_help = ctx.cli_commands["critic"]["help"]
+        for sub in (
+            "run", "status", "panel", "usage", "claude-statusline-tee",
+            "gate", "lessons", "ledger", "standing", "verify-cert", "session-start",
+        ):
+            self.assertIn(sub, cli_help)
+            self.assertIn(sub, cli.__doc__ or "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,9 +7,16 @@ op and threshold; judged items name a versioned rubric, a minimum, and a
 judge count. Prose acceptance is rejected -- a gate the system cannot
 evaluate is decoration.
 
-Baseline rule (spec, Object schema): the acceptance tests must execute
-and FAIL against the baseline before any candidate runs. If everything
-passes on the baseline, the contract is vacuous and the loop refuses it.
+Baseline rule (mode-specific, see :func:`verify_baseline`):
+- ``mode="fix"`` (default on full contract files): the acceptance suite
+  must execute and FAIL against the baseline (``fail`` — at least one
+  hard item or measured metric fails) before any candidate runs; if
+  everything passes on the baseline, the contract is vacuous and refused
+  (``pass``).
+- ``mode="improve"``: the acceptance suite must execute and PASS against
+  the baseline (``pass_improve`` — every hard item and measured metric
+  passes); a failing baseline is refused (``fail_improve``), and
+  zero-diff candidates are hard-eliminated in ``loop.py``.
 
 OWNER REVIEW item 1 (v0.3, resolved): a judged item carries TWO named
 dissent numbers, not one. ``spread_threshold`` (default 2.0) bounds the
@@ -366,13 +373,16 @@ def validate_contract(raw: dict) -> dict:
 def verify_baseline(store, contract: dict, repo_path, worktree_mgr) -> tuple[bool, dict]:
     """Run acceptance against a pristine baseline worktree.
 
-    Returns (proceed, detail). Proceed is True iff the acceptance suite
-    FAILS on the baseline in the expected way: at least one hard item
-    fails, or at least one measured metric fails (fix pass round 4,
-    spec G9, round-3 contest-core F3 — the rule used to refuse a mixed
-    contract whose hard items passed and measured items failed, which
-    its own docstring never said). Records acceptance_baseline_run on
-    the contract row. Commands run with the scrubbed gate environment,
+    Returns (proceed, detail). In ``mode="fix"`` (default), ``proceed`` is
+    True iff the acceptance suite FAILS on the baseline in the expected
+    way: at least one hard item fails, or at least one measured metric
+    fails (fix pass round 4, spec G9, round-3 contest-core F3 — the rule
+    used to refuse a mixed contract whose hard items passed and measured
+    items failed, which its own docstring never said), recording ``fail``
+    or ``pass``. In ``mode="improve"``, ``proceed`` is True iff every
+    hard item and measured metric PASSES on the baseline, recording
+    ``pass_improve`` or ``fail_improve``. Records ``acceptance_baseline_run``
+    on the contract row. Commands run with the scrubbed gate environment,
     each bounded by its item's timeout_s (spec G7 — the baseline path
     used to pass no timeout at all).
     """

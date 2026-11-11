@@ -1,14 +1,18 @@
 """Standalone CLI for the Hybrid Critic Loop.
 
 Usage:
-    python -m hybrid_critic_loop.cli run <contract.json> --repo PATH \
-        [--executors live|local] [--approve|--reject|--waive] [--data-dir PATH]
+    python -m hybrid_critic_loop.cli run <contract.json> [--repo PATH] \
+        [--executors live|hermes|cli|local] [--approve|--reject|--waive] [--data-dir PATH]
+    python -m hybrid_critic_loop.cli status [--data-dir PATH]
+    python -m hybrid_critic_loop.cli panel [--executors live|hermes|cli|local] [--data-dir PATH]
+    python -m hybrid_critic_loop.cli usage [--executors live|hermes|cli|local] [--json] [--passive] [--data-dir PATH]
+    python -m hybrid_critic_loop.cli claude-statusline-tee [--chain CMD] [--data-dir PATH]
     python -m hybrid_critic_loop.cli gate <contract_id> approved|rejected|waived [--reason R] [--data-dir PATH]
-    python -m hybrid_critic_loop.cli lessons [--domain D] [--tags a,b] [--data-dir PATH]
+    python -m hybrid_critic_loop.cli lessons [--domain D] [--tags a,b] [--limit N] [--data-dir PATH]
     python -m hybrid_critic_loop.cli ledger [--data-dir PATH]
     python -m hybrid_critic_loop.cli standing [--data-dir PATH]
-    python -m hybrid_critic_loop.cli session-start [--domain D] [--data-dir PATH]
     python -m hybrid_critic_loop.cli verify-cert <token> [--data-dir PATH]
+    python -m hybrid_critic_loop.cli session-start [--domain D] [--data-dir PATH]
 
 The same argparse shape is reused by the Hermes CLI command registered in
 plugin.py (``hermes critic ...``) via :func:`add_parser` / :func:`dispatch`.
@@ -485,7 +489,7 @@ def add_parser(subparsers):
     """Add the ``critic`` parser (with its subcommands) to ``subparsers``."""
     parser = subparsers.add_parser(
         "critic",
-        help="Hybrid Critic Loop: run contracts, lessons, ledger, standing, verify-cert",
+        help="Hybrid Critic Loop / Millionaire Matrix: run, status, panel, usage, claude-statusline-tee, gate, lessons, ledger, standing, verify-cert, session-start",
     )
     inner = parser.add_subparsers(dest="critic_command")
     _add_subcommands(inner)
@@ -538,7 +542,7 @@ def dispatch(args, data_dir=None) -> int:
     except Exception as exc:  # CLI boundary: errors are exit 1, not tracebacks
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    print("error: no critic subcommand given (run|gate|lessons|ledger|standing|verify-cert|session-start)",
+    print("error: no critic subcommand given (run|gate|lessons|ledger|standing|status|panel|usage|claude-statusline-tee|verify-cert|session-start)",
           file=sys.stderr)
     return 1
 

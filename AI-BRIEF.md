@@ -147,10 +147,10 @@ Millionaire Matrix."
   `MM CERTIFIED · 24,222 TOKENS SPENT · ONE ANSWER`. *(Dino's manual
   interactive smoke test from a fresh Hermes window has NOT yet happened — do
   not claim or imply that it has.)*
-- **Current test & validator counts (`c911fe5`):** `867/867` unit tests passing
-  (`skipped=1`) on Python `3.14.7` and Hermes venv Python `3.11.15`; `hermes
-  plugins validate` (`16/16` checks, `0` warnings, `0` errors) and `hermes
-  plugins doctor` (`5 tool(s), 2 hook(s)`) clean.
+- **Current test & validator counts (`feat/live-8x1-and-ui`):** `868/868` unit
+  tests passing (`skipped=1`) on Python `3.14.7` and Hermes venv Python
+  `3.11.15`; `hermes plugins validate` (`16/16` checks, `0` warnings, `0`
+  errors) and `hermes plugins doctor` (`5 tool(s), 2 hook(s)`) clean.
 
 ## State, standing, and the stamp
 
@@ -215,6 +215,6 @@ authors you trust to run code as you**, in disposable repositories.
 - **Not built:** Animated storefront UI, headless `agy` generate/judge adapter,
   hosted public certificate verification, SQL-pushed lesson ranking (`Named
   residual — lesson lookup cost` in `README.md` §7).
-- **Tree anchor:** Describes `v0.4.0` on branch `feat/live-8x1-and-ui` (code
-  anchored at `c911fe5`, 3 feature commits ahead of `master` pin `1483c10`;
-  unpushed; catalog `sha:` placeholder pending push).
+- **Tree anchor:** Describes `v0.4.0` on branch `feat/live-8x1-and-ui` (5
+  commits ahead of `master` pin `1483c10`; unpushed; catalog `sha:` placeholder
+  pending push).

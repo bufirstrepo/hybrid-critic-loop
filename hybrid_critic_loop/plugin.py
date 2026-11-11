@@ -831,12 +831,12 @@ def register(ctx):
     ctx.register_command(
         "critic",
         critic_command,
-        "Hybrid Critic Loop: run <contract.json> [repo_path] | status | panel | lessons [domain] | ledger | standing",
+        "Hybrid Critic Loop: run <contract.json> [repo_path] | status | panel | usage | gate | lessons [domain] | ledger | standing",
     )
     ctx.register_command(
         "mm",
         critic_command,
-        "The Millionaire Matrix: status | panel | run <contract.json> [repo_path] | gate | ledger | standing",
+        "The Millionaire Matrix: run <contract.json> [repo_path] | status | panel | usage | gate | lessons [domain] | ledger | standing",
     )
 
     # -- CLI command -----------------------------------------------------------
@@ -860,7 +860,7 @@ def register(ctx):
     if callable(register_cli):
         register_cli(
             "critic",
-            "Hybrid Critic Loop: run contracts, view lessons and the expert ledger",
+            "Hybrid Critic Loop / Millionaire Matrix: run | status | panel | usage | claude-statusline-tee | gate | lessons | ledger | standing | verify-cert | session-start",
             cli_setup,
             cli_handler,
         )

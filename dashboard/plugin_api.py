@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - stdlib test fallback when fastapi is a
 
 
 from hybrid_critic_loop.lessons import sanitize_lesson_row
+from hybrid_critic_loop.matrix import VALIDITY_ROWS
 from hybrid_critic_loop.plugin import _build_executors, resolve_data_dir
 from hybrid_critic_loop.progress import read_run_status
 from hybrid_critic_loop.reports import build_matrix_view
@@ -255,7 +256,7 @@ async def get_matrix(contract_id: str = "") -> dict:
         return {
             "contract_id": None,
             "rubric": "validity_matrix_v1",
-            "rows": ["correctness", "risk", "minimality", "evidence"],
+            "rows": list(VALIDITY_ROWS),
             "candidates": {},
             "panel_status": "not_run",
             "note": "not run",
@@ -265,7 +266,7 @@ async def get_matrix(contract_id: str = "") -> dict:
         return {
             "contract_id": cid,
             "rubric": "validity_matrix_v1",
-            "rows": ["correctness", "risk", "minimality", "evidence"],
+            "rows": list(VALIDITY_ROWS),
             "candidates": {},
             "panel_status": "not_run",
             "note": "not run",
