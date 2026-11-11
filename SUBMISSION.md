@@ -6,11 +6,11 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
 
 ## Current local build state (pre-push)
 
-- **Branch & commits:** `feat/live-8x1-and-ui` (6 commits ahead of `master` at `1483c10` and `64` commits after the earlier validated v0.3 tree `3923dad`). **Nothing has been pushed to GitHub yet.**
+- **Branch & commits:** `feat/live-8x1-and-ui` (`8` commits ahead of `master` at `1483c10` and `66` commits after the earlier validated v0.3 tree `3923dad`). Push the final Rule-11-clean commit to `github.com/bufirstrepo/hybrid-critic-loop` before opening the catalog PR.
 - **Release version:** `v0.4` (`0.4.0` across `pyproject.toml`, `plugin.yaml`, and `the-millionaire-matrix.yaml`).
 - **Automated verification (`2026-11-11`):**
-  - `868/868` unit tests passing (`skipped=1`) under both Python `3.14.7` and the Hermes venv Python `3.11.15`.
-  - `hermes plugins validate` — **PASSED** (`16/16` checks green, `0` errors, `0` warnings, security scan safe, desktop surface inside SDK bounds).
+  - `869/869` unit tests passing (`skipped=1`) under both Python `3.14.7` and the Hermes venv Python `3.11.15`.
+  - `hermes plugins validate . --install-deps` — **PASSED** (`16/16` checks green, `0` errors, `0` warnings, security scan safe, desktop surface inside SDK bounds).
   - `hermes plugins doctor` — **PASSED** (`manifest: the-millionaire-matrix 0.4.0 (standalone)`, `registrations: 5 tool(s), 2 hook(s)`).
   - `tools/check_repo_hygiene.py` — **PASSED** (zero untracked files, zero tracked runtime artifacts).
 - **Pending owner actions before opening the PR:**
@@ -20,7 +20,7 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
 ## Step 0 — before anything (owner)
 
 - [ ] Run a quick interactive smoke check from a fresh Hermes session (`/mm panel`, `/mm usage`, and an `improve` or `fix` run with the Desktop pane open).
-- [ ] Create/push the public repository `github.com/bufirstrepo/hybrid-critic-loop` from `feat/live-8x1-and-ui` (developed locally; nothing has been pushed anywhere yet). The repository name may stay `hybrid-critic-loop` — the Python package/import name is unchanged; the product's display name is The Millionaire Matrix.
+- [ ] Push `feat/live-8x1-and-ui` to the public repository `github.com/bufirstrepo/hybrid-critic-loop`. The repository name may stay `hybrid-critic-loop` — the Python package/import name is unchanged; the product's display name is The Millionaire Matrix.
 - [ ] Note the full 40-character SHA of the pushed release commit. The release this checklist ships is v0.4 (`0.4.0`).
 
 ## Step 1 — Catalog PR to NousResearch/hermes-agent
@@ -30,16 +30,16 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
 - [ ] Validate the entry before opening the PR:
 
   ```sh
-  hermes plugins validate /path/to/hybrid-critic-loop
+  hermes plugins validate /path/to/hybrid-critic-loop --install-deps
   hermes plugins doctor /path/to/hybrid-critic-loop
   ```
 
-  Status: **PASSED on the operator's machine on `feat/live-8x1-and-ui` (2026-11-10)**: all 16 `hermes plugins validate` checks (`0` errors, `0` warnings, security scan safe, desktop surface verified) plus `hermes plugins doctor` (`OK: runtime discovery, manifest parsing, import, and registration passed`). Capabilities in `the-millionaire-matrix.yaml` mirror `plugin.yaml` `(5 tools, 2 hooks)` (`plugin.yaml` also declares `emits: [run.progress]` and ships `dashboard/plugin_api.py` + `desktop/plugin.js` for the host UI).
-- [ ] Re-run `hermes plugins validate` on the exact pushed release SHA and confirm `0` warnings / `0` errors.
+  Status: **PASSED on the operator's machine on `feat/live-8x1-and-ui` (2026-11-11)**: all 16 `hermes plugins validate --install-deps` checks (`0` errors, `0` warnings, security scan safe, desktop surface verified) plus `hermes plugins doctor` (`OK: runtime discovery, manifest parsing, import, and registration passed`). Capabilities in `the-millionaire-matrix.yaml` mirror `plugin.yaml` `(5 tools, 2 hooks)` (`plugin.yaml` also declares `emits: [run.progress]` and ships `dashboard/plugin_api.py` + `desktop/plugin.js` for the host UI).
+- [ ] Re-run `hermes plugins validate --install-deps` on the exact pushed release SHA and confirm `0` warnings / `0` errors.
 - [ ] PR description must carry the Rule 13 disclosure — the same five bullets that open `README.md` ("Disclosures (read first)"), copied verbatim:
 
   > - **Executes shell commands.** It runs the model CLIs (`codex exec`, `grok -p`, and the other family adapters below), read-only CLI quota probes (`codex app-server`, `grok agent stdio`, `agy -p "/usage"`, `claude auth status`), the acceptance commands written into each contract (unit tests, build commands), the sensor commands that produce measured-gate metrics, and `git` (worktree, diff, merge, branch). Contract acceptance commands are operator-authored; the plugin runs them as written, in the candidate's worktree.
-  > - **Makes network calls through the operator's own credentials.** Inside Hermes, model traffic routes through Hermes's configured `ctx.llm` auxiliary task slots (`mm_openai` through `mm_zai`); outside Hermes (or in `--executors cli` mode), traffic goes through the operator's logged-in model CLIs, the operator's local ollama server (alibaba seat), or API adapters keyed by the operator's own environment variables (DeepSeek), plus optional read-only plan-usage checks against those same operator-configured accounts. The plugin holds no keys of its own and sends no telemetry anywhere.
+  > - **Makes network calls through the operator's own credentials.** Inside Hermes, model traffic routes through Hermes's configured `ctx.llm` auxiliary task slots (`mm_openai` through `mm_zai`) and the DeepSeek API adapter resolves `DEEPSEEK_API_KEY` exclusively via `agent.secret_scope.get_secret` (no `os.environ` fallback); outside Hermes (or in `--executors cli` mode), traffic goes through the operator's logged-in model CLIs or the operator's local ollama server (alibaba seat), plus optional read-only CLI plan-usage checks via those CLIs' own subcommands (`codex app-server`, `grok agent stdio`, `agy -p "/usage"`, `claude auth status`). Under Catalog Rule 11, the plugin never reads third-party login or credential files (`auth.json`, `.credentials.json`, `kimi-code.json`), holds no keys of its own, and sends no telemetry anywhere.
   > - **Runs candidate code.** Acceptance tests execute the candidates' implementations. Run contests in a disposable repository, never in a tree you cannot afford to have code executed in.
   > - **Writes local state.** A SQLite database (WAL mode), `cert_key`, a human-readable `lessons.md`, `session.json`, live progress snapshots (`run_status.json`), and cached quota readings (`usage_feed_cache.json`, plus optional passive Claude statusline/stream harvest files) under the plugin's data directory — the one Hermes assigns to this plugin, or `HCL_DATA_DIR` outside Hermes (default `<HERMES_HOME>/plugin-data/hybrid-critic-loop/`) — and, inside the operator's target repository, one git worktree per candidate (`wt/<contract>/<slot>`) with `critic/<contract>/<slot>` branches (losers are kept as branches after a merge). Nothing is written inside the plugin's own directory.
   > - **No hosted control plane.** The queue, the gates, the usage feed, and the matrix all run locally. In standalone CLI mode, the legacy Beam seat (Reflection) is reserved for a Nous-portal-hosted standalone path: this build ships no standalone Beam adapter, that CLI seat always reports unavailable with that note, and inside Hermes the 8-family panel runs directly over `ctx.llm` (`mm-openai` through `mm-zai`).
@@ -58,8 +58,8 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
 ## Honest limits & verification notes carried with the submission
 
 - **Claims boundary:** Live 8-family `ctx.llm` behavior is claimed from the recorded `url_slug.py` harness proof (`2026-11-10`); manual interactive smoke testing from a fresh Hermes window awaits Step 0 above.
-- **Usage-feed `unknown` pools on default install:** `claude` reports `unknown` (`plan=max`) until the operator wires `hermes critic claude-statusline-tee` in `~/.claude/settings.json` or runs a `ClaudeExecutor` stream turn; `hermes:nous` reports `unknown` (no public `ctx` quota seam under Catalog Rule 9).
-- **Usage-feed `NOT RUN` register:** `P3` Windows Credential Manager (Linux host only; synthetic path tests run); `P1` Step 2 (`grok -p`) & `P7` Step 1/3 (`claude -p` Haiku) paid CLI turns (skipped under zero-spend verification rules); `P4` live DeepSeek/Moonshot/OpenRouter balance HTTP calls & `P5` live Kimi `/usages` HTTP call (API keys and `kimi` binary absent on host; synthetic parser fixtures tested).
+- **Usage-feed `unknown` pools on default install:** `claude` reports `unknown` (`plan=max`) until the operator wires `hermes critic claude-statusline-tee` in `~/.claude/settings.json` or runs a `ClaudeExecutor` stream turn; `kimi` reports `unknown` by design under Catalog Rule 11 (never reads `kimi-code.json` or makes bearer-token `/usages` HTTP calls); `hermes:nous` reports `unknown` (no public `ctx` quota seam under Catalog Rule 9).
+- **Usage-feed `NOT RUN` register:** `P3` Windows Credential Manager (Linux host only; synthetic path tests run); `P1` Step 2 (`grok -p`) & `P7` Step 1/3 (`claude -p` Haiku) paid CLI turns (skipped under zero-spend verification rules); `P4` live DeepSeek/Moonshot/OpenRouter balance HTTP calls & `P5` live Kimi `/usages` HTTP call (Kimi credential-file reads disabled under Catalog Rule 11 and API keys absent on host; synthetic parser fixtures tested).
 - **Presentation scope:** `usage_feed.py`, `RunProgressTracker` (`agent_cursor`, `active_seat_ids`, `being_prompted`), `dashboard/plugin_api.py` (`GET /usage`, `GET /status`), and `desktop/plugin.js` (`UsagePoolsCard`, chip, pane) are shipped; the animated storefront visualization is **not built**.
 
 ## Judging criteria (for the final polish pass)

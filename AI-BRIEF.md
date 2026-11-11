@@ -100,16 +100,18 @@ Millionaire Matrix."
   side pane (`UsagePoolsCard`, seat grid, bracket, matrix, standing, lessons).
 - **Per-pool usage feed & storefront backend (`usage_feed.py`):**
   - Deduplicates shared-credential seats onto `pool_id` (`pools`, not seats)
-    with SHA-256 `acct-<8hex>` pseudonymization.
+    using non-secret normalized home/config paths with SHA-256 `acct-<8hex>`
+    pseudonymization (never reads third-party credential/login files under
+    Catalog Rule 11).
   - Enforces strict polarity (`USED` inverted via `1 - used` for Codex
     `usedPercent`, Grok `creditUsagePercent`, Claude `used_percentage` `0–100`
     & `utilization` `0–1`, Kimi `used_ratio` `0–1`; `LEFT` kept un-inverted for
     Codex enterprise `individualLimit.remainingPercent` and Antigravity
     `remaining_fraction`), fail-closed `status = "unknown"` (`fraction_left =
     None`) past `min(resets_at, fetched_at + ttl_s)`, `300s` per-pool active
-    poll floor, transport-vs-auth cache failure asymmetry, zero OAuth token
-    refreshes, zero credential writes, and read-only Codex `reset_credits`
-    (`consume_policy = "human_only"`).
+    poll floor, transport-vs-auth cache failure asymmetry, zero third-party
+    login-file reads, zero OAuth token refreshes, zero credential writes, and
+    read-only Codex `reset_credits` (`consume_policy = "human_only"`).
   - Publishes live storefront seat-activity state (`active_seat_ids`,
     `being_prompted`, monotonic `agent_cursor`) in `run_status.json` and
     `GET /usage`. **Data layer only — the animated walking-agent storefront UI
@@ -131,7 +133,8 @@ Millionaire Matrix."
    harvest), `codex` (CLI), `grok` (CLI), `agy` (CLI — declines generate/judge
    dispatch; read-only `/usage` used only by `usage_feed.py`), `beam`
    (`reflection` placeholder, always unavailable), `qwen-local` (local Ollama),
-   `qwen-cli` (CLI), `kimi` (CLI), and `deepseek` (`DEEPSEEK_API_KEY`).
+   `qwen-cli` (CLI), `kimi` (CLI), and `deepseek` (`DEEPSEEK_API_KEY` via
+   `agent.secret_scope.get_secret`, no `os.environ` fallback).
    Standalone mode has no `zai` CLI adapter.
 
 ## Recorded live proof & verification state
@@ -148,9 +151,9 @@ Millionaire Matrix."
   `MM CERTIFIED · 24,222 TOKENS SPENT · ONE ANSWER`. *(Dino's manual
   interactive smoke test from a fresh Hermes window has NOT yet happened — do
   not claim or imply that it has.)*
-- **Current test & validator counts (`feat/live-8x1-and-ui`):** `868/868` unit
+- **Current test & validator counts (`feat/live-8x1-and-ui`):** `869/869` unit
   tests passing (`skipped=1`) on Python `3.14.7` and Hermes venv Python
-  `3.11.15`; `hermes plugins validate` (`16/16` checks, `0` warnings, `0`
+  `3.11.15`; `hermes plugins validate . --install-deps` (`16/16` checks, `0` warnings, `0`
   errors) and `hermes plugins doctor` (`5 tool(s), 2 hook(s)`) clean.
 
 ## State, standing, and the stamp
@@ -205,17 +208,20 @@ authors you trust to run code as you**, in disposable repositories.
 
 ## Honest limits & operating notes
 
-- **Claude & Hermes-Nous usage pools:** `claude` reports `unknown` (`plan=max`)
-  until the operator wires `hermes critic claude-statusline-tee` or runs a
-  Claude CLI stream turn; `hermes:nous` reports `unknown` (no public `ctx`
-  usage seam under Catalog Rule 9).
+- **Claude, Kimi & Hermes-Nous usage pools:** `claude` reports `unknown`
+  (`plan=max`) until the operator wires `hermes critic claude-statusline-tee`
+  or runs a Claude CLI stream turn; `kimi` reports `unknown` under Catalog Rule
+  11 (never reads `kimi-code.json` or makes bearer-token `/usages` HTTP calls);
+  `hermes:nous` reports `unknown` (no public `ctx` usage seam under Catalog
+  Rule 9).
 - **`NOT RUN` verification items:** `P3` Windows Credential Manager (Linux host
   only); `P1`/`P7` paid CLI turns (`grok -p`, `claude -p` Haiku — skipped under
-  no-spend rule); `P4`/`P5` live API/Kimi endpoints (keys/`kimi` binary absent
-  on host; synthetic fixtures tested in `tests/test_usage_feed.py`).
+  no-spend rule); `P4`/`P5` live API/Kimi endpoints (Kimi credential-file reads
+  disabled under Rule 11 and API keys absent on host; synthetic fixtures tested
+  in `tests/test_usage_feed.py`).
 - **Not built:** Animated storefront UI, headless `agy` generate/judge adapter,
   hosted public certificate verification, SQL-pushed lesson ranking (`Named
   residual — lesson lookup cost` in `README.md` §7).
-- **Tree anchor:** Describes `v0.4.0` on branch `feat/live-8x1-and-ui` (6
-  commits ahead of `master` pin `1483c10`; unpushed; catalog `sha:` placeholder
-  pending push).
+- **Tree anchor:** Describes `v0.4.0` on branch `feat/live-8x1-and-ui` (`8`
+  commits ahead of `master` pin `1483c10`; catalog `sha:` placeholder filled on
+  the catalog PR once final commit is pushed to `bufirstrepo/hybrid-critic-loop`).

@@ -18,7 +18,9 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -257,26 +259,66 @@ class TestOllamaQwenExecutor(_StubServerMixin):
             self.assertIsNone(ex.judge("packet text", RUBRIC))
 
 
+@contextmanager
+def _with_deepseek_secret(value: str | None = None, *, raise_exc: Exception | None = None):
+    """Stub ``agent.secret_scope.get_secret`` deterministically across interpreters."""
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = []
+    scope_mod = types.ModuleType("agent.secret_scope")
+    calls: list[str] = []
+
+    def _fake_get_secret(name: str, default=None):
+        calls.append(name)
+        if raise_exc is not None:
+            raise raise_exc
+        if name == "DEEPSEEK_API_KEY" and value is not None:
+            return value
+        return default
+
+    scope_mod.get_secret = _fake_get_secret
+    agent_pkg.secret_scope = scope_mod
+    with patch.dict(sys.modules, {"agent": agent_pkg, "agent.secret_scope": scope_mod}):
+        yield calls
+
+
 class TestDeepSeekExecutor(_StubServerMixin):
     def test_identity(self):
         ex = DeepSeekExecutor()
         self.assertEqual(ex.expert_id, "deepseek")
         self.assertEqual(ex.family, "deepseek")
 
-    def test_available_toggles_on_env_var(self):
+    def test_available_toggles_on_secret_scope_without_environ_fallback(self):
         ex = DeepSeekExecutor()
+        # Even if DEEPSEEK_API_KEY is present in os.environ, DeepSeekExecutor must NEVER
+        # fall back to os.environ when secret_scope returns None, raises, or is absent (Rule 11).
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "env-fallback-must-be-ignored"}, clear=False):
+            with _with_deepseek_secret(None) as calls:
+                ok, detail = ex.available()
+                self.assertFalse(ok)
+                self.assertEqual(detail, "DEEPSEEK_API_KEY not set")
+                self.assertEqual(calls, ["DEEPSEEK_API_KEY"])
+
+            with _with_deepseek_secret(raise_exc=RuntimeError("unscoped multiplex")):
+                ok, detail = ex.available()
+                self.assertFalse(ok)
+                self.assertEqual(detail, "DEEPSEEK_API_KEY not set")
+
+            with patch.dict(sys.modules, {"agent": None, "agent.secret_scope": None}):
+                ok, detail = ex.available()
+                self.assertFalse(ok)
+                self.assertEqual(detail, "DEEPSEEK_API_KEY not set")
+
+            with _with_deepseek_secret(""):
+                ok, _ = ex.available()
+                self.assertFalse(ok, "empty key must not count as present")
+
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("DEEPSEEK_API_KEY", None)
-            ok, detail = ex.available()
-            self.assertFalse(ok)
-            self.assertEqual(detail, "DEEPSEEK_API_KEY not set")
-            os.environ["DEEPSEEK_API_KEY"] = ""
-            ok, _ = ex.available()
-            self.assertFalse(ok, "empty key must not count as present")
-            os.environ["DEEPSEEK_API_KEY"] = "test-key-not-real"
-            ok, detail = ex.available()
-            self.assertTrue(ok)
-            self.assertEqual(detail, "api key present")
+            with _with_deepseek_secret("test-key-not-real") as calls:
+                ok, detail = ex.available()
+                self.assertTrue(ok)
+                self.assertEqual(detail, "api key present")
+                self.assertEqual(calls, ["DEEPSEEK_API_KEY"])
 
     def _patched(self):
         return patch.object(
@@ -286,8 +328,8 @@ class TestDeepSeekExecutor(_StubServerMixin):
     def test_generate_against_stub(self):
         ex = DeepSeekExecutor()
         contract = {"task": "Implement SpeedSampler", "target_file": "src/speed_sampler.py"}
-        env = {"DEEPSEEK_API_KEY": "test-key-not-real"}
-        with patch.dict(os.environ, env), self._patched():
+        with patch.dict(os.environ, {}, clear=False), _with_deepseek_secret("test-key-not-real"), self._patched():
+            os.environ.pop("DEEPSEEK_API_KEY", None)
             os.environ.pop("DEEPSEEK_MODEL", None)  # assert the default model, not the host's
             with tempfile.TemporaryDirectory() as td:
                 result = ex.generate(Path(td), contract, "")
@@ -306,8 +348,7 @@ class TestDeepSeekExecutor(_StubServerMixin):
 
     def test_generate_unavailable_without_key_makes_no_request(self):
         ex = DeepSeekExecutor()
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("DEEPSEEK_API_KEY", None)
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "ignored-env-key"}, clear=False), _with_deepseek_secret(None):
             with tempfile.TemporaryDirectory() as td:
                 result = ex.generate(Path(td), {"task": "x"}, "")
         self.assertEqual(result.status, "unavailable")
@@ -317,7 +358,7 @@ class TestDeepSeekExecutor(_StubServerMixin):
     def test_generate_without_target_file_is_declined_before_any_request(self):
         # Fix pass Wave 2.9 (review M8 / 1D-12).
         ex = DeepSeekExecutor()
-        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key-not-real"}), self._patched():
+        with _with_deepseek_secret("test-key-not-real"), self._patched():
             with tempfile.TemporaryDirectory() as td:
                 result = ex.generate(Path(td), {"task": "explain something"}, "")
                 self.assertEqual(os.listdir(td), [])
@@ -330,7 +371,7 @@ class TestDeepSeekExecutor(_StubServerMixin):
         STATE.delay_s = 1.0
         ex = DeepSeekExecutor()
         contract = {"task": "x", "target_file": "src/speed_sampler.py"}
-        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key-not-real"}), self._patched(), \
+        with _with_deepseek_secret("test-key-not-real"), self._patched(), \
                 patch.object(executors_api, "_GENERATE_TIMEOUT_S", 0.3):
             with tempfile.TemporaryDirectory() as td:
                 result = ex.generate(Path(td), contract, "")
@@ -340,7 +381,7 @@ class TestDeepSeekExecutor(_StubServerMixin):
     def test_generate_error_no_exception_when_endpoint_closed(self):
         ex = DeepSeekExecutor()
         closed = f"http://127.0.0.1:{_closed_port()}/chat/completions"
-        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key-not-real"}), \
+        with _with_deepseek_secret("test-key-not-real"), \
                 patch.object(executors_api, "DEEPSEEK_API_URL", closed):
             with tempfile.TemporaryDirectory() as td:
                 result = ex.generate(  # must not raise
@@ -350,14 +391,13 @@ class TestDeepSeekExecutor(_StubServerMixin):
 
     def test_judge_against_stub(self):
         ex = DeepSeekExecutor()
-        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key-not-real"}), self._patched():
+        with _with_deepseek_secret("test-key-not-real"), self._patched():
             result = ex.judge("packet text", RUBRIC)
         self.assertEqual(result, JUDGE_REPLY)
 
     def test_judge_none_without_key(self):
         ex = DeepSeekExecutor()
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("DEEPSEEK_API_KEY", None)
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "ignored-env-key"}, clear=False), _with_deepseek_secret(None):
             self.assertIsNone(ex.judge("packet text", RUBRIC))
 
 
@@ -368,8 +408,7 @@ class TestAvailabilityNegativesAreDeterministic(unittest.TestCase):
     made the suite fail on the owner's PC — fix pass Wave 2.0, F-W20-03.)"""
 
     def test_deepseek_unavailable_without_key(self):
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("DEEPSEEK_API_KEY", None)
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "ignored-env-key"}, clear=False), _with_deepseek_secret(None):
             ok, detail = DeepSeekExecutor().available()
         self.assertFalse(ok)
         self.assertEqual(detail, "DEEPSEEK_API_KEY not set")

@@ -346,13 +346,13 @@ class DeepSeekExecutor(Executor):
     """DeepSeek chat-completions API (OpenAI-compatible shape).
 
     Availability is purely the presence of a non-empty
-    ``DEEPSEEK_API_KEY`` — no network probe is made by ``available()``.
-    Like the Ollama adapter, the model cannot edit files, so
-    ``generate()`` extracts a fenced code block from the reply for the
-    contract's ``target_file`` (a contract without one is declined before
-    any request). The API response carries no cost
-    figure, so ``cost_usd`` stays None ("not reported") — no price
-    table is invented to fill it in.
+    ``DEEPSEEK_API_KEY`` resolved via ``agent.secret_scope.get_secret``
+    (Catalog Rule 11; no ``os.environ`` fallback) — no network probe is
+    made by ``available()``. Like the Ollama adapter, the model cannot edit
+    files, so ``generate()`` extracts a fenced code block from the reply for
+    the contract's ``target_file`` (a contract without one is declined before
+    any request). The API response carries no cost figure, so ``cost_usd``
+    stays None ("not reported") — no price table is invented to fill it in.
     """
 
     expert_id = "deepseek"
@@ -367,7 +367,7 @@ class DeepSeekExecutor(Executor):
                 return str(scoped)
         except Exception:
             pass
-        return os.environ.get("DEEPSEEK_API_KEY") or ""
+        return ""
 
     def _model(self) -> str:
         return os.environ.get("DEEPSEEK_MODEL") or DEEPSEEK_DEFAULT_MODEL

@@ -14,17 +14,17 @@ Implements the verified multi-CLI / multi-API usage data layer (Waves 1-3):
   ``now < min(resets_at, fetched_at + ttl_s)``. Past ``resets_at``, past TTL,
   missing, or ambiguous readings return ``status = "unknown"`` and
   ``fraction_left = None`` — never a fabricated ``0.0`` or ``1.0``.
-- **Credential safety (R1-R8):** Pure read-only inspection. Never refreshes any
-  CLI's OAuth token, never mutates credential files, never logs raw tokens /
-  emails / account IDs (pseudonymized to ``acct-<8hex>``), never invokes Codex
-  reset-credit consume RPCs (surfaces read-only count/expiry
-  with ``consume_policy = "human_only"``), and enforces ``agy >= 1.1.11``
-  before invoking ``agy -p "/usage" --output-format json``.
+- **Credential safety & Catalog Rule 11 (R1-R8):** Pure read-only inspection.
+  Never reads third-party CLI login or credential files, never refreshes any
+  CLI's OAuth token, never mutates credential stores, derives pool IDs purely
+  from non-secret normalized home/config paths (``acct-<8hex>``), never invokes
+  Codex reset-credit consume RPCs (surfaces read-only count/expiry with
+  ``consume_policy = "human_only"``), and enforces ``agy >= 1.1.11`` before
+  invoking ``agy -p "/usage" --output-format json``.
 """
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import math
@@ -152,23 +152,6 @@ def pseudonymize_account_id(raw_value: str | None, namespace: str = "") -> str:
     return "acct-" + hashlib.sha256(material).hexdigest()[:8]
 
 
-def decode_jwt_claims_unverified(token: str | None) -> dict[str, Any]:
-    """Decode a JWT payload segment in memory without signature verification or logging."""
-    if not token or not isinstance(token, str):
-        return {}
-    parts = token.strip().split(".")
-    if len(parts) < 2:
-        return {}
-    seg = parts[1]
-    pad = "=" * ((4 - len(seg) % 4) % 4)
-    try:
-        raw = base64.urlsafe_b64decode((seg + pad).encode("ascii"))
-        obj = json.loads(raw.decode("utf-8"))
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
-
-
 # ---------------------------------------------------------------------------
 # Cross-platform CLI home resolution (POSIX + Windows)
 # ---------------------------------------------------------------------------
@@ -226,7 +209,7 @@ def kimi_code_home(env: dict[str, str] | None = None) -> Path:
     if primary.exists():
         return primary
     legacy = _user_home(e) / ".kimi"
-    if (legacy / "credentials" / "kimi-code.json").is_file():
+    if legacy.is_dir():
         return legacy
     return primary
 
@@ -611,24 +594,8 @@ def parse_codex_rate_limits(
 
 
 def _codex_pool_id_from_home(home: Path) -> str:
-    auth_file = home / "auth.json"
-    try:
-        if auth_file.is_file():
-            obj = json.loads(auth_file.read_text(encoding="utf-8"))
-            if isinstance(obj, dict):
-                tokens = obj.get("tokens") if isinstance(obj.get("tokens"), dict) else {}
-                acct = tokens.get("account_id") or obj.get("account_id")
-                if not acct and isinstance(tokens.get("access_token"), str):
-                    claims = decode_jwt_claims_unverified(tokens["access_token"])
-                    oai_auth = claims.get("https://api.openai.com/auth")
-                    if isinstance(oai_auth, dict):
-                        acct = oai_auth.get("chatgpt_account_id")
-                    acct = acct or claims.get("sub")
-                if acct:
-                    return f"codex:{pseudonymize_account_id(str(acct), 'codex')}"
-    except Exception:
-        pass
-    return f"codex:{pseudonymize_account_id(str(home), 'codex-home')}"
+    """Derive a stable pool id from the non-secret Codex home path (Catalog Rule 11)."""
+    return f"codex:{pseudonymize_account_id(str(home.expanduser()), 'codex-home')}"
 
 
 def _codex_uses_keyring_without_bus(home: Path) -> bool:
@@ -1072,25 +1039,9 @@ def read_grok_unified_log(
 
 
 def _grok_pool_id_from_home(home: Path) -> tuple[str, bool]:
-    """Return ``(pool_id, token_looks_usable)`` without refreshing or writing anything."""
-    auth_path = home / "auth.json"
-    try:
-        if auth_path.is_file():
-            obj = json.loads(auth_path.read_text(encoding="utf-8"))
-            if isinstance(obj, dict):
-                tok = obj.get("grok_auth_token") or obj.get("access_token")
-                if isinstance(tok, str) and tok.strip():
-                    claims = decode_jwt_claims_unverified(tok)
-                    ident = claims.get("sub") or claims.get("user_id") or tok[:24]
-                    return f"grok:{pseudonymize_account_id(str(ident), 'grok')}", True
-                # Grok 1.0.77 issuer-keyed format: {"https://auth.x.ai::...": {"user_id": ..., "key": ...}}
-                for k, v in obj.items():
-                    if isinstance(v, dict) and (v.get("key") or v.get("access_token") or v.get("user_id")):
-                        ident = v.get("user_id") or v.get("principal_id") or k
-                        return f"grok:{pseudonymize_account_id(str(ident), 'grok')}", True
-    except Exception:
-        pass
-    return f"grok:{pseudonymize_account_id(str(home), 'grok-home')}", False
+    """Derive ``(pool_id, home_exists)`` from the non-secret Grok home path (Catalog Rule 11)."""
+    expanded = home.expanduser()
+    return f"grok:{pseudonymize_account_id(str(expanded), 'grok-home')}", expanded.is_dir()
 
 
 def probe_grok_acp_billing(
@@ -1182,7 +1133,8 @@ def probe_grok_usage(
     """Passive ``unified.jsonl`` check first; fallback to zero-spend ACP ``_x.ai/billing``."""
     now_val = _now_ts(now)
     home = grok_home(env)
-    pool_id, has_auth = _grok_pool_id_from_home(home)
+    pool_id, home_exists = _grok_pool_id_from_home(home)
+    has_grok = home_exists or bool(shutil.which("grok"))
     log_path = home / "logs" / "unified.jsonl"
     latest_entry, new_tail_state = read_grok_unified_log(log_path, tail_state=tail_state)
 
@@ -1202,7 +1154,7 @@ def probe_grok_usage(
         if effective_prior is None and isinstance(pb, tuple) and len(pb) == 2:
             effective_prior = pb
 
-    if allow_active and has_auth:
+    if allow_active and has_grok:
         acp_reading, fkind = probe_grok_acp_billing(
             env=env, now=now_val, pool_id=pool_id, prior_bounds=effective_prior
         )
@@ -1216,7 +1168,7 @@ def probe_grok_usage(
             pool_id=pool_id,
             provider="xai",
             source="grok_unified_log",
-            freshness="missing" if has_auth else "unconfigured",
+            freshness="missing" if has_grok else "unconfigured",
             now=now_val,
             detail="no fresh Grok billing reading in unified.jsonl (refresh to query ACP)",
         ),
@@ -1618,11 +1570,11 @@ def probe_claude_usage(
 ) -> tuple[dict[str, Any], str | None]:
     """Read passive Claude tee / harvest files; optionally enrich plan via ``claude auth status``."""
     now_val = _now_ts(now)
-    cdir = claude_config_dir(env)
+    cdir = claude_config_dir(env).expanduser()
     pool_id = f"claude:{pseudonymize_account_id(str(cdir), 'claude-home')}"
 
     plan: str | None = None
-    logged_in = (cdir / ".credentials.json").is_file() or bool(shutil.which("claude"))
+    logged_in = bool(shutil.which("claude")) or cdir.is_dir()
     if allow_auth_status and shutil.which("claude"):
         plan, logged_in = _claude_auth_plan_readonly(env=env)
 
@@ -2211,81 +2163,25 @@ def probe_kimi_usage(
     timeout_s: float = 5.0,
     now: float | None = None,
 ) -> tuple[dict[str, Any], str | None]:
-    """Read-only Kimi ``/usages`` GET using an existing non-expired token (NEVER refreshes)."""
+    """Report the Kimi CLI pool as unknown without reading credential files (Catalog Rule 11)."""
+    _ = timeout_s
     now_val = _now_ts(now)
-    home = kimi_code_home(env)
-    cred_path = home / "credentials" / "kimi-code.json"
+    home = kimi_code_home(env).expanduser()
     pool_id = f"kimi:{pseudonymize_account_id(str(home), 'kimi-home')}"
-    if not cred_path.is_file():
-        return (
-            _unknown_pool_reading(
-                pool_id=pool_id, provider="moonshot", source="kimi_usages_api",
-                freshness="unconfigured", now=now_val, detail="kimi-code.json credentials absent",
-            ),
-            None,
-        )
-    try:
-        cred = json.loads(cred_path.read_text(encoding="utf-8"))
-    except Exception:
-        return (
-            _unknown_pool_reading(
-                pool_id=pool_id, provider="moonshot", source="kimi_usages_api",
-                freshness="error", now=now_val, detail="cannot parse kimi-code.json",
-            ),
-            "auth",
-        )
-    tok = cred.get("access_token") if isinstance(cred, dict) else None
-    exp = parse_epoch(cred.get("expires_at")) if isinstance(cred, dict) else None
-    if not isinstance(tok, str) or not tok.strip():
-        return (
-            _unknown_pool_reading(
-                pool_id=pool_id, provider="moonshot", source="kimi_usages_api",
-                freshness="auth_locked", now=now_val, detail="missing Kimi access_token",
-            ),
-            "auth",
-        )
-    pool_id = f"kimi:{pseudonymize_account_id(tok[:24], 'kimi')}"
-    # Hard rule R2: NEVER refresh Kimi OAuth tokens (rotation invalidates CLI session)!
-    if exp is not None and now_val >= (exp - 30.0):
-        return (
-            _unknown_pool_reading(
-                pool_id=pool_id, provider="moonshot", source="kimi_usages_api",
-                freshness="auth_locked", now=now_val,
-                detail="Kimi access_token expired (read-only rule: never refresh CLI token)",
-            ),
-            "auth",
-        )
-
-    e = env if env is not None else os.environ
-    base_url = (e.get("KIMI_CODE_BASE_URL") or "https://api.kimi.com/coding/v1").rstrip("/")
-    req = urllib.request.Request(
-        f"{base_url}/usages",
-        headers={"Authorization": f"Bearer {tok.strip()}", "Accept": "application/json"},
-        method="GET",
+    return (
+        _unknown_pool_reading(
+            pool_id=pool_id,
+            provider="moonshot",
+            source="kimi_cli",
+            freshness="unconfigured",
+            now=now_val,
+            detail="Kimi CLI quota probing disabled under Catalog Rule 11 (never reads third-party login files)",
+        ),
+        None,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            raw = json.loads(resp.read().decode("utf-8", errors="replace"))
-        fetched_val = _now_ts(now)
-        return parse_kimi_usages(raw, fetched_at=fetched_val, now=fetched_val, pool_id=pool_id), None
-    except urllib.error.HTTPError as exc:
-        fkind = "auth" if exc.code in (401, 403) else "transport"
-        return (
-            _unknown_pool_reading(
-                pool_id=pool_id, provider="moonshot", source="kimi_usages_api",
-                freshness="auth_locked" if fkind == "auth" else "error",
-                now=now_val, detail=f"Kimi /usages HTTP {exc.code}",
-            ),
-            fkind,
-        )
-    except Exception as exc:
-        return (
-            _unknown_pool_reading(
-                pool_id=pool_id, provider="moonshot", source="kimi_usages_api",
-                freshness="error", now=now_val, detail=f"Kimi /usages error: {type(exc).__name__}",
-            ),
-            "transport",
-        )
+
+
+probe_kimi_usages = probe_kimi_usage
 
 
 # ---------------------------------------------------------------------------
@@ -2779,7 +2675,7 @@ GLOBAL_USAGE_CACHE = UsageCache()
 # ---------------------------------------------------------------------------
 
 def pool_kind_for_seat(seat_id: str, executor: Any = None, env: dict[str, str] | None = None) -> tuple[str, str]:
-    """Return ``(driver_kind, pool_id)`` for one configured seat."""
+    """Return ``(driver_kind, pool_id)`` for one configured seat using non-secret paths only."""
     cls_name = type(executor).__name__ if executor is not None else ""
     sid = str(seat_id or "")
 
@@ -2794,23 +2690,21 @@ def pool_kind_for_seat(seat_id: str, executor: Any = None, env: dict[str, str] |
     if cls_name == "AgyExecutor" or sid == "agy":
         return "agy", "agy:os-keyring"
     if cls_name == "ClaudeExecutor" or sid == "claude":
-        cdir = claude_config_dir(env)
+        cdir = claude_config_dir(env).expanduser()
         return "claude", f"claude:{pseudonymize_account_id(str(cdir), 'claude-home')}"
     if cls_name == "KimiExecutor" or sid == "kimi":
-        home = kimi_code_home(env)
+        home = kimi_code_home(env).expanduser()
         return "kimi", f"kimi:{pseudonymize_account_id(str(home), 'kimi-home')}"
     if cls_name == "OllamaQwenExecutor" or sid == "qwen-local":
         base = str(getattr(executor, "base_url", None) or "http://127.0.0.1:11434/v1")
         host = base.replace("/v1", "").replace("http://", "").replace("https://", "").rstrip("/")
         return "ollama", f"local:ollama:{host}"
-    if cls_name == "DeepSeekApiExecutor" or sid == "deepseek":
-        e = env if env is not None else os.environ
-        key = e.get("DEEPSEEK_API_KEY") or ""
-        return "deepseek_api", f"api:deepseek:{pseudonymize_account_id(key, 'deepseek')}"
+    if cls_name in ("DeepSeekExecutor", "DeepSeekApiExecutor") or sid == "deepseek":
+        uhome = _user_home(env).expanduser()
+        return "deepseek_api", f"api:deepseek:{pseudonymize_account_id(str(uhome), 'deepseek-home')}"
     if cls_name == "KimiApiExecutor" or sid == "kimi-api":
-        e = env if env is not None else os.environ
-        key = e.get("MOONSHOT_API_KEY") or ""
-        return "moonshot_api", f"api:moonshot:{pseudonymize_account_id(key, 'moonshot')}"
+        uhome = _user_home(env).expanduser()
+        return "moonshot_api", f"api:moonshot:{pseudonymize_account_id(str(uhome), 'moonshot-home')}"
     if cls_name == "LocalSolverExecutor" or sid.startswith("solver-"):
         return "local_solver", "local:solver"
     return "other", f"seat:{sid}"
@@ -2930,18 +2824,20 @@ def _probe_driver_pool(
 def _discover_host_cli_pools(env: dict[str, str] | None = None) -> list[tuple[str, str]]:
     """Return installed standalone CLI / local compute pools on this machine."""
     pools: list[tuple[str, str]] = []
-    if shutil.which("codex") or (codex_home(env) / "auth.json").is_file():
-        pools.append(("codex", _codex_pool_id_from_home(codex_home(env))))
-    if shutil.which("grok") or (grok_home(env) / "auth.json").is_file():
-        gpid, _ = _grok_pool_id_from_home(grok_home(env))
+    chome = codex_home(env)
+    if shutil.which("codex") or chome.is_dir():
+        pools.append(("codex", _codex_pool_id_from_home(chome)))
+    ghome = grok_home(env)
+    if shutil.which("grok") or ghome.is_dir():
+        gpid, _ = _grok_pool_id_from_home(ghome)
         pools.append(("grok", gpid))
     if shutil.which("agy"):
         pools.append(("agy", "agy:os-keyring"))
-    if shutil.which("claude") or (claude_config_dir(env) / ".credentials.json").is_file():
-        cdir = claude_config_dir(env)
+    cdir = claude_config_dir(env).expanduser()
+    if shutil.which("claude") or cdir.is_dir():
         pools.append(("claude", f"claude:{pseudonymize_account_id(str(cdir), 'claude-home')}"))
-    if shutil.which("kimi") or (kimi_code_home(env) / "credentials" / "kimi-code.json").is_file():
-        khome = kimi_code_home(env)
+    khome = kimi_code_home(env).expanduser()
+    if shutil.which("kimi") or khome.is_dir():
         pools.append(("kimi", f"kimi:{pseudonymize_account_id(str(khome), 'kimi-home')}"))
     if shutil.which("ollama"):
         pools.append(("ollama", "local:ollama:127.0.0.1:11434"))

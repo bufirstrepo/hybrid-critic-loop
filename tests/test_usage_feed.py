@@ -59,6 +59,29 @@ class TestStaticSafetyAndPaths(unittest.TestCase):
                     hits.append(str(path.relative_to(REPO_ROOT)))
         self.assertEqual(hits, [], f"Forbidden Codex consume RPC string found in: {hits}")
 
+    def test_catalog_rule11_never_references_third_party_login_files(self) -> None:
+        forbidden_tokens = (
+            "auth.json",
+            ".credentials.json",
+            "kimi-code.json",
+            "decode_jwt_claims_unverified",
+        )
+        scan_roots = [
+            REPO_ROOT / "hybrid_critic_loop",
+            REPO_ROOT / "dashboard",
+            REPO_ROOT / "desktop",
+        ]
+        hits: list[str] = []
+        for root in scan_roots:
+            for path in root.rglob("*"):
+                if not path.is_file() or path.suffix not in (".py", ".js"):
+                    continue
+                text = path.read_text(encoding="utf-8")
+                for tok in forbidden_tokens:
+                    if tok in text:
+                        hits.append(f"{path.relative_to(REPO_ROOT)}:{tok}")
+        self.assertEqual(hits, [], f"Catalog Rule 11 forbidden credential-file reference found: {hits}")
+
     def test_pseudonymize_account_id_never_leaks_raw_secret(self) -> None:
         raw_email = "owner@example.com"
         raw_uuid = "9a12b34c-5678-49de-a012-bcdef0123456"
@@ -492,9 +515,25 @@ class TestPolarityTripwiresAndParsers(unittest.TestCase):
         self.assertEqual(c_live["reset_credits"]["available_count"], 1)
         self.assertEqual(c_live["reset_credits"]["consume_policy"], "human_only")
 
-        # 2. Grok 1.0.77 issuer-keyed `~/.grok/auth.json`
+        # 2. Catalog Rule 11: Codex, Grok, Kimi, and API pool IDs derive purely from non-secret paths
+        #    and NEVER open third-party login files or send Kimi bearer-token HTTP requests.
         with tempfile.TemporaryDirectory() as td:
-            gh = Path(td)
+            root = Path(td)
+            ch = root / "codex-home"
+            gh = root / "grok-home"
+            kh = root / "kimi-home"
+            (ch).mkdir()
+            (gh).mkdir()
+            (kh / "credentials").mkdir(parents=True)
+
+            # Plant canary login files; pool IDs must match before and after and never leak canary text
+            c_before = uf._codex_pool_id_from_home(ch)
+            g_before, g_exists = uf._grok_pool_id_from_home(gh)
+            self.assertTrue(g_exists)
+            self.assertRegex(c_before, r"^codex:acct-[0-9a-f]{8}$")
+            self.assertRegex(g_before, r"^grok:acct-[0-9a-f]{8}$")
+
+            (ch / "auth.json").write_text('{"account_id":"canary-codex-secret"}', encoding="utf-8")
             (gh / "auth.json").write_text(
                 json.dumps({
                     "https://auth.x.ai::client-id": {
@@ -505,10 +544,30 @@ class TestPolarityTripwiresAndParsers(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
-            g_pid, usable = uf._grok_pool_id_from_home(gh)
-            self.assertTrue(usable)
-            self.assertRegex(g_pid, r"^grok:acct-[0-9a-f]{8}$")
-            self.assertNotIn("user-uuid", g_pid)
+            (kh / "credentials" / "kimi-code.json").write_text(
+                json.dumps({"access_token": "kimi-secret-bearer", "expires_at": int(BASE_NOW + 3600)}),
+                encoding="utf-8",
+            )
+            self.assertEqual(uf._codex_pool_id_from_home(ch), c_before)
+            self.assertEqual(uf._grok_pool_id_from_home(gh), (g_before, True))
+
+            with mock.patch(
+                "urllib.request.urlopen",
+                side_effect=AssertionError("Catalog Rule 11 violation: unexpected Kimi HTTP call"),
+            ):
+                k_reading, k_fkind = uf.probe_kimi_usage(env={"KIMI_CODE_HOME": str(kh)}, now=BASE_NOW)
+                k_alias, _ = uf.probe_kimi_usages(env={"KIMI_CODE_HOME": str(kh)}, now=BASE_NOW)
+            self.assertIsNone(k_fkind)
+            self.assertEqual(k_reading["status"], "unknown")
+            self.assertIsNone(k_reading["fraction_left"])
+            self.assertRegex(k_reading["pool_id"], r"^kimi:acct-[0-9a-f]{8}$")
+            self.assertEqual(k_alias["pool_id"], k_reading["pool_id"])
+
+            # API seat pool IDs derive from non-secret home paths, not secret env values
+            _, ds_p1 = uf.pool_kind_for_seat("deepseek", env={"HOME": str(root), "DEEPSEEK_API_KEY": "k1"})
+            _, ds_p2 = uf.pool_kind_for_seat("deepseek", env={"HOME": str(root), "DEEPSEEK_API_KEY": "k2"})
+            self.assertEqual(ds_p1, ds_p2)
+            self.assertRegex(ds_p1, r"^api:deepseek:acct-[0-9a-f]{8}$")
 
         # 3. `_run_jsonrpc_stdio` keeps stdin open until `id=2` arrives (no premature EOF exit!)
         fake_server = (
