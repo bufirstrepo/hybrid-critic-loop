@@ -5,12 +5,12 @@
 # the PR (the catalog pins content by SHA; see SUBMISSION.md step 1).
 name: the-millionaire-matrix
 version: "0.4.0"
-repo: https://github.com/dynoshippedit/hybrid-critic-loop
+repo: https://github.com/bufirstrepo/hybrid-critic-loop
 sha: "REPLACE-WITH-FULL-40-CHAR-COMMIT-SHA"
 description: "Every model family you have a seat for generates a candidate; all of them blind-score each other on a peer validity matrix anchored by real tests (hard and measured gates outrank the matrix), the field steps down round by round to one answer behind a human gate, and verified lessons carry into your next session."
 category: tools
 tier: community
-maintainer: dynoshippedit
+maintainer: bufirstrepo
 requires_hermes: ">=0.21.0"
 capabilities:
   provides_tools:

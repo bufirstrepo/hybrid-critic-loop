@@ -15,12 +15,12 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
   - `tools/check_repo_hygiene.py` — **PASSED** (zero untracked files, zero tracked runtime artifacts).
 - **Pending owner actions before opening the PR:**
   1. Run your own manual interactive smoke test from a fresh Hermes chat/Desktop window (the recorded `url_slug.py` live 8-family proof run below executed through an automated Python harness over `plugin.register(ctx)`, not a manual interactive window).
-  2. Push the final release branch to `github.com/dynoshippedit/hybrid-critic-loop` and copy the exact 40-character release commit SHA into `the-millionaire-matrix.yaml` (`sha:` is intentionally still `"REPLACE-WITH-FULL-40-CHAR-COMMIT-SHA"` until that push exists).
+  2. Push the final release branch to `github.com/bufirstrepo/hybrid-critic-loop` and copy the exact 40-character release commit SHA into `the-millionaire-matrix.yaml` (`sha:` is intentionally still `"REPLACE-WITH-FULL-40-CHAR-COMMIT-SHA"` until that push exists).
 
 ## Step 0 — before anything (owner)
 
 - [ ] Run a quick interactive smoke check from a fresh Hermes session (`/mm panel`, `/mm usage`, and an `improve` or `fix` run with the Desktop pane open).
-- [ ] Create/push the public repository `github.com/dynoshippedit/hybrid-critic-loop` from `feat/live-8x1-and-ui` (developed locally; nothing has been pushed anywhere yet). The repository name may stay `hybrid-critic-loop` — the Python package/import name is unchanged; the product's display name is The Millionaire Matrix.
+- [ ] Create/push the public repository `github.com/bufirstrepo/hybrid-critic-loop` from `feat/live-8x1-and-ui` (developed locally; nothing has been pushed anywhere yet). The repository name may stay `hybrid-critic-loop` — the Python package/import name is unchanged; the product's display name is The Millionaire Matrix.
 - [ ] Note the full 40-character SHA of the pushed release commit. The release this checklist ships is v0.4 (`0.4.0`).
 
 ## Step 1 — Catalog PR to NousResearch/hermes-agent
