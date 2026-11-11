@@ -136,7 +136,7 @@ class _FakePluginLlm:
 
     def complete(self, messages, *, system=None, task=None, max_tokens=2000, temperature=None, timeout=120.0, **kw):
         model = self.task_models[task]
-        self.calls.append({"task": task, "model": model})
+        self.calls.append({"task": task, "model": model, "timeout": timeout, "purpose": kw.get("purpose")})
         user_text = messages[-1]["content"]
         if "RUBRIC:" in user_text:
             verdict_obj = _score_matrix_packet(user_text, r"# slot_bonus=(\d+)", None, model)
@@ -397,6 +397,15 @@ class TestHermesAuxExecutor(unittest.TestCase):
             self.assertEqual(res["status"], "awaiting_human_gate")
             verdict = store.latest_verdict("ctr_hermes_8x1")
             self.assertEqual(verdict["judged"]["panel_status"], "full")
+
+            for slot_cfg in ctx.aux_tasks.values():
+                self.assertEqual(slot_cfg["defaults"]["timeout"], 180)
+            gen_calls = [c for c in fake_llm.calls if str(c.get("purpose") or "").startswith("mm.generate.")]
+            judge_calls = [c for c in fake_llm.calls if str(c.get("purpose") or "").startswith("mm.judge.")]
+            self.assertEqual(len(gen_calls), 8)
+            self.assertTrue(all(c["timeout"] == 180 for c in gen_calls))
+            self.assertGreater(len(judge_calls), 0)
+            self.assertTrue(all(c["timeout"] == 90 for c in judge_calls))
 
             # Verify runtime family-collapse refusal when a slot resolves to wrong family
             bad_llm = _FakePluginLlm({"mm_xai": "openai/gpt-5.4-mini"})

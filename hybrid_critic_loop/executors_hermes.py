@@ -211,7 +211,7 @@ class HermesAuxExecutor(Executor):
                 ],
                 task=self.task_key,
                 max_tokens=4096,
-                timeout=90,
+                timeout=180,
                 purpose=f"mm.generate.{self.family}",
             )
             duration_ms = int((time.monotonic() - start) * 1000)

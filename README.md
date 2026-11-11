@@ -210,6 +210,7 @@ Executed via automated harness driving `plugin.register(ctx)` against live Nous 
 - **Step-down bracket:** `Round 1 (5 → 3)` → `Round 2 (3 → 2)` → `Round 3 (2 → 1)` (`panel_status: full`, **0 self-scores** across every matrix cell).
 - **Human gate & signed stamp:** `critic_gate(..., decision="approved")` merged `mm-anthropic` and issued:
   `MM CERTIFIED · 24,222 TOKENS SPENT · ONE ANSWER`.
+- **Post-proof generation timeout alignment:** In the `url_slug.py` run above, `HermesAuxExecutor.generate` capped generation at `90s` (`mm-alibaba` and `mm-zai` timed out generating full files while succeeding on every `90s` peer-judge call); `HermesAuxExecutor.generate` now uses `timeout=180` matching the `180s` slot default registered in `register_auxiliary_tasks`.
 
 ### 2. Deterministic offline demo (`demo/run_demo.py`)
 

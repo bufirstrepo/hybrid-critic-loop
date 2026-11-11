@@ -6,9 +6,9 @@ An entry is THREE steps. A pull request plus a video alone is **not** an entry �
 
 ## Current local build state (pre-push)
 
-- **Branch & commits:** `feat/live-8x1-and-ui` (5 commits ahead of `master` at `1483c10` and `63` commits after the earlier validated v0.3 tree `3923dad`). **Nothing has been pushed to GitHub yet.**
+- **Branch & commits:** `feat/live-8x1-and-ui` (6 commits ahead of `master` at `1483c10` and `64` commits after the earlier validated v0.3 tree `3923dad`). **Nothing has been pushed to GitHub yet.**
 - **Release version:** `v0.4` (`0.4.0` across `pyproject.toml`, `plugin.yaml`, and `the-millionaire-matrix.yaml`).
-- **Automated verification (`2026-11-10`):**
+- **Automated verification (`2026-11-11`):**
   - `868/868` unit tests passing (`skipped=1`) under both Python `3.14.7` and the Hermes venv Python `3.11.15`.
   - `hermes plugins validate` — **PASSED** (`16/16` checks green, `0` errors, `0` warnings, security scan safe, desktop surface inside SDK bounds).
   - `hermes plugins doctor` — **PASSED** (`manifest: the-millionaire-matrix 0.4.0 (standalone)`, `registrations: 5 tool(s), 2 hook(s)`).

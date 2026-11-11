@@ -140,7 +140,8 @@ Millionaire Matrix."
   `plugin.register(ctx)` on Nous Portal):** Shorthand `mode="improve"` run on
   isolated git repo (`url_slug.py` + `test_url_slug.py`). All 8 `mm-*` seats
   dispatched; 5 passed `unittest`, `mm-moonshot` failed the hard gate, and
-  `mm-alibaba` / `mm-zai` timed out on 90s generation but served as active peer
+  `mm-alibaba` / `mm-zai` timed out on the then-`90s` generation cap (`HermesAuxExecutor.generate`
+  now uses `timeout=180` matching the `180s` slot default) while serving as active peer
   judges across all 3 rounds. Bracket stepped `5 → 3 → 2 → 1` (`0`
   self-scores); `mm-anthropic` (`nous:anthropic/claude-sonnet-5`) won with
   validity median `9.75` over `mm-deepseek` (`9.50`); gate approval minted
@@ -215,6 +216,6 @@ authors you trust to run code as you**, in disposable repositories.
 - **Not built:** Animated storefront UI, headless `agy` generate/judge adapter,
   hosted public certificate verification, SQL-pushed lesson ranking (`Named
   residual — lesson lookup cost` in `README.md` §7).
-- **Tree anchor:** Describes `v0.4.0` on branch `feat/live-8x1-and-ui` (5
+- **Tree anchor:** Describes `v0.4.0` on branch `feat/live-8x1-and-ui` (6
   commits ahead of `master` pin `1483c10`; unpushed; catalog `sha:` placeholder
   pending push).
