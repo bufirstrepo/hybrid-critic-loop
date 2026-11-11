@@ -953,6 +953,7 @@ class _Run:
         # H3): the only source of validity points.
         self.matrix_validity: dict[str, float] = {}
         self.progress: progress_mod.RunProgressTracker | None = None
+        self._preflight_skips: dict[str, str] = {}
 
     # -- events ---------------------------------------------------------
     def _emit(self, type_: str, detail: str):
@@ -1087,7 +1088,10 @@ class _Run:
         # spec G9; round-4 contest-core F4): an unavailable seat gets a
         # candidate row and a ledger row, never a checkout it will not
         # use (before, it leaked one worktree per seat per attempt).
-        ok, why = executor.available()
+        if expert_id in self._preflight_skips:
+            ok, why = False, self._preflight_skips[expert_id]
+        else:
+            ok, why = executor.available()
         if ok:
             wt = self.mgr.create(self.contract_id, slot_name)
         else:
@@ -1487,6 +1491,23 @@ class _Run:
             last_gate_details["measurements"] = []
             last_gate_details["judged"] = None
 
+            # Optional pool-deduped usage pre-flight when contract requests min_usage_fraction.
+            min_uf = self.contract.get("min_usage_fraction")
+            if min_uf is not None:
+                try:
+                    from . import usage_feed as usage_feed_mod
+
+                    self._preflight_skips = usage_feed_mod.evaluate_panel_preflight(
+                        self.executors,
+                        contestants,
+                        float(min_uf),
+                        data_dir=progress_mod.store_data_dir(store),
+                    )
+                except Exception:  # noqa: BLE001 - pre-flight inspection must never crash a run
+                    self._preflight_skips = {}
+            else:
+                self._preflight_skips = {}
+
             # Generation wave: identical inputs, isolated worktrees.
             context = self._context_for(retry_notes)
             wave = self._dispatch_wave(contestants, attempt, context)
@@ -1839,6 +1860,11 @@ class _Run:
                 calibrations=calibrations,
                 seed=attempt,
                 round_no=round_no,
+                on_judge_start=(
+                    (lambda jid, r=round_no: self.progress.matrix_judge_started(r, jid))
+                    if self.progress is not None
+                    else None
+                ),
                 on_judge_done=(
                     (lambda jid, r=round_no: self.progress.matrix_judge_done(r, jid))
                     if self.progress is not None
@@ -2085,6 +2111,9 @@ class _Run:
                 continue
             if not _can_judge(ex):
                 skipped.append((pid, "cannot judge"))
+                continue
+            if pid in self._preflight_skips:
+                skipped.append((pid, f"unavailable: {self._preflight_skips[pid]}"))
                 continue
             try:
                 ok, why = ex.available()

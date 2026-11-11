@@ -99,12 +99,29 @@ function StatusChip({ ctx }) {
   })
 }
 
+function formatUsageTag(usage) {
+  if (!usage) return null
+  if (typeof usage.fraction_left === 'number') {
+    return `${Math.round(usage.fraction_left * 100)}% left`
+  }
+  if (typeof usage.money_left === 'number') {
+    return `${usage.money_left.toFixed(2)} ${usage.currency || 'USD'}`
+  }
+  if (usage.meter_kind === 'unmetered_local' && usage.status === 'ok') {
+    return 'local'
+  }
+  return null
+}
+
 function SeatRow({ seat }) {
   const status = String(seat.status || (seat.ready ? 'ready' : 'unavailable'))
+  const prompting = Boolean(seat.being_prompted)
+  const activity = seat.activity
   const eliminated = seat.eliminated_at
   const score = seat.score
+  const usageTag = formatUsageTag(seat.usage)
   let tone = 'muted'
-  if (status === 'running' || status === 'completed' || status === 'ready') {
+  if (prompting || status === 'running' || status === 'completed' || status === 'ready') {
     tone = eliminated ? 'warn' : 'good'
   } else if (status === 'error' || status === 'timeout' || status === 'refused') {
     tone = 'bad'
@@ -117,7 +134,7 @@ function SeatRow({ seat }) {
       jsxs('div', {
         className: 'flex min-w-0 items-center gap-2',
         children: [
-          status === 'running'
+          prompting || status === 'running'
             ? jsx(GlyphSpinner, { className: 'size-3 shrink-0 text-(--ui-accent)' })
             : jsx(StatusDot, { tone, className: 'shrink-0' }),
           jsxs('div', {
@@ -148,14 +165,86 @@ function SeatRow({ seat }) {
       jsxs('div', {
         className: 'flex shrink-0 items-center gap-1.5 font-mono text-[0.68rem]',
         children: [
+          usageTag
+            ? jsx('span', {
+                className: 'text-(--ui-text-tertiary)',
+                children: usageTag
+              })
+            : null,
           score !== null && score !== undefined
             ? jsx(Badge, { variant: 'outline', children: `${Number(score).toFixed(1)}` })
             : null,
           jsx('span', {
-            className: 'text-(--ui-text-secondary)',
-            children: eliminated ? `out:${eliminated}` : status
+            className: prompting ? 'text-(--ui-accent)' : 'text-(--ui-text-secondary)',
+            children: prompting
+              ? activity || 'prompting'
+              : eliminated
+                ? `out:${eliminated}`
+                : status
           })
         ]
+      })
+    ]
+  })
+}
+
+function UsagePoolsCard({ usage }) {
+  const pools = Object.values(usage?.pools || {})
+  if (pools.length === 0) return null
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-1.5 rounded border border-(--ui-stroke-secondary) p-2.5 text-xs',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center justify-between',
+        children: [
+          jsx('span', {
+            className: 'font-medium text-(--ui-text-secondary)',
+            children: 'Plan-Usage Pools'
+          }),
+          jsx('span', {
+            className: 'font-mono text-[0.65rem] text-(--ui-text-tertiary)',
+            children: `${usage?.summary?.pools_known ?? 0}/${pools.length} metered`
+          })
+        ]
+      }),
+      jsx('div', {
+        className: 'flex flex-col gap-1',
+        children: pools.map(pool => {
+          const tag = formatUsageTag(pool) || `unknown (${pool.freshness || 'missing'})`
+          const tone =
+            pool.status === 'exhausted' ? 'bad' : pool.status === 'ok' ? 'good' : 'muted'
+          return jsxs(
+            'div',
+            {
+              className:
+                'flex items-center justify-between gap-2 rounded border border-(--ui-stroke-secondary) px-2 py-1 font-mono text-[0.66rem]',
+              children: [
+                jsxs('div', {
+                  className: 'flex min-w-0 items-center gap-1.5 truncate',
+                  children: [
+                    jsx(StatusDot, { tone, className: 'shrink-0' }),
+                    jsx('span', {
+                      className: 'truncate text-(--ui-text-primary)',
+                      children: pool.pool_id
+                    }),
+                    pool.plan
+                      ? jsx('span', {
+                          className: 'text-(--ui-text-tertiary)',
+                          children: `[${pool.plan}]`
+                        })
+                      : null
+                  ]
+                }),
+                jsx('span', {
+                  className: 'shrink-0 text-(--ui-text-secondary)',
+                  children: tag
+                })
+              ]
+            },
+            pool.pool_id
+          )
+        })
       })
     ]
   })
@@ -256,6 +345,7 @@ function MatrixPane({ ctx }) {
   const onRefresh = async () => {
     setRefreshing(true)
     try {
+      await ctx.rest('/usage?refresh=true')
       await ctx.rest('/status?refresh_panel=true')
       await refetch()
     } catch {
@@ -385,6 +475,8 @@ function MatrixPane({ ctx }) {
                 })
           ]
         }),
+
+        jsx(UsagePoolsCard, { usage: data?.usage }),
 
         jsx(MatrixCard, { matrix: data?.latest_matrix }),
 

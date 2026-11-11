@@ -91,6 +91,18 @@ def read_run_status(data_dir: Path | None) -> dict:
                             obj = dict(obj)
                             obj["active"] = False
                             obj["phase"] = "interrupted"
+                            obj["active_seat_ids"] = []
+                            raw_seats = obj.get("seats")
+                            if isinstance(raw_seats, dict):
+                                cleaned_seats = {}
+                                for sid, sinfo in raw_seats.items():
+                                    if isinstance(sinfo, dict):
+                                        scopy = dict(sinfo)
+                                        scopy["being_prompted"] = False
+                                        cleaned_seats[sid] = scopy
+                                    else:
+                                        cleaned_seats[sid] = sinfo
+                                obj["seats"] = cleaned_seats
                             obj["message"] = (
                                 f"Previous run (pid {pid}) exited unexpectedly during "
                                 f"{obj.get('phase', 'execution')}."
@@ -105,6 +117,14 @@ def read_run_status(data_dir: Path | None) -> dict:
         "mode": None,
         "message": "Idle — no Millionaire Matrix run in progress.",
         "seats": {},
+        "active_seat_ids": [],
+        "agent_cursor": {
+            "seat_id": None,
+            "action": "idle",
+            "round": 0,
+            "seq": 0,
+            "updated_at": None,
+        },
         "bracket": {"rounds": [], "ladder": []},
         "updated_at": None,
     }
@@ -138,13 +158,46 @@ class RunProgressTracker:
         self.phase = "starting"
         self.active = True
         self.message = f"Starting Millionaire Matrix ({self.mode} mode) for {self.contract_id}"
+        self._cursor_seq = 0
+        self.agent_cursor: dict = {
+            "seat_id": None,
+            "action": "starting",
+            "round": 0,
+            "seq": 0,
+            "updated_at": self.started_at,
+        }
+        passive_feed: dict = {}
+        try:
+            from .usage_feed import collect_usage_feed, pool_kind_for_seat
+
+            subset_execs = {eid: executors[eid] for eid in contestants if eid in executors}
+            passive_feed = collect_usage_feed(
+                subset_execs, data_dir=self.data_dir, refresh=False, include_cli_pools=True
+            )
+        except Exception:
+            pool_kind_for_seat = None  # type: ignore[assignment]
+            passive_feed = {}
+
+        self.usage_pools: dict = dict((passive_feed.get("pools") or {}) if isinstance(passive_feed, dict) else {})
+        seat_usage_map = (passive_feed.get("seats") or {}) if isinstance(passive_feed, dict) else {}
+
         self.seats: dict[str, dict] = {}
         for eid in contestants:
             ex = executors.get(eid)
+            pool_id = None
+            if callable(pool_kind_for_seat):
+                try:
+                    _, pool_id = pool_kind_for_seat(eid, ex)
+                except Exception:
+                    pool_id = None
             self.seats[eid] = {
                 "expert_id": eid,
                 "family": getattr(ex, "family", None),
                 "status": "pending",
+                "activity": "idle",
+                "being_prompted": False,
+                "pool_id": pool_id,
+                "usage": seat_usage_map.get(eid),
                 "model": getattr(ex, "default_model", None) or eid,
                 "duration_ms": None,
                 "eliminated_at": None,
@@ -165,12 +218,25 @@ class RunProgressTracker:
         self.winner: dict | None = None
         self.certificate_stamp: str | None = None
 
+    def _advance_cursor_unlocked(self, seat_id: str | None, action: str, round_no: int = 0) -> None:
+        self._cursor_seq += 1
+        self.agent_cursor = {
+            "seat_id": seat_id,
+            "action": action,
+            "round": int(round_no),
+            "seq": self._cursor_seq,
+            "updated_at": _utc_iso(),
+        }
+
     def _snapshot_unlocked(self) -> dict:
         elapsed = round(max(0.0, time.monotonic() - self._start_mono), 1)
         counts: dict[str, int] = {}
-        for info in self.seats.values():
+        active_seat_ids: list[str] = []
+        for eid, info in self.seats.items():
             st = info.get("status") or "pending"
             counts[st] = counts.get(st, 0) + 1
+            if info.get("being_prompted"):
+                active_seat_ids.append(eid)
         return {
             "active": self.active,
             "pid": os.getpid(),
@@ -186,7 +252,10 @@ class RunProgressTracker:
             "elapsed_s": elapsed,
             "seat_counts": counts,
             "seats_total": len(self.seats),
+            "active_seat_ids": active_seat_ids,
+            "agent_cursor": dict(self.agent_cursor),
             "seats": {k: dict(v) for k, v in self.seats.items()},
+            "usage_pools": {k: dict(v) for k, v in self.usage_pools.items()},
             "matrix_progress": dict(self.matrix_progress),
             "bracket": {
                 "current_round": self.bracket["current_round"],
@@ -213,6 +282,9 @@ class RunProgressTracker:
             self.attempt = attempt
             if expert_id in self.seats:
                 self.seats[expert_id]["status"] = "running"
+                self.seats[expert_id]["activity"] = "generating"
+                self.seats[expert_id]["being_prompted"] = True
+            self._advance_cursor_unlocked(expert_id, "generating", 0)
             running = [k for k, v in self.seats.items() if v["status"] == "running"]
             done = sum(
                 1 for v in self.seats.values()
@@ -230,6 +302,8 @@ class RunProgressTracker:
         with self._lock:
             entry = self.seats.setdefault(expert_id, {"expert_id": expert_id})
             entry["status"] = status
+            entry["being_prompted"] = False
+            entry["activity"] = "done" if status == "completed" else status
             entry["duration_ms"] = duration_ms
             if model:
                 entry["model"] = model
@@ -250,6 +324,9 @@ class RunProgressTracker:
         with self._lock:
             if expert_id in self.seats:
                 self.seats[expert_id]["eliminated_at"] = eliminated_at
+                self.seats[expert_id]["being_prompted"] = False
+                self.seats[expert_id]["activity"] = "eliminated" if eliminated_at else "survived_gates"
+            self._advance_cursor_unlocked(expert_id, "evaluating_gates", 0)
             self.phase = "gates"
             survivors = sum(
                 1 for v in self.seats.values()
@@ -277,8 +354,30 @@ class RunProgressTracker:
             snap = self._snapshot_unlocked()
         write_run_status(self.data_dir, snap)
 
+    def matrix_judge_started(self, round_no: int, judge_id: str) -> None:
+        with self._lock:
+            entry = self.seats.setdefault(judge_id, {"expert_id": judge_id})
+            entry["being_prompted"] = True
+            entry["activity"] = "judging"
+            self._advance_cursor_unlocked(judge_id, "judging", round_no)
+            active_judges = [k for k, v in self.seats.items() if v.get("being_prompted")]
+            done = self.matrix_progress.get("judges_done", 0)
+            total = self.matrix_progress.get("judges_total", 0)
+            self.phase = "matrix"
+            self.message = (
+                f"Round {round_no} peer matrix: {done}/{total} judges scored "
+                f"(prompting: {', '.join(active_judges) or judge_id})"
+            )
+            snap = self._snapshot_unlocked()
+        write_run_status(self.data_dir, snap)
+
     def matrix_judge_done(self, round_no: int, judge_id: str) -> None:
         with self._lock:
+            if judge_id in self.seats:
+                self.seats[judge_id]["being_prompted"] = False
+                self.seats[judge_id]["activity"] = (
+                    "eliminated" if self.seats[judge_id].get("eliminated_at") else "done"
+                )
             if self.matrix_progress.get("round") == round_no:
                 self.matrix_progress["judges_done"] = int(self.matrix_progress.get("judges_done", 0)) + 1
             done = self.matrix_progress.get("judges_done", 0)
@@ -307,8 +406,10 @@ class RunProgressTracker:
                 if eid in self.seats and sc is not None:
                     self.seats[eid]["score"] = round(float(sc), 2)
             for eid in cut_experts:
-                if eid in self.seats and self.seats[eid].get("eliminated_at") is None:
-                    self.seats[eid]["eliminated_at"] = f"bracket_r{round_no}"
+                if eid in self.seats:
+                    if self.seats[eid].get("eliminated_at") is None:
+                        self.seats[eid]["eliminated_at"] = f"bracket_r{round_no}"
+                    self.seats[eid]["activity"] = "eliminated"
             ladder_str = " → ".join(str(n) for n in self.bracket["ladder"])
             self.message = f"Bracket round {round_no}: {field_in} → {field_out} (ladder: {ladder_str})"
             snap = self._snapshot_unlocked()
@@ -319,6 +420,13 @@ class RunProgressTracker:
             self.active = False
             self.phase = phase
             self.message = message
+            for sinfo in self.seats.values():
+                sinfo["being_prompted"] = False
+            self._advance_cursor_unlocked(
+                winner_expert,
+                "winner" if winner_expert else "idle",
+                int(self.bracket.get("current_round") or 0),
+            )
             if winner_expert:
                 self.winner = {"expert_id": winner_expert, "family": winner_family}
             if certificate_stamp:
@@ -340,6 +448,9 @@ def format_status_report(data_dir: Path | None, panel_executors: dict | None = N
         lines.append(f"  Contract: {st['contract_id']} ({mode} mode){el_str}")
     if st.get("message"):
         lines.append(f"  Detail:   {st['message']}")
+    active_ids = st.get("active_seat_ids") or []
+    if active_ids:
+        lines.append(f"  Active:   {', '.join(str(x) for x in active_ids)}")
     ladder = (st.get("bracket") or {}).get("ladder") or []
     if ladder:
         lines.append(f"  Bracket:  {' -> '.join(str(x) for x in ladder)}")
@@ -358,6 +469,8 @@ def format_status_report(data_dir: Path | None, panel_executors: dict | None = N
             score = info.get("score")
             model = info.get("model")
             extra = []
+            if info.get("being_prompted"):
+                extra.append(f"prompting:{info.get('activity') or 'active'}")
             if model and model != eid:
                 extra.append(str(model))
             if score is not None:

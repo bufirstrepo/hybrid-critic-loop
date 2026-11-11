@@ -327,6 +327,20 @@ def validate_contract(raw: dict) -> dict:
         raise ContractError("bracket.cut_per_round must be an integer >= 1")
     bracket = {"cut_mode": cut_mode, "cut_per_round": cut_per_round}
 
+    min_usage_fraction = None
+    if "min_usage_fraction" in raw and raw.get("min_usage_fraction") is not None:
+        raw_muf = raw["min_usage_fraction"]
+        if isinstance(raw_muf, bool) or not isinstance(raw_muf, (int, float)):
+            raise ContractError(
+                f"contract.min_usage_fraction must be a number in [0.0, 1.0], got {raw_muf!r}"
+            )
+        muf_val = float(raw_muf)
+        if not math.isfinite(muf_val) or muf_val < 0.0 or muf_val > 1.0:
+            raise ContractError(
+                f"contract.min_usage_fraction must be in [0.0, 1.0], got {raw_muf!r}"
+            )
+        min_usage_fraction = muf_val
+
     return {
         "id": contract_id,
         "target_id": raw.get("target_id"),
@@ -345,6 +359,7 @@ def validate_contract(raw: dict) -> dict:
         "constraints": list(raw.get("constraints", [])),
         "budget": raw.get("budget"),
         "bracket": bracket,
+        "min_usage_fraction": min_usage_fraction,
     }
 
 

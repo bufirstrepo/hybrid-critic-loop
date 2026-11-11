@@ -338,6 +338,8 @@ def _build_shorthand_contract(args: dict) -> dict:
         raw["target_file"] = args["target_file"]
     if args.get("target_files"):
         raw["target_files"] = list(args["target_files"])
+    if args.get("min_usage_fraction") is not None:
+        raw["min_usage_fraction"] = args["min_usage_fraction"]
     return raw
 
 
@@ -470,6 +472,10 @@ _CRITIC_RUN_SCHEMA = {
         "spread_threshold": {
             "type": "number",
             "description": "Maximum inner peer-mean spread before escalating for panel split (shorthand default 3.5).",
+        },
+        "min_usage_fraction": {
+            "type": "number",
+            "description": "Optional minimum verified quota fraction left [0.0..1.0] required per pool before fielding a seat.",
         },
         "contract_id": {
             "type": "string",
@@ -666,6 +672,15 @@ def register(ctx):
             "report": ledger_report(store),
             "active_run": read_run_status(data_dir),
         }
+        try:
+            from .usage_feed import collect_usage_feed
+
+            exec_map = _build_executors("live", ctx=ctx)
+            payload["usage"] = collect_usage_feed(
+                exec_map, data_dir=data_dir, refresh=False, include_cli_pools=True
+            )
+        except Exception:
+            payload["usage"] = None
         # Events surface (owner review item 8): present only when the
         # store records events (events_for lands in a sibling
         # workstream); guarded so older stores keep the old shape.
@@ -735,6 +750,7 @@ def register(ctx):
                 "  critic run <contract.json> [repo_path]\n"
                 "  critic status\n"
                 "  critic panel\n"
+                "  critic usage\n"
                 "  critic gate <contract_id> approve|reject|waive [reason]\n"
                 "  critic lessons [domain]\n"
                 "  critic ledger\n"
@@ -749,6 +765,17 @@ def register(ctx):
             except Exception:
                 panel_execs = None
             return format_status_report(data_dir, panel_executors=panel_execs)
+        if sub == "usage":
+            try:
+                from .usage_feed import collect_usage_feed, format_usage_report
+
+                panel_execs = _build_executors("live", ctx=ctx)
+                feed = collect_usage_feed(
+                    panel_execs, data_dir=data_dir, refresh=True, include_cli_pools=True
+                )
+                return format_usage_report(feed)
+            except Exception as exc:
+                return f"usage unavailable: {exc}"
         if sub == "run":
             if len(parts) < 2:
                 return "usage: critic run <contract.json> [repo_path]"
@@ -799,7 +826,7 @@ def register(ctx):
             except ImportError:
                 return "standing unavailable (the standing module failed to load)"
             return standing_report(store)
-        return f"unknown critic subcommand: {sub} (try: run, status, panel, gate, lessons, ledger, standing)"
+        return f"unknown critic subcommand: {sub} (try: run, status, panel, usage, gate, lessons, ledger, standing)"
 
     ctx.register_command(
         "critic",

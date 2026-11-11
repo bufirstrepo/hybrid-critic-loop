@@ -330,6 +330,37 @@ def _cmd_panel(executors_spec, data_dir) -> int:
     return 0
 
 
+def _cmd_usage(executors_spec, as_json, passive, data_dir) -> int:
+    from .plugin import _build_executors
+    from .usage_feed import collect_usage_feed, format_usage_report
+
+    execs = _build_executors(executors_spec or "live")
+    feed = collect_usage_feed(
+        execs,
+        data_dir=data_dir,
+        refresh=not bool(passive),
+        include_cli_pools=True,
+    )
+    if as_json:
+        print(json.dumps(feed, indent=2, default=str))
+    else:
+        print(format_usage_report(feed))
+    return 0
+
+
+def _cmd_claude_statusline_tee(chain_cmd, data_dir) -> int:
+    from .usage_feed import CLAUDE_STATUSLINE_FILENAME, write_claude_statusline_tee
+
+    stdin_text = sys.stdin.read() if sys.stdin is not None else ""
+    dest = Path(data_dir) / CLAUDE_STATUSLINE_FILENAME
+    _wrote, out = write_claude_statusline_tee(
+        stdin_text, dest, chain_cmd=chain_cmd
+    )
+    if out:
+        sys.stdout.write(out)
+    return 0
+
+
 def _cmd_session_start(domain, data_dir) -> int:
     from . import hooks as hooks_mod
     from .standing import has_standing, standing_line
@@ -413,6 +444,27 @@ def _add_subcommands(subparsers):
     )
     panel_p.add_argument("--data-dir", default=None)
 
+    usage_p = subparsers.add_parser(
+        "usage", help="show normalized per-pool and per-seat plan-usage-left"
+    )
+    usage_p.add_argument(
+        "--executors", choices=["live", "hermes", "cli", "local"], default="live",
+        help="panel backend to map seats from (default: live)",
+    )
+    usage_p.add_argument("--json", dest="as_json", action="store_true", help="emit raw JSON feed")
+    usage_p.add_argument(
+        "--passive", action="store_true",
+        help="read cached/passive files only without spawning active free CLI probes",
+    )
+    usage_p.add_argument("--data-dir", default=None)
+
+    tee_p = subparsers.add_parser(
+        "claude-statusline-tee",
+        help="read Claude Code statusLine JSON on stdin and persist sanitized quota cache",
+    )
+    tee_p.add_argument("--chain", default=None, help="optional downstream statusLine command")
+    tee_p.add_argument("--data-dir", default=None)
+
     cert_p = subparsers.add_parser(
         "verify-cert",
         help="verify an MM CERTIFIED certificate token against this store",
@@ -470,6 +522,15 @@ def dispatch(args, data_dir=None) -> int:
             return _cmd_status(effective_dir)
         if sub == "panel":
             return _cmd_panel(getattr(args, "executors", "live"), effective_dir)
+        if sub == "usage":
+            return _cmd_usage(
+                getattr(args, "executors", "live"),
+                getattr(args, "as_json", False),
+                getattr(args, "passive", False),
+                effective_dir,
+            )
+        if sub == "claude-statusline-tee":
+            return _cmd_claude_statusline_tee(getattr(args, "chain", None), effective_dir)
         if sub == "verify-cert":
             return _cmd_verify_cert(args.token, effective_dir)
         if sub == "session-start":

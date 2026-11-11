@@ -553,12 +553,17 @@ def _cli_generate(binary_label: str, cmd: str, worktree: Path) -> tuple[GenResul
     return _cli_result(binary_label, result, combined, tokens_in, tokens_out, cost, request_ids), (result.stdout or "")
 
 
-def _cli_judge(cmd: str, cwd: Path) -> dict | None:
+def _cli_judge(cmd: str, cwd: Path, on_stdout=None) -> dict | None:
     """Shared judge() body: run a judge command, extract its verdict."""
     try:
         result = run_command(cmd, cwd=cwd, timeout_s=300)
     except Exception:
         return None
+    if callable(on_stdout):
+        try:
+            on_stdout(result.stdout or "")
+        except Exception:
+            pass
     if result.timed_out:
         return None
     return _extract_judge_verdict(result.stdout or "")
@@ -586,6 +591,9 @@ class _PromptCliExecutor(Executor):
             return (True, path)
         return (False, f"{self.binary} binary not found on PATH")
 
+    def _on_stdout(self, stdout: str) -> None:
+        return None
+
     def generate(self, worktree: Path, contract: dict, context: str) -> GenResult:
         ok, detail_avail = self.available()
         if not ok:
@@ -597,6 +605,10 @@ class _PromptCliExecutor(Executor):
         prompt = build_prompt_with_files(Path(worktree), contract, context) if targets else build_prompt(contract, context)
         cmd = f"{self.binary} {self._prompt_args(prompt)}"
         gen, stdout = _cli_generate(self.binary, cmd, worktree)
+        try:
+            self._on_stdout(stdout)
+        except Exception:
+            pass
         if gen.status == "completed" and targets and _targets_unchanged(Path(worktree), before_snapshots):
             _apply_cli_stdout_edits(Path(worktree), contract, stdout, gen)
         return gen
@@ -608,7 +620,7 @@ class _PromptCliExecutor(Executor):
         prompt = packet + "\n\nRUBRIC:\n" + json.dumps(rubric, indent=2, default=str) + "\n\n" + JUDGE_INSTRUCTION_V2
         with tempfile.TemporaryDirectory() as td:
             cmd = f"{self.binary} {self._prompt_args(prompt)}"
-            return _cli_judge(cmd, Path(td))
+            return _cli_judge(cmd, Path(td), on_stdout=self._on_stdout)
 
 
 class AgyExecutor(Executor):
@@ -658,6 +670,15 @@ class ClaudeExecutor(_PromptCliExecutor):
 
     def _prompt_args(self, prompt: str) -> str:
         return f"-p {shlex.quote(prompt)} --output-format json"
+
+    def _on_stdout(self, stdout: str) -> None:
+        try:
+            from .usage_feed import harvest_claude_output
+            from .plugin import ACTIVE_DATA_DIR
+
+            harvest_claude_output(stdout, data_dir=ACTIVE_DATA_DIR)
+        except Exception:
+            pass
 
 
 class QwenExecutor(_PromptCliExecutor):

@@ -498,7 +498,7 @@ class MatrixOutcome:
 def run_matrix(store, contract, candidates, gate_results, diffs,
                peer_executors, *, min_score, dissent_threshold=3.0,
                spread_threshold=2.0, calibrations=None, seed=0,
-               round_no=None, on_judge_done=None) -> MatrixOutcome:
+               round_no=None, on_judge_start=None, on_judge_done=None) -> MatrixOutcome:
     """Run the peer validity matrix over hard/measured survivors.
 
     ``peer_executors`` maps expert_id -> executor (``.family`` and
@@ -575,15 +575,21 @@ def run_matrix(store, contract, candidates, gate_results, diffs,
         prepared_peers.append((judge_id, executor, judge_family, order, labels, packet))
 
     def _call_peer_judge(jid: str, ex, pkt: str):
+        if callable(on_judge_start):
+            try:
+                on_judge_start(jid)
+            except Exception:
+                pass
         try:
             res = ex.judge(pkt, rubric)
         except Exception:  # noqa: BLE001 - a failing peer yields no cells
             res = None
-        if callable(on_judge_done):
-            try:
-                on_judge_done(jid)
-            except Exception:
-                pass
+        finally:
+            if callable(on_judge_done):
+                try:
+                    on_judge_done(jid)
+                except Exception:
+                    pass
         return res
 
     raw_by_judge: dict[str, object] = {}

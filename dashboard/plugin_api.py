@@ -37,6 +37,7 @@ from hybrid_critic_loop.plugin import _build_executors, resolve_data_dir
 from hybrid_critic_loop.progress import read_run_status
 from hybrid_critic_loop.reports import build_matrix_view
 from hybrid_critic_loop.standing import standing_line
+from hybrid_critic_loop.usage_feed import collect_usage_feed, pool_kind_for_seat
 
 router = APIRouter()
 
@@ -71,10 +72,15 @@ def _panel_snapshot(force: bool = False) -> list[dict]:
                 ok, detail = ex.available()
             except Exception as exc:  # noqa: BLE001
                 ok, detail = False, str(exc)
+            try:
+                _, pool_id = pool_kind_for_seat(eid, ex)
+            except Exception:  # noqa: BLE001
+                pool_id = None
             seats.append({
                 "expert_id": eid,
                 "family": getattr(ex, "family", None),
                 "model": getattr(ex, "last_model", None) or getattr(ex, "default_model", None) or eid,
+                "pool_id": pool_id,
                 "ready": bool(ok),
                 "detail": str(detail or ""),
             })
@@ -168,19 +174,67 @@ async def get_status(refresh_panel: bool = False) -> dict:
             store.close()
 
     ready_count = sum(1 for s in panel if s.get("ready"))
+    try:
+        exec_map = _build_executors("live")
+    except Exception:  # noqa: BLE001
+        exec_map = {}
+    usage_data = collect_usage_feed(
+        exec_map,
+        data_dir=data_dir,
+        refresh=bool(refresh_panel),
+        include_cli_pools=True,
+    )
+    seat_usage = usage_data.get("seats") or {}
+    enriched_panel = []
+    for s in panel:
+        scopy = dict(s)
+        sid = scopy.get("expert_id")
+        if sid and sid in seat_usage:
+            scopy["usage"] = seat_usage[sid]
+            scopy.setdefault("pool_id", seat_usage[sid].get("pool_id"))
+        enriched_panel.append(scopy)
+
     return {
         "ok": True,
         "active_run": active_run,
         "panel": {
-            "seats": panel,
+            "seats": enriched_panel,
             "ready_count": ready_count,
-            "total_count": len(panel),
+            "total_count": len(enriched_panel),
         },
+        "usage": usage_data,
         "recent_contracts": recent_contracts,
         "latest_matrix": latest_matrix,
         "ledger_summary": ledger_summary,
         "standing_line": standing_text,
         "lessons": lessons,
+    }
+
+
+@router.get("/usage")
+async def get_usage(refresh: bool = True, include_cli_pools: bool = True) -> dict:
+    """Return normalized per-pool and per-seat plan-usage-left plus live seat activity."""
+    data_dir = resolve_data_dir(None)
+    active_run = read_run_status(data_dir)
+    try:
+        exec_map = _build_executors("live")
+    except Exception:  # noqa: BLE001
+        exec_map = {}
+    feed = collect_usage_feed(
+        exec_map,
+        data_dir=data_dir,
+        refresh=bool(refresh),
+        include_cli_pools=bool(include_cli_pools),
+    )
+    return {
+        "ok": True,
+        "generated_at": feed.get("generated_at"),
+        "pools": feed.get("pools") or {},
+        "seats": feed.get("seats") or {},
+        "summary": feed.get("summary") or {},
+        "active_run_phase": active_run.get("phase"),
+        "active_seat_ids": list(active_run.get("active_seat_ids") or []),
+        "agent_cursor": active_run.get("agent_cursor"),
     }
 
 
