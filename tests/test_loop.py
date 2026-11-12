@@ -214,7 +214,7 @@ class TestRunOne(LoopTestBase):
         )
         self.assertEqual(again["status"], "already_run", again)
         self.assertEqual(again["contract_status"], "awaiting_human_gate")
-        self.assertIn("critic_gate", again["detail"])
+        self.assertIn("/critic gate", again["detail"])
         self.assertEqual(len(self.store.candidates_for("ctr_demo_1")), 2)
         self.assertIn("NotImplementedError", (self.repo / "src" / "speed_sampler.py").read_text())
         # The gate itself still completes the contract.

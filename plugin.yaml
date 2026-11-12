@@ -14,6 +14,7 @@ provides_tools:
   - critic_ledger
   - critic_gate
 provides_hooks:
+  - pre_tool_call
   - on_session_start
   - pre_llm_call
 emits:

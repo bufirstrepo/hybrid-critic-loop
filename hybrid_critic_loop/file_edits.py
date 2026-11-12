@@ -37,8 +37,8 @@ def redact_for_llm(text: str) -> str:
         from agent.redact import redact_sensitive_text
 
         return redact_sensitive_text(text, force=True)
-    except Exception:
-        return text
+    except Exception as exc:
+        raise RuntimeError("secret redaction unavailable; refusing to send file content") from exc
 
 
 def contract_target_files(contract: dict | None) -> list[str]:
@@ -116,7 +116,7 @@ def build_prompt_with_files(
     max_file_bytes: int = 65536,
 ) -> str:
     """Build generation prompt including current target file contents and reply format rules."""
-    base = build_prompt(contract, context)
+    base = redact_for_llm(build_prompt(contract, context))
     contract = contract or {}
     targets = contract_target_files(contract)
     if not targets and allow_discovery:
@@ -143,17 +143,14 @@ def build_prompt_with_files(
             if dest is None or not dest.is_file():
                 file_sections.append(f"=== FILE: {rel} (new file — does not exist yet) ===")
                 continue
-            try:
-                raw_bytes = dest.read_bytes()
-                truncated = len(raw_bytes) > max_file_bytes
-                text = raw_bytes[:max_file_bytes].decode("utf-8", errors="replace")
-                safe_text = redact_for_llm(text)
-                note = " [TRUNCATED]" if truncated else ""
-                file_sections.append(
-                    f"=== FILE: {rel}{note} ===\n```\n{safe_text}\n```"
-                )
-            except Exception:
-                continue
+            raw_bytes = dest.read_bytes()
+            if len(raw_bytes) > max_file_bytes:
+                raise ValueError(f"target file {rel} exceeds the safe full-file edit limit")
+            text = raw_bytes.decode("utf-8")
+            safe_text = redact_for_llm(text)
+            if safe_text != text:
+                raise ValueError(f"target file {rel} contains redacted content; refusing full-file replacement")
+            file_sections.append(f"=== FILE: {rel} ===\n```\n{safe_text}\n```")
         if file_sections:
             parts.extend(["", "CURRENT WORKTREE FILES:", *file_sections])
 

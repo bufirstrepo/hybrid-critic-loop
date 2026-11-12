@@ -157,7 +157,7 @@ try:
 finally:
     store.close()
 print(json.dumps({"status": result.get("status"),
-                  "detail": result.get("detail")}))
+                  "detail": result.get("detail")}), file=sys.__stdout__)
 '''
 
 
@@ -186,6 +186,7 @@ class TestConcurrentGateClaim(RealGitBase):
         for p in procs:
             out, err = p.communicate(timeout=180)
             self.assertEqual(p.returncode, 0, err)
+            self.assertTrue(out.strip(), f"gate helper produced no output; stderr: {err}")
             outputs.append(json.loads(out.strip().splitlines()[-1]))
         self.assertEqual(
             sorted(o["status"] for o in outputs), ["completed", "error"],

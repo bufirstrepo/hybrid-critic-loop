@@ -253,17 +253,15 @@ class TestRunClaimLifecycle(RealGitBase):
                     self._executors(), human_decider=None)
         self.assertFalse(self._claim_path("ctr_boom").exists())
 
-    def test_stale_claim_is_broken_with_a_note(self):
+    def test_existing_claim_is_not_broken_before_status_changes(self):
         mgr = WorktreeManager(self.repo)
         self.assertTrue(mgr.claim_run("ctr_stale"))
         result = loop_mod.run_contract(
             self.store, _contract("ctr_stale"), self.repo,
             self._executors(), human_decider=None)
-        self.assertEqual(result["status"], "awaiting_human_gate", result)
-        self.assertIn("stale run claim", result.get("claim_note", ""),
-                      result)
-        # And the successful run released its own claim on exit.
-        self.assertFalse(self._claim_path("ctr_stale").exists())
+        self.assertEqual(result["status"], "already_run", result)
+        self.assertTrue(self._claim_path("ctr_stale").exists())
+        mgr.release_run("ctr_stale")
 
     def test_claim_over_a_running_contract_answers_already_run(self):
         contract = _contract("ctr_busy")

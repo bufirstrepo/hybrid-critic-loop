@@ -123,6 +123,13 @@ class FakeWorktrees:
     def commit_all(self, wt, msg):
         return "deadbeef"
 
+    def is_commit(self, commit):
+        return commit == "deadbeef"
+
+    def merge_commit_into_main(self, commit):
+        assert commit == "deadbeef"
+        return "cafef00d"
+
     def merge_into_main(self, wt):
             return "cafef00d"
 

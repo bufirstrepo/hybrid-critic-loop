@@ -411,6 +411,11 @@ def verify_baseline(store, contract: dict, repo_path, worktree_mgr) -> tuple[boo
             item["sensor_cmd"], baseline_wt, timeout_s=item.get("timeout_s", 900)
         )
         entry = {"sensor_cmd": item["sensor_cmd"], "exit_code": res.exit_code, "metrics": []}
+        if res.timed_out or res.exit_code != 0:
+            measured_failed = True
+            entry["error"] = f"sensor failed (exit={res.exit_code}, timed_out={res.timed_out})"
+            detail["measured"].append(entry)
+            continue
         try:
             values = json.loads(res.stdout)
         except Exception:  # noqa: BLE001

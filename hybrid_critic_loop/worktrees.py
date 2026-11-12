@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .shellrun import vendor_cli_env
+
 
 def _git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -13,6 +15,7 @@ def _git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProces
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
+        env=vendor_cli_env(""),
     )
 
 
@@ -39,14 +42,8 @@ class WorktreeManager:
         run gets False instead of fighting over worktree and branch
         names. The claim is taken before any worktree is created and
         records the claimant's pid and the time it was taken. The loop
-        releases it on EVERY run exit (round-5 fix spec H6; round-5
-        gate-core F4): the file guards a run that is actually live —
-        the contract row reads "running" — and nothing else. A claim
-        left behind by a run that died inside the claim window (before
-        the status flip, e.g. during baseline verification) is stale:
-        the loop breaks it with a named note on the result and takes
-        the claim for the new run, because that contract never
-        dispatched and its id was never spent.
+        releases its own claim on exit. An existing claim is never
+        automatically broken; an operator must inspect an abandoned claim.
         """
         import os
         import time
@@ -60,10 +57,8 @@ class WorktreeManager:
             )
         except FileExistsError:
             return False
-        except OSError:
-            # A filesystem that cannot take the claim must not block the
-            # run: the store's status claim still guards sequentially.
-            return True
+        except OSError as exc:
+            raise RuntimeError(f"cannot acquire run claim: {exc}") from exc
         try:
             stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             os.write(
@@ -202,11 +197,31 @@ class WorktreeManager:
 
     def diff(self, path) -> str:
         path = Path(path)
-        _git(["-C", str(path), "add", "-A"])
+        added = _git(["-C", str(path), "add", "-A"])
+        if added.returncode != 0:
+            raise RuntimeError(f"git add failed: {added.stderr.strip()}")
         result = _git(["-C", str(path), "diff", "--cached"])
         if result.returncode != 0:
             raise RuntimeError(f"git diff failed: {result.stderr.strip()}")
         return result.stdout or ""
+
+    def snapshot_diff(self, baseline, snapshot) -> str:
+        result = _git(["-C", str(self.repo), "diff", str(baseline), str(snapshot)])
+        if result.returncode != 0:
+            raise RuntimeError(f"git snapshot diff failed: {result.stderr.strip()}")
+        return result.stdout or ""
+
+    def index_tree(self, path) -> str:
+        result = _git(["-C", str(path), "write-tree"])
+        if result.returncode != 0:
+            raise RuntimeError(f"git write-tree failed: {result.stderr.strip()}")
+        return result.stdout.strip()
+
+    def commit_tree(self, commit) -> str:
+        result = _git(["-C", str(self.repo), "rev-parse", f"{commit}^{{tree}}"])
+        if result.returncode != 0:
+            raise RuntimeError(f"git commit tree lookup failed: {result.stderr.strip()}")
+        return result.stdout.strip()
 
     def commit_all(self, path, message) -> str:
         path = Path(path)

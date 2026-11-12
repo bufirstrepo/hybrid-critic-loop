@@ -277,7 +277,11 @@ def _with_deepseek_secret(value: str | None = None, *, raise_exc: Exception | No
 
     scope_mod.get_secret = _fake_get_secret
     agent_pkg.secret_scope = scope_mod
-    with patch.dict(sys.modules, {"agent": agent_pkg, "agent.secret_scope": scope_mod}):
+    redact_mod = types.ModuleType("agent.redact")
+    redact_mod.redact_sensitive_text = lambda text, **kwargs: text
+    agent_pkg.redact = redact_mod
+    with patch.dict(sys.modules, {"agent": agent_pkg, "agent.secret_scope": scope_mod,
+                                 "agent.redact": redact_mod}):
         yield calls
 
 

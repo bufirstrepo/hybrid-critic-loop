@@ -1,6 +1,6 @@
 """Hermes plugin registration for the Hybrid Critic Loop.
 
-``register(ctx)`` wires tools, a slash command, a CLI command, and the two
+``register(ctx)`` wires tools, a slash command, a CLI command, and three
 lifecycle hooks onto the Hermes context.  Everything is built on ``ctx``
 plus the standard library — no other Hermes imports.  The loop, contracts,
 executors and standing modules are imported lazily inside handlers so
@@ -12,6 +12,9 @@ State lives in the plugin data dir, never in the plugin directory.
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
+import secrets
 import os
 import shlex
 import time
@@ -45,7 +48,8 @@ _SYSTEM_PROMPT_GUIDANCE = (
     "the user to `/mm status`, `/mm panel`, `hermes critic status`, or the Desktop "
     "**Millionaire Matrix** status-bar chip and right-side pane.\n"
     "- **Human gate**: `critic_run` stops at `awaiting_human_gate`. Show the winning seat, "
-    "summary diff/scores (`critic_matrix`), and ask the user before calling `critic_gate`."
+    "summary diff/scores (`critic_matrix`), and direct the user to `/critic gate` or "
+    "`hermes critic gate` for approval or waiver; the agent tool can inspect or reject."
 )
 
 
@@ -54,23 +58,13 @@ _SYSTEM_PROMPT_GUIDANCE = (
 # --------------------------------------------------------------------------
 
 def resolve_data_dir(ctx=None) -> Path:
-    """Resolve the plugin data dir without ever touching the plugin dir.
+    """Resolve host storage without accepting an environment data-dir override.
 
-    Precedence, in order:
-
-    1. the Hermes ctx's own ``plugin_data_dir()`` — a forward-compat
-       probe only: the real host's PluginContext has no such attribute,
-       so this step is inert today and exists in case a future host
-       grows one;
-    2. an explicit ``HCL_DATA_DIR`` override;
-    3. Hermes's ``plugins.plugin_storage`` helper, when importable —
-       in practice the authoritative in-host source;
-    4. ``<HERMES_HOME>/plugin-data/hybrid-critic-loop``.
-
-    The explicit override sits above the importable helper on purpose:
-    the test suite, the standalone CLI and an operator pointing a run
-    elsewhere must never land in the live store just because Hermes's
-    package happens to be on ``sys.path`` (Wave 2.0, F-W20-02).
+    A context-provided plugin_data_dir is a forward-compat probe. Otherwise
+    Hermes' get_hermes_home() supplies the profile-aware home. Deriving the
+    plugin-data path without calling plugin_storage avoids creating directories
+    during dashboard read-only requests. Standalone callers can use --data-dir.
+    When Hermes is not importable, HERMES_HOME or the user's home is used.
     """
     if ctx is not None:
         getter = getattr(ctx, "plugin_data_dir", None)
@@ -81,23 +75,13 @@ def resolve_data_dir(ctx=None) -> Path:
                     return Path(result)
             except Exception:
                 pass
-    env_dir = os.environ.get("HCL_DATA_DIR")
-    if env_dir:
-        return Path(env_dir).expanduser()
     try:
-        from plugins.plugin_storage import plugin_data_dir
-
-        result = None
-        try:
-            result = plugin_data_dir("hybrid-critic-loop")
-        except TypeError:
-            result = plugin_data_dir()
-        if result:
-            return Path(result)
-    except Exception:
-        pass
-    hermes_home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
-    return hermes_home / "plugin-data" / "hybrid-critic-loop"
+        from hermes_constants import get_hermes_home
+    except ImportError:
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser()
+    else:
+        home = Path(get_hermes_home()).expanduser()
+    return home / "plugin-data" / "hybrid-critic-loop"
 
 
 # --------------------------------------------------------------------------
@@ -290,15 +274,9 @@ def _infer_test_cmd(repo_path: str | Path | None) -> str:
             return "go test ./..."
         if (root / "package.json").is_file():
             return "npm test"
-        has_py_tests = (
-            (root / "tests").is_dir()
-            or any(root.glob("test_*.py"))
-            or any(root.glob("*_test.py"))
-        )
-        if has_py_tests:
-            return "python3 -m unittest"
-        if any(root.rglob("*.py")):
-            return "python3 -m compileall -q ."
+        # Test discovery varies widely between Python projects, and both
+        # unittest and compileall can exit successfully without running tests.
+        # Require the operator to name the project's actual test command.
     raise ValueError(
         "test_cmd is required for shorthand task runs when no standard test suite is detected in repo_path"
     )
@@ -418,7 +396,7 @@ _CRITIC_RUN_SCHEMA = {
         "families implement or improve the task in isolated git worktrees, "
         "hard/measured gates plus the blind 8->6->4->2->1 peer validity matrix "
         "pick one winner, and the result stops at the human gate — complete it "
-        "with critic_gate or the CLI after user confirmation. Accepts either a "
+        "by the operator using /critic gate or the CLI. Accepts either a "
         "full contract/contract_path OR shorthand task + mode ('improve' for "
         "passing repos, 'fix' for failing tests) + test_cmd + target_files. "
         "Gate commands execute on the operator's machine, starting with the "
@@ -543,18 +521,16 @@ _CRITIC_LEDGER_SCHEMA = {
 
 _CRITIC_GATE_SCHEMA = {
     "description": (
-        "Complete the human gate of a contract whose run ended awaiting it: "
-        "approve merges the winner, reject opens a follow-up contract carrying "
-        "the rejection, waive accepts a measured-gate failure (never a hard one). "
-        "The decision is recorded on the verdict and cannot be replayed."
+        "Inspect or reject a pending gate. Approval and waiver require "
+        "the operator to use /critic gate or the interactive CLI."
     ),
     "type": "object",
     "properties": {
         "contract_id": {"type": "string", "description": "Contract whose human gate is pending."},
         "decision": {
             "type": "string",
-            "enum": ["approved", "rejected", "waived"],
-            "description": "The human's decision.",
+            "enum": ["status", "rejected"],
+            "description": "Inspect the gate or reject its winner; only the operator may approve or waive.",
         },
         "reason": {"type": "string", "description": "Optional reason, recorded with a rejection."},
     },
@@ -603,9 +579,55 @@ def register(ctx):
         except Exception:
             pass
 
+    # Bind the contract and repository to the approval request. A missing hook,
+    # a changed file, or modified tool arguments must not silently run commands.
+    approval_key = secrets.token_bytes(32)
+
+    def signature(args):
+        payload = {k: v for k, v in args.items() if k != "_mm_approval_signature"}
+        data = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+        return hmac.new(approval_key, data, hashlib.sha256).hexdigest()
+
+    def _pre_tool_call(tool_name="", args=None, **kw):
+        if tool_name != "critic_run":
+            return None
+        if not isinstance(args, dict) or not args.get("repo_path"):
+            return {"action": "block", "message": "critic_run requires a repository path."}
+        try:
+            contract = _load_contract(args)
+            if contract is None:
+                raise ValueError("contract, contract_path, or task is required")
+            repo = str(Path(args["repo_path"]).expanduser().resolve())
+            commands = [a.get("cmd") if a["class"] == "hard" else a.get("sensor_cmd")
+                        for a in contract["acceptance"] if a["class"] in ("hard", "measured")]
+            if not all(isinstance(c, str) and c for c in commands):
+                raise ValueError("all gate commands must be nonempty strings")
+            # The Hermes dispatcher passes the same argument dictionary to the
+            # hook and handler. Freeze the loaded contract and inferred command.
+            args.pop("_mm_approval_signature", None)
+            args.pop("contract_path", None)
+            args["repo_path"] = repo
+            args["contract"] = contract
+            args["_mm_approval_signature"] = signature(args)
+            message = ("Repository: " + repo + "\nGate and sensor commands (executed on the host, "
+                       "including against generated changes):\n" +
+                       "\n".join("- " + json.dumps(c, ensure_ascii=True) for c in commands) +
+                       "\nModel CLI executors may also run and edit files with the operator's authority.")
+            rule_key = "critic_run:" + hashlib.sha256(message.encode()).hexdigest()
+            return {"action": "approve", "message": message, "rule_key": rule_key}
+        except Exception as exc:
+            return {"action": "block", "message": f"Cannot prepare critic_run approval: {exc}"}
+
     # -- tools -------------------------------------------------------------
-    def critic_run_handler(args):
+    def critic_run_handler(args, *, operator=False):
         args = args or {}
+        if not operator:
+            try:
+                token = args.get("_mm_approval_signature", "")
+                if not isinstance(token, str) or not hmac.compare_digest(token, signature(args)):
+                    return json.dumps({"error": "critic_run requires a matching Hermes approval hook"})
+            except (TypeError, ValueError):
+                return json.dumps({"error": "critic_run approval inputs are invalid"})
         repo_path = args.get("repo_path")
         if not repo_path:
             return json.dumps({"error": "repo_path is required"})
@@ -702,21 +724,18 @@ def register(ctx):
         decision = args.get("decision")
         if not contract_id or not decision:
             return json.dumps({"error": "contract_id and decision are required"})
+        if decision == "status":
+            verdict = store.latest_verdict(contract_id)
+            return json.dumps({"contract_id": contract_id, "verdict": verdict}, default=str)
+        if decision != "rejected":
+            return json.dumps({"error": "A human must approve or waive using /critic gate or hermes critic gate."})
         try:
             from . import loop as loop_mod
+            return json.dumps(loop_mod.record_human_gate(
+                store, contract_id, "rejected", args.get("reason"), channel="tool"
+            ), default=str)
         except Exception as exc:
-            return json.dumps({"error": f"loop module not available: {exc}"})
-        # The decision is recorded with its real channel (fix spec G1,
-        # round 4 security F7): a decision that arrived through this
-        # tool is "tool", not a blanket "human". The call is wrapped
-        # like the run handler's (fix spec G10, round 4 regression F2).
-        try:
-            result = loop_mod.record_human_gate(
-                store, contract_id, decision, args.get("reason"), channel="tool"
-            )
-        except Exception as exc:  # noqa: BLE001 - surface boundary
             return json.dumps({"error": f"gate failed: {exc}"})
-        return json.dumps(result, default=str)
 
     def _register(name, raw_schema, handler):
         schema = _tool_schema(name, raw_schema)
@@ -781,7 +800,7 @@ def register(ctx):
                 return "usage: critic run <contract.json> [repo_path]"
             repo_path = parts[2] if len(parts) > 2 else "."
             out = critic_run_handler(
-                {"contract_path": parts[1], "repo_path": repo_path}
+                {"contract_path": parts[1], "repo_path": repo_path}, operator=True
             )
             try:
                 result = json.loads(out)
@@ -790,8 +809,7 @@ def register(ctx):
             rendered = json.dumps(result, indent=2, default=str)
             if _is_awaiting(result):
                 rendered += (
-                    "\nHuman gate pending — approve/reject via the critic_gate "
-                    "tool, `critic gate <contract_id> approve|reject|waive`, "
+                    "\nHuman gate pending — decide via `critic gate <contract_id> approve|reject|waive`, "
                     "or the CLI."
                 )
             return rendered
@@ -804,9 +822,13 @@ def register(ctx):
                 "waive": "waived", "waived": "waived",
             }.get(parts[2].lower(), parts[2])
             reason = " ".join(parts[3:]) or None
-            out = critic_gate_handler(
-                {"contract_id": parts[1], "decision": decision, "reason": reason}
-            )
+            try:
+                from . import loop as loop_mod
+                out = json.dumps(loop_mod.record_human_gate(
+                    store, parts[1], decision, reason, channel="slash"
+                ), default=str)
+            except Exception as exc:
+                out = json.dumps({"error": f"gate failed: {exc}"})
             try:
                 return json.dumps(json.loads(out), indent=2, default=str)
             except Exception:
@@ -877,7 +899,9 @@ def register(ctx):
     def _pre_llm_call(**kw):
         return hooks_mod.pre_llm_call(store, data_dir, **kw)
 
-    # Two hooks (fix pass Wave 2.10, review 1C-17). The post_tool_call /
+    ctx.register_hook("pre_tool_call", _pre_tool_call)
+
+    # The observer hooks remain in addition to the run approval hook. The post_tool_call /
     # post_llm_call observers of v0.2 read fields Hermes never sends and
     # wrote against a contract no finished run leaves open — a declared
     # capability that observed nothing. They are gone from the registration,

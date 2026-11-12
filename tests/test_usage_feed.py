@@ -935,8 +935,8 @@ class TestCacheAsymmetryTeeAndIntegrations(unittest.TestCase):
 
     def test_plugin_api_and_cli_usage_are_strictly_read_only_on_fresh_dir(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            nonexistent_data_dir = Path(td) / "fresh_never_created"
-            with mock.patch.dict(os.environ, {"HCL_DATA_DIR": str(nonexistent_data_dir)}):
+            nonexistent_data_dir = Path(td) / "plugin-data" / "hybrid-critic-loop"
+            with mock.patch.dict(os.environ, {"HERMES_HOME": td, "HCL_DATA_DIR": str(Path(td) / "ignored")}):
                 status_resp = asyncio.run(plugin_api.get_status(refresh_panel=False))
                 self.assertTrue(status_resp["ok"])
                 self.assertIn("usage", status_resp)

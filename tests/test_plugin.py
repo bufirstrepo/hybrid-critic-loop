@@ -27,6 +27,9 @@ class FakeCtx:
         self.cli_commands = {}
         self.hooks = {}
 
+    def plugin_data_dir(self):
+        return os.environ.get("HCL_DATA_DIR")
+
     def register_tool(self, name=None, toolset=None, schema=None, handler=None):
         self.tools[name] = {
             "toolset": toolset, "schema": schema, "handler": handler,
@@ -51,6 +54,9 @@ class FakeCtxNoCli:
         self.tools = {}
         self.commands = {}
         self.hooks = {}
+
+    def plugin_data_dir(self):
+        return os.environ.get("HCL_DATA_DIR")
 
     def register_tool(self, name=None, toolset=None, schema=None, handler=None):
         self.tools[name] = {"handler": handler, "schema": schema}
@@ -87,14 +93,12 @@ class TestRegistration(unittest.TestCase):
         self.assertIn("critic", ctx.cli_commands)
         self.assertTrue(callable(ctx.cli_commands["critic"]["setup_fn"]))
         self.assertTrue(callable(ctx.cli_commands["critic"]["handler_fn"]))
-        # Two hooks (fix pass Wave 2.10, review 1C-17): the two observers
-        # that read fields Hermes never sends, against a contract no run
-        # leaves open, are gone from the registration and the manifest.
-        self.assertEqual(set(ctx.hooks), {"on_session_start", "pre_llm_call"})
+        # The approval hook and two lifecycle observers are registered and declared.
+        self.assertEqual(set(ctx.hooks), {"on_session_start", "pre_llm_call", "pre_tool_call"})
         manifest = (Path(__file__).resolve().parent.parent / "plugin.yaml").read_text(encoding="utf-8")
-        declared = re.findall(r"^\s*-\s*(on_session_start|pre_llm_call|post_tool_call|post_llm_call)\s*$",
+        declared = re.findall(r"^\s*-\s*(on_session_start|pre_llm_call|pre_tool_call|post_tool_call|post_llm_call)\s*$",
                               manifest, re.M)
-        self.assertEqual(sorted(declared), ["on_session_start", "pre_llm_call"])
+        self.assertEqual(sorted(declared), ["on_session_start", "pre_llm_call", "pre_tool_call"])
 
     def test_register_without_cli_command_support(self):
         ctx = FakeCtxNoCli()
@@ -283,72 +287,40 @@ class TestRegistration(unittest.TestCase):
 
 
 class TestDataDirPrecedence(unittest.TestCase):
-    """Where state lands, in order: ctx getter, HCL_DATA_DIR, Hermes's
-    storage helper, the HERMES_HOME default — the explicit override must
-    beat an importable Hermes package (fix pass Wave 2.0, F-W20-02).
-
-    A fake ``plugins.plugin_storage`` stands in for Hermes's own helper, so
-    the precedence is tested on every interpreter, not only the Hermes venv.
-    """
-
-    HELPER_DIR = "/nonexistent/hermes-home/plugin-data/hybrid-critic-loop"
+    """Hermes host paths and standalone fallback ignore HCL_DATA_DIR."""
 
     def setUp(self):
-        import sys
         import types
-
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        fake = types.ModuleType("plugins.plugin_storage")
-        fake.plugin_data_dir = lambda name=None: self.HELPER_DIR
-        pkg = types.ModuleType("plugins")
-        pkg.plugin_storage = fake
-        patcher = mock.patch.dict(
-            sys.modules, {"plugins": pkg, "plugins.plugin_storage": fake}
-        )
+        constants = types.ModuleType("hermes_constants")
+        constants.get_hermes_home = lambda: Path(self._tmp.name) / "profile"
+        patcher = mock.patch.dict(sys.modules, {"hermes_constants": constants})
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _env_without(self, *names):
-        return {k: v for k, v in os.environ.items() if k not in names}
+    def test_host_and_contextless_resolution_ignore_hcl_override(self):
+        expected = Path(self._tmp.name) / "profile" / "plugin-data" / "hybrid-critic-loop"
+        with mock.patch.dict(os.environ, {"HCL_DATA_DIR": "/untrusted/override"}):
+            self.assertEqual(plugin.resolve_data_dir(object()), expected)
+            self.assertEqual(plugin.resolve_data_dir(None), expected)
+        self.assertFalse(expected.exists())
 
-    def test_explicit_env_outranks_the_hermes_helper(self):
-        with mock.patch.dict(os.environ, {"HCL_DATA_DIR": self._tmp.name}):
-            self.assertEqual(plugin.resolve_data_dir(FakeCtx()), Path(self._tmp.name))
-
-    def test_hermes_helper_used_when_nothing_overrides_it(self):
-        with mock.patch.dict(os.environ, self._env_without("HCL_DATA_DIR"), clear=True):
-            self.assertEqual(plugin.resolve_data_dir(FakeCtx()), Path(self.HELPER_DIR))
-
-    def test_ctx_getter_outranks_everything(self):
-        class Ctx(FakeCtx):
+    def test_ctx_getter_outranks_hermes_home(self):
+        class Ctx:
             def plugin_data_dir(self):
                 return "/ctx/provided/dir"
+        self.assertEqual(plugin.resolve_data_dir(Ctx()), Path("/ctx/provided/dir"))
 
-        with mock.patch.dict(os.environ, {"HCL_DATA_DIR": self._tmp.name}):
-            self.assertEqual(plugin.resolve_data_dir(Ctx()), Path("/ctx/provided/dir"))
+    def test_fallback_without_hermes_constants_uses_hermes_home(self):
+        with mock.patch.dict(sys.modules, {"hermes_constants": None}), \
+             mock.patch.dict(os.environ, {"HERMES_HOME": self._tmp.name, "HCL_DATA_DIR": "/ignored"}):
+            self.assertEqual(plugin.resolve_data_dir(None),
+                Path(self._tmp.name) / "plugin-data" / "hybrid-critic-loop")
 
-    def test_hermes_home_default_without_helper_or_override(self):
-        import sys
-
-        env = self._env_without("HCL_DATA_DIR")
-        env["HERMES_HOME"] = self._tmp.name
-        # A ``None`` entry makes ``import plugins.plugin_storage`` fail.
-        with mock.patch.dict(sys.modules, {"plugins": None, "plugins.plugin_storage": None}), \
-                mock.patch.dict(os.environ, env, clear=True):
-            self.assertEqual(
-                plugin.resolve_data_dir(FakeCtx()),
-                Path(self._tmp.name) / "plugin-data" / "hybrid-critic-loop",
-            )
-
-    def test_cli_resolves_the_same_directory_as_the_plugin(self):
+    def test_cli_explicit_data_dir_or_hermes_home(self):
         from hybrid_critic_loop import cli
-
-        with mock.patch.dict(os.environ, {"HCL_DATA_DIR": self._tmp.name}):
-            self.assertEqual(cli._resolve_data_dir(None), plugin.resolve_data_dir(None))
-            self.assertEqual(cli._resolve_data_dir(None), Path(self._tmp.name))
-        with mock.patch.dict(os.environ, self._env_without("HCL_DATA_DIR"), clear=True):
-            self.assertEqual(cli._resolve_data_dir(None), Path(self.HELPER_DIR))
+        self.assertEqual(cli._resolve_data_dir(None), plugin.resolve_data_dir(None))
         self.assertEqual(cli._resolve_data_dir("~/x"), Path("~/x").expanduser())
 
 
@@ -420,7 +392,7 @@ class TestDocsMatchTheCode(unittest.TestCase):
         args = parser.parse_args(shlex.split(line)[1:])  # raises SystemExit if the example is wrong
         self.assertEqual(args.command, "run")
         self.assertEqual(args.contract, "contract.json")
-        self.assertEqual(args.gate, "approved")
+        self.assertIsNone(args.gate)
         self.assertEqual(args.data_dir, "./hcl-data")
 
     def test_readme_describes_the_injection_rule_as_implemented(self):
@@ -484,15 +456,15 @@ class TestDocsMatchTheCode(unittest.TestCase):
         self.assertIn("declines a contract without a `target_file`", readme)
 
     def test_hook_counts_cost_disclosure_and_package_version_are_true(self):
-        # Fix pass Wave 2.10 (review 1C-17, 1D-16, 1A-06): two hooks, who
+        # Check the hook count, who
         # reports a cost, and the package's own version string.
         import hybrid_critic_loop
 
         readme = self._read("README.md")
         submission = self._read("SUBMISSION.md")
-        self.assertIn("2 hooks", readme)
+        self.assertIn("3 hooks", readme)
         self.assertNotIn("4 hooks", readme)
-        self.assertIn("(5 tools, 2 hooks)", submission)
+        self.assertIn("(5 tools, 3 hooks)", submission)
         self.assertIn("report tokens only", self._section(readme, "## Cost per validity point"))
         py = re.search(r'^version\s*=\s*"([^"]+)"', self._read("pyproject.toml"), re.M).group(1)
         self.assertEqual(hybrid_critic_loop.__version__, py)
@@ -609,26 +581,22 @@ class TestHostSurface(unittest.TestCase):
         self.assertIn("contract_id", self.ctx.tools["critic_gate"]["schema"]["parameters"]["properties"])
         self.assertEqual(
             self.ctx.tools["critic_gate"]["schema"]["parameters"]["properties"]["decision"]["enum"],
-            ["approved", "rejected", "waived"],
+            ["status", "rejected"],
         )
 
     def test_critic_gate_without_a_pending_gate_is_an_error_not_a_crash(self):
         handler = self.ctx.tools["critic_gate"]["handler"]
         self.assertIn("required", json.loads(handler({"contract_id": "ctr-x"}))["error"])
         out = json.loads(handler({"contract_id": "ctr-none", "decision": "approved"}))
-        self.assertEqual(out["status"], "error")
-        self.assertIn("no pending human gate", out["detail"])
+        self.assertIn("human must approve", out["error"].lower())
 
     def test_critic_gate_routes_to_record_human_gate(self):
         with mock.patch("hybrid_critic_loop.loop.record_human_gate",
                         return_value={"contract_id": "ctr_x", "status": "completed"}) as rec:
             out = json.loads(self.ctx.tools["critic_gate"]["handler"](
                 {"contract_id": "ctr_x", "decision": "waived", "reason": "measured only"}))
-        self.assertEqual(out["status"], "completed")
-        # The decision is recorded with its real channel (fix spec G1,
-        # round 4 security F7): it arrived through the tool.
-        rec.assert_called_once_with(
-            self.store, "ctr_x", "waived", "measured only", channel="tool")
+        self.assertIn("human must approve", out["error"].lower())
+        rec.assert_not_called()
 
     def test_critic_run_cannot_decide_its_own_gate(self):
         # Fix spec G1 (round 4 security F7): the run tool's schema has
@@ -641,11 +609,10 @@ class TestHostSurface(unittest.TestCase):
                         return_value={"contract_id": "ctr_demo_1",
                                       "status": "awaiting_human_gate"}) as run, \
                 mock.patch("hybrid_critic_loop.loop.record_human_gate") as rec:
-            out = json.loads(self.ctx.tools["critic_run"]["handler"]({
-                "contract_path": str(self.ROOT / "contracts" / "demo1.json"),
-                "repo_path": "/nonexistent/repo", "human_gate": "approved",
-                "executors": "local",
-            }))
+            args = {"contract_path": str(self.ROOT / "contracts" / "demo1.json"),
+                    "repo_path": "/nonexistent/repo", "human_gate": "approved", "executors": "local"}
+            self.assertEqual(self.ctx.hooks["pre_tool_call"](tool_name="critic_run", args=args)["action"], "approve")
+            out = json.loads(self.ctx.tools["critic_run"]["handler"](args))
         self.assertEqual(out["status"], "awaiting_human_gate")
         run.assert_called_once()
         self.assertIsNone(run.call_args.kwargs.get("human_decider"))
@@ -657,10 +624,10 @@ class TestHostSurface(unittest.TestCase):
         # the same containment the CLI's dispatch boundary gives.
         with mock.patch("hybrid_critic_loop.loop.run_contract",
                         side_effect=ValueError("usage blew up")):
-            out = json.loads(self.ctx.tools["critic_run"]["handler"]({
-                "contract_path": str(self.ROOT / "contracts" / "demo1.json"),
-                "repo_path": "/nonexistent/repo", "executors": "local",
-            }))
+            args = {"contract_path": str(self.ROOT / "contracts" / "demo1.json"),
+                    "repo_path": "/nonexistent/repo", "executors": "local"}
+            self.ctx.hooks["pre_tool_call"](tool_name="critic_run", args=args)
+            out = json.loads(self.ctx.tools["critic_run"]["handler"](args))
         self.assertIn("error", out)
         self.assertIn("usage blew up", out["error"])
 
@@ -672,7 +639,7 @@ class TestHostSurface(unittest.TestCase):
             out = json.loads(self.ctx.tools["critic_gate"]["handler"](
                 {"contract_id": "ctr_x", "decision": "approved"}))
         self.assertIn("error", out)
-        self.assertIn("merge exploded", out["error"])
+        self.assertIn("human must approve", out["error"].lower())
 
     def test_slash_gate_subcommand_maps_the_verbs(self):
         handler = self.ctx.commands["critic"]["handler"]
@@ -685,7 +652,7 @@ class TestHostSurface(unittest.TestCase):
         # recorded channel is "tool" (fix spec G1).
         rec.assert_called_once_with(
             self.store, "ctr_x", "rejected", "too slow for the hot loop",
-            channel="tool")
+            channel="slash")
         self.assertIn("critic gate <contract_id>", handler(""))
 
     def test_cli_setup_accepts_the_parser_hermes_hands_it(self):

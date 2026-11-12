@@ -13,7 +13,7 @@ Each test names the review finding it pins (source reports in
   the sealing routes when any non-"append" rows exist.
 - T9 CLI — correctness F11/F12, host F5: read-only commands never
   create a store; session-start gates its fallback on has_standing.
-- T9 docstrings — host F4/F6: plugin docstring says two hooks;
+- T9 docstrings — host F4/F6: plugin docstring says three hooks;
   resolve_data_dir docstring names step 1 a forward-compat probe.
 - T12 — provenance is sealed: flipping it breaks verify_chain at that
   row; a store sealed under the pre-T12 canonical form opens, re-seals
@@ -214,11 +214,11 @@ class TestSessionStartGate(unittest.TestCase):
 
 class TestDocstringHonesty(unittest.TestCase):
     """T9 (host F4/F6): the docstrings name the real registration —
-    two lifecycle hooks, and resolve_data_dir's step 1 is a
+    three lifecycle hooks, and resolve_data_dir's step 1 is a
     forward-compat probe, not the host's authoritative source."""
 
-    def test_plugin_docstring_says_two_hooks(self):
-        self.assertIn("two", plugin.__doc__)
+    def test_plugin_docstring_says_three_hooks(self):
+        self.assertIn("three", plugin.__doc__)
         self.assertIn("lifecycle hooks", plugin.__doc__)
         self.assertNotIn("four lifecycle hooks", plugin.__doc__)
 
@@ -226,7 +226,7 @@ class TestDocstringHonesty(unittest.TestCase):
         doc = plugin.resolve_data_dir.__doc__
         self.assertIn("forward-compat", doc)
         self.assertIn("plugin_storage", doc)
-        self.assertIn("authoritative in-host source", doc)
+        self.assertIn("get_hermes_home", doc)
 
 
 class TestProvenanceSealedInChain(unittest.TestCase):

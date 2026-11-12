@@ -2,7 +2,7 @@
 
 Usage:
     python -m hybrid_critic_loop.cli run <contract.json> [--repo PATH] \
-        [--executors live|hermes|cli|local] [--approve|--reject|--waive] [--data-dir PATH]
+        [--executors live|hermes|cli|local] [--data-dir PATH]
     python -m hybrid_critic_loop.cli status [--data-dir PATH]
     python -m hybrid_critic_loop.cli panel [--executors live|hermes|cli|local] [--data-dir PATH]
     python -m hybrid_critic_loop.cli usage [--executors live|hermes|cli|local] [--json] [--passive] [--data-dir PATH]
@@ -30,10 +30,7 @@ from pathlib import Path
 
 
 def _resolve_data_dir(value=None) -> Path:
-    """``--data-dir`` wins; otherwise the plugin's own chain (``HCL_DATA_DIR``,
-    then Hermes's storage helper when importable, then
-    ``<HERMES_HOME>/plugin-data/hybrid-critic-loop``), so the standalone CLI
-    reads the same store the plugin writes (Wave 2.0, F-W20-05)."""
+    """``--data-dir`` wins; otherwise use the profile-aware Hermes home."""
     if value:
         return Path(value).expanduser()
     from .plugin import resolve_data_dir
@@ -179,6 +176,9 @@ def _cmd_run(contract_path, repo, executors_spec, gate, data_dir) -> int:
     from .plugin import _build_executors, _is_awaiting, _load_contract
     from .reports import verdict_report
 
+    if gate in ("approved", "rejected", "waived"):
+        print("error: a gate decision cannot be supplied before the winner is reviewed", file=sys.stderr)
+        return 1
     store, data_dir = _open(data_dir)
     contract = _load_contract({"contract_path": contract_path})
     if contract is None:
@@ -186,28 +186,10 @@ def _cmd_run(contract_path, repo, executors_spec, gate, data_dir) -> int:
         return 1
     executors = _build_executors(executors_spec or "live")
 
-    if gate in ("approved", "rejected", "waived"):
-        decider = lambda *a, **kw: gate  # noqa: E731
-    elif sys.stdin is not None and sys.stdin.isatty():
-        def decider(*a, **kw):
-            answer = input(
-                "Human gate — approve winner? [approve/reject/waive]: "
-            ).strip().lower()
-            return {
-                "approve": "approved",
-                "approved": "approved",
-                "reject": "rejected",
-                "rejected": "rejected",
-                "waive": "waived",
-                "waived": "waived",
-            }.get(answer, answer)
-    else:
-        decider = None
-
     from . import loop as loop_mod
 
     result = loop_mod.run_contract(
-        store, contract, repo, executors, human_decider=decider
+        store, contract, repo, executors, human_decider=None
     )
     print(json.dumps(result, indent=2, default=str))
     contract_id = contract.get("id") if isinstance(contract, dict) else None
@@ -233,6 +215,13 @@ def _cmd_gate(contract_id, decision, reason, data_dir) -> int:
     from . import loop as loop_mod
     from .reports import verdict_report
 
+    if sys.stdin is None or not sys.stdin.isatty():
+        print("error: gate decisions require an interactive operator", file=sys.stderr)
+        return 1
+    confirmation = input(f"Confirm {decision} for contract {contract_id} [type YES]: ")
+    if confirmation.strip() != "YES":
+        print("gate decision cancelled", file=sys.stderr)
+        return 1
     store, data_dir = _open(data_dir)
     # The decision is recorded with its real channel (fix spec G1,
     # round 4 security F7): this surface is the operator's CLI.
@@ -405,11 +394,11 @@ def _add_subcommands(subparsers):
     )
     gate = run_p.add_mutually_exclusive_group()
     gate.add_argument("--approve", dest="gate", action="store_const",
-                      const="approved", help="approve the winner at the human gate")
+                      const="approved", help=argparse.SUPPRESS)
     gate.add_argument("--reject", dest="gate", action="store_const",
-                      const="rejected", help="reject the winner at the human gate")
+                      const="rejected", help=argparse.SUPPRESS)
     gate.add_argument("--waive", dest="gate", action="store_const",
-                      const="waived", help="waive the human gate")
+                      const="waived", help=argparse.SUPPRESS)
     run_p.add_argument("--data-dir", default=None)
 
     gate_p = subparsers.add_parser(

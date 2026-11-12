@@ -240,6 +240,9 @@ class HermesAuxExecutor(Executor):
                 tokens_out = None
 
             reply_text = str(getattr(res, "text", "") or "")
+            if str(getattr(res, "finish_reason", "") or "").lower() in ("length", "max_tokens", "max_output_tokens"):
+                return GenResult(status="error", log="", duration_ms=duration_ms,
+                                 detail="model output was truncated; refusing full-file replacement")
             allow_unlisted = not bool(contract_target_files(contract))
             handled, edit_detail = apply_reply_edits(
                 Path(worktree),

@@ -545,7 +545,7 @@ class TestJudgeVerdictParsing(unittest.TestCase):
 
 def _fake_run(result):
     """A stand-in for shellrun.run_command returning one scripted result."""
-    def fake(cmd, cwd=None, timeout_s=900):
+    def fake(cmd, cwd=None, timeout_s=900, env=None):
         fake.calls.append(cmd)
         return result
     fake.calls = []

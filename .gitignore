@@ -6,3 +6,8 @@ demo-output/
 *.db-wal
 *.db-shm
 lessons.md
+
+.teknium-task-tmp/
+devteam/
+CODEX-*-HANDOFF*.md
+CODEX-TEKNIUM-FIXES-REPORT-2026-11-11.md

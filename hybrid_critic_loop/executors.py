@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .shellrun import vendor_cli_env
 from .shellrun import run_command
 
 LESSON_KEYWORDS = ["ops_per_tick", "alloc", "hot-loop", "hot loop", "pre-allocate", "ring"]
@@ -414,7 +415,7 @@ class CodexExecutor(Executor):
         prompt = build_prompt(contract, context)
         # codex exec --sandbox workspace-write --cd <worktree> --json <prompt>
         cmd = f"codex exec --sandbox workspace-write --cd {shlex.quote(str(worktree))} --json {shlex.quote(prompt)}"
-        result = run_command(cmd, cwd=worktree, timeout_s=300)
+        result = run_command(cmd, cwd=worktree, timeout_s=300, env=vendor_cli_env(shlex.split(cmd)[0]))
         combined = (result.stdout or "") + "\n" + (result.stderr or "")
         log = combined
         tokens_in, tokens_out, request_ids, cost = _parse_jsonl_usage(result.stdout or "")
@@ -432,7 +433,7 @@ class CodexExecutor(Executor):
         with tempfile.TemporaryDirectory() as td:
             cmd = f"codex exec --sandbox read-only --cd {shlex.quote(td)} --json {shlex.quote(prompt)}"
             try:
-                result = run_command(cmd, cwd=Path(td), timeout_s=300)
+                result = run_command(cmd, cwd=Path(td), timeout_s=300, env=vendor_cli_env(shlex.split(cmd)[0]))
             except Exception:
                 return None
             if result.timed_out:
@@ -461,7 +462,7 @@ class GrokExecutor(Executor):
         before_snapshots = _snapshot_targets(Path(worktree), targets) if targets else {}
         prompt = build_prompt_with_files(Path(worktree), contract, context) if targets else build_prompt(contract, context)
         cmd = f"grok -p {shlex.quote(prompt)} --cwd {shlex.quote(str(worktree))}"
-        result = run_command(cmd, cwd=worktree, timeout_s=300)
+        result = run_command(cmd, cwd=worktree, timeout_s=300, env=vendor_cli_env(shlex.split(cmd)[0]))
         combined = (result.stdout or "") + "\n" + (result.stderr or "")
         tokens_in, tokens_out, request_ids, cost = _parse_jsonl_usage(result.stdout or "")
         gen = _cli_result("grok", result, combined, tokens_in, tokens_out, cost, request_ids)
@@ -477,7 +478,7 @@ class GrokExecutor(Executor):
         with tempfile.TemporaryDirectory() as td:
             cmd = f"grok -p {shlex.quote(prompt)} --cwd {shlex.quote(td)}"
             try:
-                result = run_command(cmd, cwd=Path(td), timeout_s=300)
+                result = run_command(cmd, cwd=Path(td), timeout_s=300, env=vendor_cli_env(shlex.split(cmd)[0]))
             except Exception:
                 return None
             if result.timed_out:
@@ -544,7 +545,7 @@ def _cli_generate(binary_label: str, cmd: str, worktree: Path) -> tuple[GenResul
     Mirrors the Codex/Grok adapters: JSON usage parse, then the one
     classification in ``_cli_result`` (exit code decides; markers explain).
     """
-    result = run_command(cmd, cwd=worktree, timeout_s=300)
+    result = run_command(cmd, cwd=worktree, timeout_s=300, env=vendor_cli_env(shlex.split(cmd)[0]))
     combined = (result.stdout or "") + "\n" + (result.stderr or "")
     tokens_in, tokens_out, request_ids, cost = _parse_jsonl_usage(result.stdout or "")
     if not request_ids:
@@ -556,7 +557,7 @@ def _cli_generate(binary_label: str, cmd: str, worktree: Path) -> tuple[GenResul
 def _cli_judge(cmd: str, cwd: Path, on_stdout=None) -> dict | None:
     """Shared judge() body: run a judge command, extract its verdict."""
     try:
-        result = run_command(cmd, cwd=cwd, timeout_s=300)
+        result = run_command(cmd, cwd=cwd, timeout_s=300, env=vendor_cli_env(shlex.split(cmd)[0]))
     except Exception:
         return None
     if callable(on_stdout):
@@ -795,6 +796,7 @@ class LocalSolverExecutor(Executor):
                 capture_output=True,
                 text=True,
                 timeout=120,
+                env=vendor_cli_env(""),
             )
             duration_ms = int((time.monotonic() - start) * 1000)
             log = (proc.stdout or "") + (proc.stderr or "")

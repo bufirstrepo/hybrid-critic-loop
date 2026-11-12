@@ -135,6 +135,7 @@ class TestCriticLessonsToolSanitizes(unittest.TestCase):
         self.addCleanup(patcher.stop)
         plugin.REGISTRATION_NOTES.clear()
         self.ctx = FakeCtx()
+        self.ctx.plugin_data_dir = lambda: self._tmp.name
         self.store = plugin.register(self.ctx)
         self.assertIsNotNone(self.store)
 

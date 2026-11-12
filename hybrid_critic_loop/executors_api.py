@@ -290,6 +290,9 @@ class OllamaQwenExecutor(Executor):
                     detail=(f"ollama generate {'timed out' if timed_out else 'failed'} "
                             f"at {self._host()}: {err}"),
                 )
+            if str(obj.get("done_reason") or "").lower() in ("length", "max_tokens"):
+                return GenResult(status="error", log="", duration_ms=duration_ms,
+                                 detail="model output was truncated; refusing full-file replacement")
             reply = obj.get("response") or ""
             tokens_in = _as_int(obj.get("prompt_eval_count"))
             tokens_out = _as_int(obj.get("eval_count"))
@@ -441,6 +444,10 @@ class DeepSeekExecutor(Executor):
                     duration_ms=duration_ms,
                     detail=f"deepseek generate {'timed out' if timed_out else 'failed'}: {err}",
                 )
+            choices = obj.get("choices") or []
+            if choices and isinstance(choices[0], dict) and str(choices[0].get("finish_reason") or "").lower() in ("length", "max_tokens"):
+                return GenResult(status="error", log="", duration_ms=duration_ms,
+                                 detail="model output was truncated; refusing full-file replacement")
             reply = self._reply_text(obj)
             tokens_in, tokens_out, request_ids = self._usage(obj)
             handled, detail = _write_target_file(Path(worktree), contract or {}, reply)

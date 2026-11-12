@@ -20,7 +20,6 @@ import fnmatch
 import json
 import operator
 import os
-import shlex
 from dataclasses import dataclass, field
 
 from .errors import GateError
@@ -119,9 +118,8 @@ def scrubbed_env_names(env=None) -> list:
     arbitrary-command document whose gate commands start running at
     baseline time; they do not get the operator's secret-bearing
     environment. Keys matching *_KEY, *_TOKEN, *_SECRET or *PASSWORD*
-    are stripped from the env copy handed to gate commands. Executor
-    dispatch (generation) keeps the full environment — only gate and
-    sensor commands are scrubbed.
+    are stripped from the env copy handed to gate commands. Vendor CLI
+    processes use a separate minimal allowlist.
 
     Round-5 spec H6 (round-5 security F3) adds the *_CREDENTIALS and
     *_DSN suffixes and the _SECRET_ENV_NAMES exact names.  Honest
@@ -140,19 +138,19 @@ def scrubbed_env_names(env=None) -> list:
 
 
 def run_gate_command(cmd: str, cwd, timeout_s=900):
-    """Run a gate/sensor command with the scrubbed gate environment.
+    """Run a gate/sensor command with a scrubbed explicit environment.
 
-    The scrub is expressed as an ``env -u NAME ...`` prefix over the
-    command string (run_command is argv-only, and the recorded command
-    everywhere — HardResult, baseline detail, citation matching — stays
-    the contract's own string; only the executed argv loses the
-    variables). With nothing to strip, the command runs unchanged.
+    The child retains ordinary variables but not known secret names. This is
+    hygiene, not a sandbox: commands run with the operator's authority.
+    Python bytecode generation is disabled to preserve the candidate tree.
     """
-    names = scrubbed_env_names()
-    if not names:
-        return run_command(cmd, cwd, timeout_s=timeout_s)
-    prefix = "env " + " ".join(f"-u {shlex.quote(name)}" for name in names)
-    return run_command(f"{prefix} {cmd}", cwd, timeout_s=timeout_s)
+    # An explicit, scrubbed copy avoids inheriting provider secrets. Disable
+    # Python bytecode output so ordinary test discovery does not mutate the
+    # candidate tree that must remain identical to the judged snapshot.
+    child_env = {k: v for k, v in os.environ.items() if k not in scrubbed_env_names()}
+    child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return run_command(cmd, cwd, timeout_s=timeout_s, env=child_env)
+
 
 
 @dataclass
@@ -262,6 +260,11 @@ def run_measured_items(store, contract: dict, candidate_id, cwd) -> list:
         sensor_cmd = item["sensor_cmd"]
         sensor = item.get("sensor", item["sensor_cmd"])
         res = run_gate_command(sensor_cmd, cwd, timeout_s=item.get("timeout_s", 900))
+        if res.timed_out or res.exit_code != 0:
+            raise GateError(
+                f"sensor {sensor_cmd!r} failed (exit={res.exit_code}, "
+                f"timed_out={res.timed_out}); no readings accepted"
+            )
         raw = res.stdout or ""
         try:
             parsed = json.loads(raw)

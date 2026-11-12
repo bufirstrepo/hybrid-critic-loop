@@ -934,13 +934,13 @@ class _Run:
         self.channel = channel
         self.mgr = WorktreeManager(self.repo_path)
         # Run-claim bookkeeping (round-5 fix spec H6): whether THIS
-        # run holds the worktree manager's claim file, and the note
-        # when it had to break a stale claim to take it.
+        # run holds the worktree manager's claim file.
         self._run_claim_held = False
         self._claim_note: str | None = None
         # Candidate id -> the GateError text that eliminated it (fix
         # spec G7 tail): retry notes and the ledger carry the reason.
         self.gate_errors: dict[str, str] = {}
+        self.candidate_trees: dict[str, str] = {}
         self.events: list[dict] = []
         self.durations: dict[str, int] = {}
         self.target_id = contract.get("target_id")
@@ -1018,7 +1018,7 @@ class _Run:
         the recorded status, and for a pending gate the surface that
         completes it, instead of a second dispatch."""
         if status == "awaiting_human_gate":
-            hint = ("its human gate is pending — decide it with the critic_gate tool, "
+            hint = ("its human gate is pending — the operator must decide it using "
                     "`/critic gate <id> approve|reject|waive` or `hermes critic gate`, "
                     "not a re-run")
         elif status == "completed":
@@ -1039,7 +1039,7 @@ class _Run:
             # gate-core F5).
             hint = ("its human gate was claimed but its completion failed "
                     "(contract status 'gate_failed'); present the recorded "
-                    "decision again with the critic_gate tool, "
+                    "decision again using "
                     "`/critic gate <id> approve|reject|waive` or "
                     "`hermes critic gate` to retry completion — do not "
                     "open a new contract id")
@@ -1148,6 +1148,9 @@ class _Run:
         if gen.status == "completed":
             diff = self.mgr.diff(wt)
             store.update_candidate(cand_id, payload_hash=sha256_text(diff))
+            tree = getattr(self.mgr, "index_tree", None)
+            if callable(tree):
+                self.candidate_trees[cand_id] = tree(wt)
         elif gen.status == "refused":
             store.record_refusal(expert_id)
         if self.progress is not None:
@@ -1337,34 +1340,19 @@ class _Run:
         # already_run instead of colliding on worktree/branch names
         # (which carry the attempt: a racing run never gets far enough
         # to mint its own). The claim is released on every exit (see
-        # run()); a claim file that already exists guards only a
-        # contract whose row actually reads "running" — one left by a
-        # run that died inside the claim window, before the status
-        # flip (the window includes baseline verification, the longest
-        # phase), is stale, and the loop breaks it with a named note
-        # rather than bricking a contract that never dispatched
-        # (round-5 fix spec H6; round-5 gate-core F4).
+        # run()). Never break an existing claim automatically: its owner
+        # may be alive but not yet have changed the database status.
         claim_run = getattr(self.mgr, "claim_run", None)
         if callable(claim_run):
             if claim_run(self.contract_id):
                 self._run_claim_held = True
             else:
-                fresh = store.get_contract(self.contract_id) or {}
-                if fresh.get("status") == "running":
-                    return self._already_run("running")
-                release_run = getattr(self.mgr, "release_run", None)
-                if callable(release_run):
-                    release_run(self.contract_id)
-                if not claim_run(self.contract_id):
-                    return self._already_run("running")
-                self._run_claim_held = True
-                self._claim_note = (
-                    f"broke a stale run claim for contract "
-                    f"{self.contract_id}: a claim file existed but the "
-                    f"contract was not running (status "
-                    f"{fresh.get('status')!r}); the run that left it "
-                    f"never dispatched"
+                result = self._already_run("running")
+                result["detail"] += (
+                    "; an existing run claim must be inspected by the operator "
+                    "before an abandoned claim is removed"
                 )
+                return result
         claimed_status = False
         set_status = getattr(store, "set_contract_status", None)
         if callable(set_status):
@@ -1442,6 +1430,15 @@ class _Run:
                 )
 
         category = router_mod.category_of(self.contract["domain"])
+        target = store.get_target(self.target_id) or {}
+        if target.get("budget"):
+            return self._escalate(
+                int(self.contract.get("attempt", 1)),
+                "budgeted run refused: provider usage and cost cannot be bounded before dispatch",
+                {"measurements": [], "hard_failures": [], "judged": None,
+                 "candidate_experts": {}, "winner_expert": None, "loser_experts": [],
+                 "escalation_reason": None},
+            )
         route = router_mod.route_for(store, category)
         # Panel composition (v0.3): route-first order — primary,
         # compete_with, then the fallback order, then any remaining
@@ -1776,9 +1773,21 @@ class _Run:
         must never propagate out of ``run_contract`` and strand the
         contract at "open" with its id spent."""
         try:
-            return gates_mod.evaluate_candidate(
+            expected = cand.get("payload_hash")
+            if isinstance(expected, str) and expected.startswith("sha256:"):
+                if sha256_text(self.mgr.diff(cand["worktree"])) != expected:
+                    raise GateError("candidate changed before gate evaluation")
+                if cand["id"] in self.candidate_trees and self.mgr.index_tree(cand["worktree"]) != self.candidate_trees[cand["id"]]:
+                    raise GateError("candidate tree changed before gate evaluation")
+            result = gates_mod.evaluate_candidate(
                 self.store, self.contract, cand, Path(cand["worktree"])
             )
+            if isinstance(expected, str) and expected.startswith("sha256:"):
+                if sha256_text(self.mgr.diff(cand["worktree"])) != expected:
+                    raise GateError("gate command changed the candidate worktree")
+                if cand["id"] in self.candidate_trees and self.mgr.index_tree(cand["worktree"]) != self.candidate_trees[cand["id"]]:
+                    raise GateError("gate command changed the candidate tree")
+            return result
         except GateError as exc:
             reason = str(exc)
             self.gate_errors[cand["id"]] = reason
@@ -2358,6 +2367,10 @@ class _Run:
                 cid for cid in all_ids if cid not in covered
             ]
         hard, measured, judged_summary = self._gate_summaries(gate_results, judged_map)
+        try:
+            self._snapshot_winner(winner)
+        except Exception as exc:
+            return self._escalate(attempt, f"winner snapshot failed: {exc}", last_gate_details)
         is_waiver = waiver_candidate is not None and winner["id"] == waiver_candidate["id"]
         waiver = None
         if is_waiver:
@@ -2392,7 +2405,6 @@ class _Run:
                     store.update_candidate(winner["id"], evidence=wev)
         except Exception:  # noqa: BLE001 - bookkeeping must not break a verdict
             pass
-        self._snapshot_winner(winner)
         category = router_mod.category_of(self.contract["domain"])
         store.record_expert_result(winner["expert_id"], category, won=True)
         self._record_validity(winner, eliminated, gate_results, judged_map)
@@ -2451,29 +2463,31 @@ class _Run:
         the candidate's payload hash at that commit (fix spec G1;
         round-4 contest-core F1).
 
-        What merges is what was gated: the human gate merges this
-        snapshot commit, never the live worktree, which sits mutable
-        between verdict and decision (gate-command side effects, stray
-        files, a hand edit). Best-effort — if the snapshot cannot be
-        taken, the gate falls back to the legacy live-tree merge and
-        says so in its result detail."""
-        try:
-            commit = self.mgr.commit_all(
-                Path(winner["worktree"]),
-                f"critic: {self.contract_id} verdict snapshot {winner['id']}",
-            )
-        except Exception:  # noqa: BLE001 - the gate's fallback covers us
-            return
+        The snapshot must match the candidate tree presented to the
+        gates and judges. Failure aborts the verdict rather than falling
+        back to a mutable worktree."""
+        expected = winner.get("payload_hash")
+        if isinstance(expected, str) and expected.startswith("sha256:"):
+            if sha256_text(self.mgr.diff(winner["worktree"])) != expected:
+                raise RuntimeError("winner changed after gate evaluation")
+        commit = self.mgr.commit_all(
+            Path(winner["worktree"]),
+            f"critic: {self.contract_id} verdict snapshot {winner['id']}",
+        )
         if not commit:
-            return
+            raise RuntimeError("winner snapshot was not created")
+        if winner["id"] in self.candidate_trees:
+            if self.mgr.commit_tree(commit) != self.candidate_trees[winner["id"]]:
+                raise RuntimeError("snapshot tree differs from the gated candidate")
+        snapshot_diff = getattr(self.mgr, "snapshot_diff", None)
+        if callable(snapshot_diff) and isinstance(expected, str) and expected.startswith("sha256:"):
+            if sha256_text(snapshot_diff(winner["baseline_hash"], commit)) != expected:
+                raise RuntimeError("snapshot differs from the gated candidate")
         setter = getattr(self.store, "set_candidate_payload_hash", None)
-        try:
-            if callable(setter):
-                setter(winner["id"], commit)
-            else:
-                self.store.update_candidate(winner["id"], payload_hash=commit)
-        except Exception:  # noqa: BLE001 - bookkeeping must not break a verdict
-            pass
+        if callable(setter):
+            setter(winner["id"], commit)
+        else:
+            self.store.update_candidate(winner["id"], payload_hash=commit)
         # Pin the snapshot under its own ref as well (round-5 fix
         # spec H6; round-5 gate-core F3): the payload hash is a
         # database string, and the winner's branch was the commit's
@@ -2483,10 +2497,7 @@ class _Run:
         # first; terminal cleanup deletes it.
         pin = getattr(self.mgr, "pin_snapshot_ref", None)
         if callable(pin):
-            try:
-                pin(self.contract_id, winner["id"], commit)
-            except Exception:  # noqa: BLE001 - the payload hash still names it
-                pass
+            pin(self.contract_id, winner["id"], commit)
 
     def _apply_human_gate(self, verdict_id, decision, result):
         return record_human_gate(
@@ -2730,8 +2741,7 @@ def record_human_gate(store, contract_id: str, decision: str, reason: str | None
     the plugin's gate tool — never a hardcoded "human" (round-4
     security F7). The merge takes the verdict-time snapshot commit
     recorded on the winner, never the live worktree (contest-core F1);
-    verdicts without a snapshot (legacy rows) fall back to merging the
-    live tree, and the result says so. The certificate attaches only
+    verdicts without a valid snapshot cannot be merged. The certificate attaches only
     once the decision completes — refused, rejected, and error results
     carry no stamp and no token (round-4 regression F1).
 
@@ -3085,16 +3095,7 @@ def _complete_human_gate(store, contract_id, decision, reason, contract,
         merged_sha = merge_commit(snapshot)
         result["merge_source"] = "verdict_snapshot"
     else:
-        # Legacy verdict (no snapshot on record): merge the live
-        # worktree as it stands, and say so in the result.
-        commit = mgr.commit_all(wt, f"critic: {contract_id} winner {winner['id']} ({decision})")
-        merged_sha = mgr.merge_into_main(wt)
-        result["merge_source"] = "live_worktree_legacy"
-        note = ("no verdict-time snapshot on record for the winner; "
-                "merged the live worktree as it stands (legacy fallback)")
-        result["detail"] = (
-            f"{result['detail']}; {note}" if result.get("detail") else note
-        )
+        raise RuntimeError("winner snapshot is missing or invalid; refusing live-worktree merge")
     for loser_id in verdict.get("eliminated", []):
         loser = store.get_candidate(loser_id)
         if loser and Path(loser["worktree"]).exists():

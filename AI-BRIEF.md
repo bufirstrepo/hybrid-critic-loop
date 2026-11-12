@@ -70,8 +70,8 @@ Millionaire Matrix."
    default `2`, or `cut_mode: "half"`) down to a final two, then head-to-head
    to `1`. Matrix failers drop before the cut. Tie-break: fewer tokens wins,
    then shorter generation duration. Never synthesizes or blends candidates.
-7. **Human gate.** Stops at `awaiting_human_gate`. Completing via `critic_gate`,
-   `/mm gate` / `/critic gate`, or `hermes critic gate` merges the winner's
+7. **Human gate.** Stops at `awaiting_human_gate`. An operator completes via
+   `/mm gate` / `/critic gate` or the interactive `hermes critic gate` command; approval merges the winner's
    snapshot (`approved` / `waived`) or opens `<id>_rej<attempt>` (`rejected`).
    Decisions are one-shot.
 8. **Lesson writeback.** Writes an evidence-derived Lesson (`written_to:
@@ -151,10 +151,9 @@ Millionaire Matrix."
   `MM CERTIFIED · 24,222 TOKENS SPENT · ONE ANSWER`. *(Dino's manual
   interactive smoke test from a fresh Hermes window has NOT yet happened — do
   not claim or imply that it has.)*
-- **Current test & validator counts (`feat/live-8x1-and-ui`):** `869/869` unit
-  tests passing (`skipped=1`) on Python `3.14.7` and Hermes venv Python
-  `3.11.15`; `hermes plugins validate . --install-deps` (`16/16` checks, `0` warnings, `0`
-  errors) and `hermes plugins doctor` (`5 tool(s), 2 hook(s)`) clean.
+- **Historical release 371c032 test & validator counts:** 869 unit
+  tests run (one skipped) on Python `3.14.7` and Hermes venv Python
+  `3.11.15`; `hermes plugins validate . --install-deps` (16 passing checks, with dependency preparation failing in the available log) and `hermes plugins doctor` (`5 tool(s), 2 hook(s)`) clean.
 
 ## State, standing, and the stamp
 
@@ -204,7 +203,7 @@ authors you trust to run code as you**, in disposable repositories.
 | Visibility & Usage | `progress.py`, `usage_feed.py`, `dashboard/plugin_api.py`, `desktop/plugin.js` | `RunProgressTracker` (`run_status.json`, `agent_cursor`), normalized pool quota feed (`UsageCache`), read-only FastAPI routes, Desktop chip & pane |
 | State | `state.py`, `chain.py` | WAL SQLite store; hash-chained ledger; `mm1` certificates |
 | Memory | `lessons.py`, `router.py`, `standing.py` | Evidence-derived Lessons; `PANEL_FAMILIES` routing; standing tiers |
-| Surface | `plugin.py`, `hooks.py`, `cli.py`, `loop.py`, `reports.py` | Hermes registration (5 tools, 2 hooks, `/mm` & `/critic`, `hermes critic`, system-prompt section), orchestration loop, DB-only reports |
+| Surface | `plugin.py`, `hooks.py`, `cli.py`, `loop.py`, `reports.py` | Hermes registration (5 tools, 3 hooks, `/mm` & `/critic`, `hermes critic`, system-prompt section), orchestration loop, DB-only reports |
 
 ## Honest limits & operating notes
 

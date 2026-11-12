@@ -421,8 +421,8 @@ class TestPluginSurfacesAndDashboardApi(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.data_dir = Path(self._tmp.name) / "plugin-data"
-        patcher = mock.patch.dict(os.environ, {"HCL_DATA_DIR": str(self.data_dir)})
+        self.data_dir = Path(self._tmp.name) / "plugin-data" / "hybrid-critic-loop"
+        patcher = mock.patch.dict(os.environ, {"HERMES_HOME": self._tmp.name, "HCL_DATA_DIR": str(self.data_dir)})
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -453,6 +453,7 @@ class TestPluginSurfacesAndDashboardApi(unittest.TestCase):
         # Now register plugin with FakeHermesCtx and test shorthand contract + /mm
         task_models = {task_key: default_model for _, _, task_key, _, default_model in HERMES_FAMILY_SLOTS}
         ctx = _FakeHermesCtx(_FakePluginLlm(task_models))
+        ctx.plugin_data_dir = lambda: self.data_dir
         def _cleanup_plugin_globals():
             if plugin.ACTIVE_STORE is not None:
                 try:
@@ -587,6 +588,7 @@ class TestPluginSurfacesAndDashboardApi(unittest.TestCase):
         # 3. plugin.py slash & CLI registration blurbs + cli.py docstring carry full subcommand sets
         task_models = {task_key: default_model for _, _, task_key, _, default_model in HERMES_FAMILY_SLOTS}
         ctx = _FakeHermesCtx(_FakePluginLlm(task_models))
+        ctx.plugin_data_dir = lambda: self.data_dir
 
         def _cleanup_plugin_globals():
             if plugin.ACTIVE_STORE is not None:

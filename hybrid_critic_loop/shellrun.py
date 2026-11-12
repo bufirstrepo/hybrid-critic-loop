@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shlex
 import subprocess
 import time
@@ -15,6 +16,32 @@ from pathlib import Path
 # instead of surfacing as a bare OSError.
 MAX_ARG_STRLEN = 131072
 
+# Only configuration paths belonging to the invoked vendor are inherited.
+_VENDOR_CONFIG = {
+    "codex": ("CODEX_HOME",),
+    "claude": ("CLAUDE_CONFIG_DIR",),
+    "grok": ("GROK_CONFIG_DIR", "GROK_HOME"),
+    "kimi": ("KIMI_HOME", "KIMI_CONFIG_DIR"),
+    "qwen": ("QWEN_HOME", "QWEN_CONFIG_DIR"),
+    "agy": ("AGY_CONFIG_DIR", "AGY_HOME"),
+}
+
+
+def vendor_cli_env(vendor: str, source=None) -> dict[str, str]:
+    """Return an explicit minimal environment, without provider credentials.
+
+    Config paths may allow a CLI to use its own saved login. They do not make
+    the child a sandbox: it still runs with the operator's filesystem access.
+    """
+    source = os.environ if source is None else source
+    name = Path(vendor).name.lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    allowed = {"PATH", "HOME", "LANG", "LANGUAGE", "TMPDIR"}
+    allowed.update(_VENDOR_CONFIG.get(name, ()))
+    return {k: v for k, v in source.items()
+            if k in allowed or k.startswith("LC_")}
+
 
 @dataclass
 class RunResult:
@@ -26,7 +53,7 @@ class RunResult:
     timed_out: bool
 
 
-def run_command(cmd: str, cwd=None, timeout_s: int = 900) -> RunResult:
+def run_command(cmd: str, cwd=None, timeout_s: int = 900, env=None) -> RunResult:
     """Run a command string without a shell.
 
     - shlex.split the cmd, subprocess.run with shell=False, stdin=DEVNULL,
@@ -65,6 +92,7 @@ def run_command(cmd: str, cwd=None, timeout_s: int = 900) -> RunResult:
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            env=vendor_cli_env("") if env is None else env,
         )
         duration_ms = int((time.monotonic() - start) * 1000)
         return RunResult(

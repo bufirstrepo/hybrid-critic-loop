@@ -25,6 +25,8 @@ Implements the verified multi-CLI / multi-API usage data layer (Waves 1-3):
 
 from __future__ import annotations
 
+from .shellrun import vendor_cli_env
+
 import hashlib
 import json
 import math
@@ -639,7 +641,7 @@ def _run_jsonrpc_stdio(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
-            env=dict(os.environ if env is None else env),
+            env=vendor_cli_env(argv[0], env),
         )
     except Exception as exc:
         return None, f"spawn error: {type(exc).__name__}", False
@@ -1470,6 +1472,7 @@ def write_claude_statusline_tee(
                     capture_output=True,
                     text=True,
                     timeout=5.0,
+                    env=vendor_cli_env(argv[0]),
                 )
                 passthrough_out = proc.stdout or ""
         except Exception:
@@ -1506,11 +1509,6 @@ def harvest_claude_output(
             latest_status = obj
 
     target_dir = Path(data_dir) if data_dir is not None else None
-    if target_dir is None:
-        env_dir = os.environ.get("HCL_DATA_DIR")
-        if env_dir:
-            target_dir = Path(env_dir)
-
     if latest_event is not None:
         to_save = {
             "fetched_at": epoch_to_iso(now_val),
@@ -1549,7 +1547,7 @@ def _claude_auth_plan_readonly(env: dict[str, str] | None = None, timeout_s: flo
             capture_output=True,
             text=True,
             timeout=timeout_s,
-            env=dict(os.environ if env is None else env),
+            env=vendor_cli_env("claude", env),
         )
         obj = json.loads(proc.stdout or "{}")
         if isinstance(obj, dict):
@@ -1880,7 +1878,7 @@ def probe_agy_usage(
             capture_output=True,
             text=True,
             timeout=4.0,
-            env=dict(os.environ if env is None else env),
+            env=vendor_cli_env("agy", env),
         )
         ver_out = (vproc.stdout or "") + " " + (vproc.stderr or "")
     except Exception as exc:
@@ -1910,7 +1908,7 @@ def probe_agy_usage(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=dict(os.environ if env is None else env),
+            env=vendor_cli_env("agy", env),
         )
         stdout, stderr = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
